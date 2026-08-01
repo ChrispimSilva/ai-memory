@@ -950,11 +950,11 @@ async fn handle_sessions_by_agent(
             &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
         )
     };
-    match state
+    let counts: ai_memory_store::StoreResult<Vec<ai_memory_store::AgentSessionCount>> = state
         .reader
         .session_counts_by_agent(ws, proj, owner_filter, since_us)
-        .await
-    {
+        .await;
+    match counts {
         Ok(counts) => (
             StatusCode::OK,
             Json(
@@ -5489,6 +5489,31 @@ mod tests {
             json["by_agent"].as_array().unwrap().len(),
             2,
             "since_days=0 means the whole history, not an empty window: {json}"
+        );
+
+        // A window wider than the epoch saturates into "all history" rather
+        // than overflowing: `u32::MAX` days times a day of microseconds does
+        // not fit in the i64 the cutoff is computed in.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/admin/sessions/by-agent\
+                         ?workspace=default&project=target&since_days=4294967295",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"].as_array().unwrap().len(),
+            2,
+            "a saturating window counts everything, it does not panic or empty: {json}"
         );
 
         // Unknown scope fails closed with a 404 — never auto-created.

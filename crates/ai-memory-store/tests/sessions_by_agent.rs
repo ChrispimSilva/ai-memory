@@ -166,3 +166,43 @@ async fn counts_are_scoped_to_the_asking_operator() {
         "the recovery switch reports all operators"
     );
 }
+
+/// A caller the server cannot name — no bearer identity, no proxy-asserted
+/// user — resolves to `Unattributed` and must see only the shared rows.
+/// This is the shape a single-user install has for every request, so it is
+/// also the path that must keep working when nobody configured multi-user.
+#[tokio::test]
+async fn an_unidentified_caller_sees_only_shared_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    session(
+        &store,
+        ws,
+        proj,
+        AgentKind::ClaudeCode,
+        Some(operator("alice")),
+    )
+    .await;
+    session(&store, ws, proj, AgentKind::Cursor, None).await;
+
+    let anonymous = OwnerFilter::for_actor_context(&ActorContext::anonymous());
+    assert_eq!(
+        anonymous,
+        OwnerFilter::Unattributed,
+        "a caller with no identity must not resolve to a named owner",
+    );
+
+    let counts = store
+        .reader
+        .session_counts_by_agent(ws, proj, anonymous, None)
+        .await
+        .unwrap();
+    let agents: Vec<&str> = counts.iter().map(|c| c.agent.as_str()).collect();
+    assert_eq!(
+        agents,
+        vec!["cursor"],
+        "shared rows only — alice's session is not this caller's to count",
+    );
+}
