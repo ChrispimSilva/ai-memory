@@ -142,6 +142,9 @@ to — and consumed by — the next session to start, whoever it belongs to.
   multi-user mode.
 - `ai-memory finalize-session --all-owners` does the same for sessions, and
   `GET /admin/open-sessions?all_owners=true` is the underlying switch.
+- `GET /admin/sessions/by-agent` reports how many sessions each agent CLI
+  opened in a scope. It follows the same rule: the caller's own sessions
+  plus the unowned ones, with `all_owners=true` to see every operator's.
 - The read-only handoff listing (`GET
   /api/v1/workspaces/{ws}/projects/{p}/handoffs`) serves its prompt-derived
   fields — `summary`, `open_questions`, `next_steps` — to a caller the server

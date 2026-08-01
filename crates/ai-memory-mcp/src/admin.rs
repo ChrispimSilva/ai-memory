@@ -10,6 +10,7 @@
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
 //! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent.
+//! - `GET  /admin/sessions/by-agent` — session counts per agent CLI for one scope.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -559,6 +560,7 @@ pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -
         .route("/admin/status", get(handle_status))
         .route("/admin/projects", get(handle_list_projects))
         .route("/admin/open-sessions", get(handle_open_sessions))
+        .route("/admin/sessions/by-agent", get(handle_sessions_by_agent))
         .route(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
@@ -905,6 +907,69 @@ struct OpenSessionEntry {
 }
 
 /// Parse a kebab-case agent wire string into an [`AgentKind`].
+/// Query string for `GET /admin/sessions/by-agent` — how many sessions each
+/// agent CLI opened in one scope.
+///
+/// `since_days = 0` means "no lower bound": count the project's whole
+/// history rather than an empty window, which is what a dashboard asking for
+/// "all time" wants and what a `u32` cannot express as `None`.
+#[derive(Debug, Deserialize)]
+struct SessionsByAgentQuery {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    since_days: u32,
+    /// Report every operator's sessions instead of just the caller's. Same
+    /// recovery switch the other scoped admin reads expose.
+    #[serde(default)]
+    all_owners: bool,
+}
+
+/// Microseconds in a day, for the `since_days` window.
+const US_PER_DAY: i64 = 86_400_000_000;
+
+async fn handle_sessions_by_agent(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Query(query): Query<SessionsByAgentQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let since_us = (query.since_days > 0).then(|| {
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_sub(i64::from(query.since_days).saturating_mul(US_PER_DAY))
+    });
+    let owner_filter = if query.all_owners {
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        ai_memory_core::OwnerFilter::for_actor_context(
+            &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
+        )
+    };
+    match state
+        .reader
+        .session_counts_by_agent(ws, proj, owner_filter, since_us)
+        .await
+    {
+        Ok(counts) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(&counts)
+                    .map(|list| serde_json::json!({ "by_agent": list }))
+                    .unwrap_or_else(|_| serde_json::json!({ "by_agent": [] })),
+            ),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
 fn parse_agent_kind(raw: &str) -> Option<AgentKind> {
     AgentKind::ALL.into_iter().find(|kind| kind.as_str() == raw)
 }
@@ -5315,6 +5380,137 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+    }
+
+    /// The dashboard read: session counts grouped per agent CLI, with the
+    /// scope failing closed and never auto-created.
+    #[tokio::test]
+    async fn sessions_by_agent_counts_per_agent_and_fails_closed_on_unknown_scope() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        for (project_id, agent) in [
+            (target, AgentKind::ClaudeCode),
+            (target, AgentKind::ClaudeCode),
+            (target, AgentKind::Cursor),
+            // A different scope must not leak into the target's totals.
+            (other_project, AgentKind::Codex),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: SessionId::new(),
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: agent,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49375".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=target")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"],
+            serde_json::json!([
+                { "agent": "claude-code", "sessions": 2 },
+                { "agent": "cursor", "sessions": 1 },
+            ]),
+            "counts are per agent, scoped, count-desc: {json}"
+        );
+
+        // A window that starts in the future reports nothing rather than
+        // ignoring the bound.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=target&since_days=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"].as_array().unwrap().len(),
+            2,
+            "since_days=0 means the whole history, not an empty window: {json}"
+        );
+
+        // Unknown scope fails closed with a 404 — never auto-created.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            store
+                .reader
+                .find_project(ws, "ghost".to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "read route must not auto-create scopes"
+        );
     }
 
     #[tokio::test]
