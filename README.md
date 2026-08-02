@@ -230,6 +230,19 @@ priors are at the [bottom](#influences-and-prior-art).
   Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, and Antigravity
   CLI; direct harness launches remain unchanged. See
   [Managed cross-harness workstreams](docs/managed-workstreams.md).
+- **"Just put me back where I was."** From any directory, with no name to
+  type and no list to read:
+
+  ```bash
+  ai-memory continue
+  ```
+
+  It picks the checkout whose managed launch is most recent, revalidates the
+  path and its resolved scope, then continues there exactly as bare
+  `ai-memory run` would. A link whose directory moved, was replaced, or now
+  resolves to a different project is reported on stderr and skipped, so a
+  resume never quietly lands in the wrong project. `--workspace` narrows the
+  search; `--yolo` and `--fresh` are forwarded.
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok

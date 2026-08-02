@@ -40,6 +40,9 @@ pub enum Command {
     /// Pick a local project and installed harness, then launch from that
     /// checkout. Removes the `cd` step `run` requires.
     Show(ShowArgs),
+    /// Resume the most recently launched managed checkout from anywhere,
+    /// without `cd` and without picking from a list.
+    Continue(ContinueArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
     /// Audit the store for likely cross-project contamination (read-only,
@@ -263,6 +266,26 @@ pub struct ShowArgs {
     /// Native harness arguments, forwarded byte-for-byte and in order.
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub native_args: Vec<OsString>,
+}
+
+/// Arguments for `continue`.
+///
+/// Deliberately smaller than [`ShowArgs`]: `continue` always delegates to
+/// `run`'s bare mode, which rejects native argv and `--executable` because
+/// their meaning depends on a harness the user did not name.
+#[derive(Debug, Args)]
+pub struct ContinueArgs {
+    /// Only consider checkouts resolving to this workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Disable native permission prompts using the resolved harness's
+    /// equivalent dangerous-mode option. Forwarded to `run`.
+    #[arg(long)]
+    pub yolo: bool,
+    /// Start a new native session instead of resuming the linked one.
+    /// Forwarded to `run`.
+    #[arg(long)]
+    pub fresh: bool,
 }
 
 /// Arguments for `workstream-search`.
@@ -1704,6 +1727,34 @@ mod tests {
             documented, visible,
             "docs/ARCHITECTURE.md CLI subcommands must match `ai-memory --help`"
         );
+    }
+
+    /// `continue` always delegates to `run`'s bare mode, which refuses native
+    /// argv and `--executable`. Rejecting them at parse time keeps that
+    /// contract visible in `--help` instead of failing after the launch has
+    /// already started resolving a workstream.
+    #[test]
+    fn continue_takes_wrapper_flags_only() {
+        let parsed =
+            Cli::try_parse_from(["ai-memory", "continue", "--workspace", "work", "--yolo"])
+                .expect("continue parses wrapper flags");
+        let Command::Continue(args) = parsed.command else {
+            panic!("expected continue command");
+        };
+        assert_eq!(args.workspace.as_deref(), Some("work"));
+        assert!(args.yolo);
+        assert!(!args.fresh);
+
+        for rejected in [
+            vec!["ai-memory", "continue", "claude"],
+            vec!["ai-memory", "continue", "--model", "opus"],
+            vec!["ai-memory", "continue", "--executable", "/bin/claude"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&rejected).is_err(),
+                "{rejected:?} must not parse"
+            );
+        }
     }
 
     #[test]

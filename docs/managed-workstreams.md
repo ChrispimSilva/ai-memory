@@ -84,6 +84,36 @@ all setup succeeds. `--yolo`, `--fresh`, and trailing native arguments apply to
 the selected harness. Non-terminal callers must use `--json`; JSON cannot be
 combined with launch arguments.
 
+## Continuing from anywhere
+
+Bare `ai-memory run` continues the current checkout, but its workstream lookup
+is keyed by `(workspace, project, repo fingerprint, worktree fingerprint)`, so
+the caller must already be in the project. `ai-memory continue` supplies the
+missing step and needs no `cd`:
+
+```bash
+ai-memory continue
+ai-memory continue --workspace work
+```
+
+The checkout is chosen entirely on the client, from the `linked_at` stamp that
+every successful managed prepare writes to `client-projects.json`. The server
+is never asked which directory to use — it does not expose host paths, and a
+link can only be trusted after this host revalidates it.
+
+Before launching, the newest link is rechecked twice: the recorded path must
+still canonicalize to itself (rejecting a directory that moved or was replaced
+by a symlink), and it must still resolve to the same `(workspace, project)`
+(rejecting a checkout that would file this session's memory under a different
+scope). A link failing either check is named on stderr and skipped, and the
+next-newest link is tried. Falling through is never silent: the selected
+project and path are always printed before the harness starts.
+
+Once a checkout is selected, the launch is exactly bare `ai-memory run` in that
+directory, including automatic harness selection. `continue` therefore accepts
+`--workspace`, `--yolo`, and `--fresh`, but not native harness arguments or
+`--executable`, whose meaning depends on a harness the user did not name.
+
 ## Automatic harness selection
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for

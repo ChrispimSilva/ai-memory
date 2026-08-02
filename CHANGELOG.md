@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `ai-memory continue`, which resumes the most recently launched managed
+  checkout from any directory. `run`'s bare mode already continues the current
+  checkout, but its workstream lookup is keyed by repository and worktree
+  fingerprints, so it requires a `cd` first. `continue` orders the client-local
+  checkout links by their `linked_at` stamp, revalidates the newest one's path
+  and resolved scope, and then delegates to the same bare-mode launch. Stale,
+  retargeted, or scope-mismatched links are announced on stderr and skipped
+  rather than silently resuming a different project. It accepts `--workspace`,
+  `--yolo`, and `--fresh`; native harness arguments and `--executable` remain
+  unavailable because bare mode does not know which harness it will pick
+  (#349).
+
 ## [1.22.0] - 2026-08-01
 
 ### Added
