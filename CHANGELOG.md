@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than silently resuming a different project. It accepts `--workspace`,
   `--yolo`, and `--fresh`; native harness arguments and `--executable` remain
   unavailable because bare mode does not know which harness it will pick
-  (#349).
+  (#350).
 
 ## [1.22.0] - 2026-08-01
 
