@@ -507,6 +507,9 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/auto-improve/report`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
+/// - `GET  /admin/projects`
+/// - `GET  /admin/open-sessions`
+/// - `GET  /admin/sessions/by-agent`
 /// - `GET  /admin/audit-contamination`
 /// - `GET  /admin/search`
 /// - `GET  /admin/read-page`
@@ -906,7 +909,6 @@ struct OpenSessionEntry {
     cwd: Option<String>,
 }
 
-/// Parse a kebab-case agent wire string into an [`AgentKind`].
 /// Query string for `GET /admin/sessions/by-agent` — how many sessions each
 /// agent CLI opened in one scope.
 ///
@@ -915,8 +917,11 @@ struct OpenSessionEntry {
 /// "all time" wants and what a `u32` cannot express as `None`.
 #[derive(Debug, Deserialize)]
 struct SessionsByAgentQuery {
+    /// Workspace name (required).
     workspace: String,
+    /// Project name (required).
     project: String,
+    /// Inclusive lookback in days; zero means all history.
     #[serde(default)]
     since_days: u32,
     /// Report every operator's sessions instead of just the caller's. Same
@@ -970,6 +975,7 @@ async fn handle_sessions_by_agent(
     }
 }
 
+/// Parse a kebab-case agent wire string into an [`AgentKind`].
 fn parse_agent_kind(raw: &str) -> Option<AgentKind> {
     AgentKind::ALL.into_iter().find(|kind| kind.as_str() == raw)
 }
@@ -5426,6 +5432,20 @@ mod tests {
                 .await
                 .unwrap();
         }
+        for (agent, owner) in [(AgentKind::ClaudeCode, "alice"), (AgentKind::Codex, "bob")] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: SessionId::new(),
+                    workspace_id: ws,
+                    project_id: target,
+                    agent_kind: agent,
+                    cwd: None,
+                    actor_user: Some(IdentityKey::User(owner.into()).storage_key()),
+                })
+                .await
+                .unwrap();
+        }
 
         let router = admin_router(AdminState {
             writer: store.writer.clone(),
@@ -5470,8 +5490,65 @@ mod tests {
             "counts are per agent, scoped, count-desc: {json}"
         );
 
-        // A window that starts in the future reports nothing rather than
-        // ignoring the bound.
+        // A named operator sees their rows plus shared legacy rows, but not a
+        // colleague's. The recovery switch deliberately includes all owners.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=target")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"],
+            serde_json::json!([
+                { "agent": "claude-code", "sessions": 3 },
+                { "agent": "cursor", "sessions": 1 },
+            ]),
+            "named callers see own plus shared sessions only: {json}"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/admin/sessions/by-agent?workspace=default&project=target&all_owners=true",
+                    )
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"],
+            serde_json::json!([
+                { "agent": "claude-code", "sessions": 3 },
+                { "agent": "codex", "sessions": 1 },
+                { "agent": "cursor", "sessions": 1 },
+            ]),
+            "all_owners includes every operator: {json}"
+        );
+
+        // Zero is the explicit all-history spelling and must not become an
+        // empty time window.
         let resp = router
             .clone()
             .oneshot(
@@ -8176,6 +8253,11 @@ mod tests {
                 serde_json::json!({"workspace": "default", "project": "scratch"}),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            (
+                "GET",
+                "/admin/sessions/by-agent?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
             (
@@ -8378,6 +8460,7 @@ mod tests {
     async fn multiuser_operational_admin_routes_allow_root() {
         let (_tmp, router) = user_admin_test_router("root-token");
         let resp = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/admin/status")
@@ -8388,6 +8471,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // The scope does not exist in this fixture, so reaching the handler
+        // produces 404. A rejected root request would instead be 401/403.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=scratch")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

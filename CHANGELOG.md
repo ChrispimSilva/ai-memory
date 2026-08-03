@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so equal counts do not reorder between calls. Like the other scoped admin
   reads it reports the caller's own sessions plus unowned ones, with
   `all_owners=true` as the recovery switch. Unknown scopes 404 rather than
-  being auto-created. No migration.
+  being auto-created. No migration. (#349)
 
 ## [1.22.0] - 2026-08-01
 
