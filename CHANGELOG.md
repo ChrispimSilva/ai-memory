@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `ai-memory continue`, which resumes the most recently launched managed
+  checkout from any directory. `run`'s bare mode already continues the current
+  checkout, but its workstream lookup is keyed by repository and worktree
+  fingerprints, so it requires a `cd` first. `continue` orders the client-local
+  checkout links by their `linked_at` stamp, revalidates the newest one's path
+  and resolved scope, and then delegates to the same bare-mode launch. Stale,
+  retargeted, scope-mismatched, or corrupt-ordering links are announced on
+  stderr and skipped rather than silently resuming a different project. It
+  accepts `--workspace`,
+  `--yolo`, and `--fresh`; native harness arguments and `--executable` remain
+  unavailable because bare mode does not know which harness it will pick.
+  Docker-wrapper installs route the command through the checksum-verified host
+  client so it can inspect local checkouts, session stores, and harnesses
+  (#350).
 - New `GET /admin/sessions/by-agent` endpoint reporting how many sessions
   each agent CLI opened in one scope (`claude-code`, `cursor`, `codex`, …),
   so a dashboard can answer "where is this project's memory coming from".
