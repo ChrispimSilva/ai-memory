@@ -128,6 +128,14 @@ priors are at the [bottom](#influences-and-prior-art).
   still find session pages. These signals affect retrieval provenance only;
   retrieved text remains untrusted historical evidence and never gains
   instruction authority from its namespace, tier, tags, pin, or rank.
+- **Clear routing alongside code-intelligence tools.** Run ai-memory beside a
+  structural MCP server, LSP, or other live-code tool without synchronizing
+  their stores. Use memory for prior decisions, rationale, failed attempts,
+  procedures, and handoffs; use the current checkout and structural provider
+  for symbols, callers, dependencies, and impact analysis. Verify historical
+  code claims against the checkout before acting, and treat source, builds,
+  tests, and observed runtime behavior as operational truth. See
+  [Historical memory and live code intelligence](docs/usage.md#historical-memory-and-live-code-intelligence).
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
   at session-end (or PreCompact; clients without a true session-end event can
   use `ai-memory finalize-session --agent <agent>` for a manual final close),
