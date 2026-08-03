@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-08-03
+
 ### Changed
 - Documented provider-neutral coexistence with structural code-intelligence
   tools: use ai-memory for historical intent and continuity, use the current
@@ -2953,7 +2955,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.22.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.23.0...HEAD
+[1.23.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.23.0
 [1.22.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.22.0
 [1.21.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.21.0
 [1.20.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.2
