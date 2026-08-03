@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Antigravity CLI's generated native `PreToolUse` hook now returns the required
+  `{"decision":"allow"}` response on normal capture, malformed input, and
+  capture-policy drops. Local installs default to the native spool-based hook
+  command, whose generic `{}` response caused Antigravity to deny every tool
+  call even though the staged shell and PowerShell hooks already returned the
+  correct decision (#352).
+
 ### Added
 - Added `ai-memory continue`, which resumes the most recently launched managed
   checkout from any directory. `run`'s bare mode already continues the current
