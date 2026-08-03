@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- New `GET /admin/sessions/by-agent` endpoint reporting how many sessions
+  each agent CLI opened in one scope (`claude-code`, `cursor`, `codex`, …),
+  so a dashboard can answer "where is this project's memory coming from".
+  `sessions.agent_kind` already carried the answer but no read surface
+  exposed it — the existing `/admin/open-sessions` takes the agent as a
+  *filter* and returns neither the kind nor a total. Counts cover open and
+  ended sessions alike, take an optional `since_days` window (`0` or absent
+  = whole history), and order count-descending with an agent-name tiebreak
+  so equal counts do not reorder between calls. Like the other scoped admin
+  reads it reports the caller's own sessions plus unowned ones, with
+  `all_owners=true` as the recovery switch. Unknown scopes 404 rather than
+  being auto-created. No migration. (#349)
+
 ## [1.22.0] - 2026-08-01
 
 ### Added
