@@ -38,8 +38,8 @@ ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
 not. Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop, VS Code Copilot, and Zed are **MCP-only** here: they expose
-long-term memory to their LLMs via ai-memory's MCP tools
+Claude Desktop, Kiro CLI, VS Code Copilot, and Zed are **MCP-only** here: they
+expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
 endpoint. The trade-off:
@@ -120,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / devin / zero / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / devin / zero / vscode-copilot / zed
 > ```
 
 ---
@@ -792,6 +792,57 @@ same pattern as Gemini CLI.
   same event. `PostToolUse` and `PostToolUseFailure` reuse one handler command,
   but are mutually exclusive event triggers, so successful and failed calls
   are both captured once.
+
+## Kiro CLI
+
+**Status:** MCP supported. Lifecycle hooks and managed workstreams are not yet
+supported.
+
+**Config file:** `$KIRO_HOME/settings/mcp.json`, defaulting to
+`~/.kiro/settings/mcp.json`. Use `--config-file .kiro/settings/mcp.json` when
+you intentionally want Kiro's lower-scope project configuration instead.
+
+```bash
+ai-memory install-mcp --client kiro-cli --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+```
+
+The `kiro` alias is equivalent. The command preserves unrelated settings and
+servers, and merges this entry idempotently:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "https://memory.example/mcp?flavor=bedrock",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Kiro sends MCP tool schemas through Amazon Bedrock, which rejects root-level
+`anyOf`, `oneOf`, and `allOf`. The installer appends `?flavor=bedrock`; the
+server strips only those root combinators for that request while preserving
+nested schemas and the handlers' runtime validation. Kimi Code's existing
+`?flavor=moonshot` behavior remains supported independently.
+
+Kiro permits remote MCP URLs over HTTPS. Plain HTTP is accepted only for
+`localhost`, `127.0.0.1`, or another loopback address; `install-mcp` rejects a
+non-loopback HTTP URL before writing the config. See
+[HTTPS via reverse proxy](https-via-proxy.md) for a homelab deployment.
+
+Kiro CLI v3 changes both its hook schema and its persisted session format from
+v2. Until each version has fixtures and an explicit compatibility contract,
+`install-hooks --agent kiro-cli` and `ai-memory run kiro` are intentionally not
+advertised or accepted. Follow
+[#355](https://github.com/akitaonrails/ai-memory/issues/355) for hooks and
+[#356](https://github.com/akitaonrails/ai-memory/issues/356) for managed
+workstreams.
+
+Sources: <https://kiro.dev/docs/cli/mcp/configuration/>,
+<https://kiro.dev/docs/cli/reference/settings/>,
+<https://kiro.dev/docs/cli/v3/>.
 
 ## OpenClaw
 

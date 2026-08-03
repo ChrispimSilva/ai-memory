@@ -675,7 +675,7 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["mcpServers", "ai-memory"],
             "url",
         )),
-        McpClient::KimiCode => Ok(infer_json_mcp_config(
+        McpClient::KimiCode | McpClient::KiroCli => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
             "url",

@@ -3429,28 +3429,27 @@ impl ServerHandler for AiMemoryServer {
         // rmcp injects `http::request::Parts` into request extensions in
         // both stateless and stateful modes, so the flavor marker is
         // available even without peer clientInfo.
-        let moonshot = context
+        let restricted_schema = context
             .extensions
             .get::<http::request::Parts>()
             .and_then(|parts| parts.uri.query())
-            .is_some_and(|query| query.split('&').any(|pair| pair == "flavor=moonshot"));
-        if moonshot {
-            Ok(ListToolsResult::with_all_items(moonshot_safe_tool_list(
-                tools,
-            )))
+            .is_some_and(has_restricted_schema_flavor);
+        if restricted_schema {
+            Ok(ListToolsResult::with_all_items(
+                restricted_schema_tool_list(tools),
+            ))
         } else {
             Ok(ListToolsResult::with_all_items(tools))
         }
     }
 }
 
-/// Moonshot ("moonshot flavored json schema") rejects root-level
+/// Bedrock and Moonshot reject root-level
 /// `anyOf`/`oneOf`/`allOf` in tool parameter schemas with a 400 at
-/// `tools/list` time. Requests marked `?flavor=moonshot` (the URL
-/// `install-mcp --client kimi-code` writes) get the tool list with
-/// those root keys stripped; nested combinators stay, and the handlers'
-/// runtime validation still enforces the arg contracts.
-fn moonshot_safe_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
+/// `tools/list` time. Kimi's legacy `?flavor=moonshot` and Kiro's
+/// `?flavor=bedrock` both get schemas with those root keys stripped;
+/// nested combinators stay, and runtime validation remains unchanged.
+fn restricted_schema_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
     const ROOT_COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
     tools
         .into_iter()
@@ -3469,6 +3468,12 @@ fn moonshot_safe_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
             tool
         })
         .collect()
+}
+
+fn has_restricted_schema_flavor(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| matches!(pair, "flavor=moonshot" | "flavor=bedrock"))
 }
 
 /// A page's access counter is bumped at most once per this window. Repeated
@@ -6434,7 +6439,7 @@ mod tests {
 
     // Pins what the patch strips (root combinators) and what it preserves.
     #[test]
-    fn moonshot_safe_tool_list_strips_root_combinators_only() {
+    fn restricted_schema_tool_list_strips_root_combinators_only() {
         let schema: serde_json::Map<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({
                 "$schema": "http://json-schema.org/draft-07/schema#",
@@ -6453,7 +6458,7 @@ mod tests {
             .unwrap();
         let tool = Tool::new("memory_read_page", "Read a wiki page", schema);
 
-        let patched = moonshot_safe_tool_list(vec![tool]);
+        let patched = restricted_schema_tool_list(vec![tool]);
         let out = &patched[0].input_schema;
 
         for key in ["anyOf", "oneOf", "allOf"] {
@@ -6473,7 +6478,7 @@ mod tests {
     }
 
     #[test]
-    fn moonshot_safe_tool_list_leaves_flat_tools_untouched() {
+    fn restricted_schema_tool_list_leaves_flat_tools_untouched() {
         let schema: serde_json::Map<String, serde_json::Value> =
             serde_json::from_value(serde_json::json!({
                 "type": "object",
@@ -6483,10 +6488,22 @@ mod tests {
         let tool = Tool::new("memory_status", "Status counts", schema);
         let before = serde_json::to_value(&tool).unwrap();
 
-        let patched = moonshot_safe_tool_list(vec![tool]);
+        let patched = restricted_schema_tool_list(vec![tool]);
         let after = serde_json::to_value(&patched[0]).unwrap();
 
         assert_eq!(before, after, "flat tools must pass through unchanged");
+    }
+
+    #[test]
+    fn restricted_schema_flavor_matches_complete_query_pairs_only() {
+        assert!(has_restricted_schema_flavor("flavor=moonshot"));
+        assert!(has_restricted_schema_flavor(
+            "client=kiro&flavor=bedrock&debug=false"
+        ));
+        assert!(!has_restricted_schema_flavor("flavor=unknown"));
+        assert!(!has_restricted_schema_flavor(
+            "note=flavor=bedrock&client=kiro"
+        ));
     }
 
     // Issue #155: the neither-arg error must teach a looping model what a

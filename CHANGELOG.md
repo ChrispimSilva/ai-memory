@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct decision (#352).
 
 ### Added
+- Kiro CLI is now supported as an MCP-only client through `install-mcp
+  --client kiro-cli` (alias `kiro`). The installer preserves existing
+  `$KIRO_HOME/settings/mcp.json` content, adds bearer headers when configured,
+  honors `$KIRO_HOME`, and appends a Bedrock schema flavor that removes only
+  unsupported root-level JSON Schema combinators. Non-loopback Kiro endpoints
+  must use HTTPS and are rejected before `--apply` writes an unusable config.
+  Kiro lifecycle hooks and managed workstreams remain deferred because its v2
+  and early-access v3 engines use incompatible hook and session formats
+  (#351).
 - Added `ai-memory continue`, which resumes the most recently launched managed
   checkout from any directory. `run`'s bare mode already continues the current
   checkout, but its workstream lookup is keyed by repository and worktree

@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -599,9 +599,9 @@ Each agent CLI needs two things:
    Without this, the agent can still query memory but capture
    becomes manual.
 
-Claude Desktop, VS Code Copilot, and Zed are MCP-only today. The hook-capable
-clients in the [README Support Matrix](../README.md#support-matrix), including
-Pi and Zero, have lifecycle capture paths through `install-hooks`.
+Claude Desktop, Kiro CLI, VS Code Copilot, and Zed are MCP-only today. The
+hook-capable clients in the [README Support Matrix](../README.md#support-matrix),
+including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 
 > **Hook install pattern.** Local supported profiles default to host-native
 > commands. Claude Code may use its supported Windows exec form (`command` =
@@ -734,6 +734,33 @@ script-fallback installation so its staged scripts are refreshed.
 Kimi Code hook entries accept only `event`, `matcher`, `command`, and
 `timeout`; extra fields make the whole `config.toml` fail to load, so prefer
 `install-hooks --apply` over hand edits.
+
+### Kiro CLI
+
+Kiro CLI is MCP-only in this release. Its global MCP file is
+`$KIRO_HOME/settings/mcp.json`, defaulting to `~/.kiro/settings/mcp.json`;
+pass `--config-file .kiro/settings/mcp.json` for a project-scoped entry.
+
+```bash
+ai-memory install-mcp --client kiro-cli --apply \
+    --server-url "https://memory.example/mcp" \
+    --auth-token "$TOKEN"
+```
+
+The `kiro` alias is equivalent. The installed URL includes
+`?flavor=bedrock` so Kiro's Bedrock backend receives schemas without
+root-level `anyOf`, `oneOf`, or `allOf`; nested schemas and runtime validation
+remain intact. Kiro requires HTTPS for non-loopback remote servers, so the CLI
+rejects a plain-HTTP homelab URL before changing the file. Configure a reverse
+proxy as described in [HTTPS via reverse proxy](https-via-proxy.md).
+
+Kiro v2 and the early-access v3 engine use incompatible hook and persisted
+session formats. `install-hooks --agent kiro-cli` and `ai-memory run kiro` are
+therefore deferred until both formats have fixtures and explicit compatibility
+tests; this MCP registration does not claim automatic capture or managed
+resume. Follow [#355](https://github.com/akitaonrails/ai-memory/issues/355) for
+hooks and [#356](https://github.com/akitaonrails/ai-memory/issues/356) for the
+managed-workstream adapter.
 
 ### OpenCode
 
@@ -874,6 +901,10 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client kiro-cli        --auth-token "$TOKEN" \
+    --server-url "https://memory.example/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client vscode-copilot  --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
 
@@ -888,9 +919,9 @@ Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw support both
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
 captures lifecycle events.
 Grok ignores `SessionStart` stdout, so handoffs must be accepted through MCP with
-`memory_handoff_accept` when resuming. Claude Desktop, VS Code Copilot, and Zed
-are MCP-only here, so you'll need to nudge the model to call `memory_query` /
-`memory_handoff_accept` itself.
+`memory_handoff_accept` when resuming. Claude Desktop, Kiro CLI, VS Code
+Copilot, and Zed are MCP-only here, so you'll need to nudge the model to call
+`memory_query` / `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
 for Grok's (and Zero's) no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
