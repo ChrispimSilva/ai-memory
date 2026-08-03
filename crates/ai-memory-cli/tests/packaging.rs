@@ -769,7 +769,7 @@ fn hook_installer_writes_only_expected_files_from_a_verified_archive() {
 
 #[cfg(unix)]
 #[test]
-fn managed_run_wrapper_uses_host_binary_path_and_remote_server_without_docker() {
+fn managed_host_commands_use_native_path_and_remote_server_without_docker() {
     let tmp = tempfile::tempdir().unwrap();
     let native = tmp.path().join("native-ai-memory");
     let docker = tmp.path().join("docker");
@@ -804,34 +804,40 @@ fn managed_run_wrapper_uses_host_binary_path_and_remote_server_without_docker() 
         shell_path(tmp.path()),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = shell_script_command(&repo_root().join("bin/ai-memory"))
-        .args(["run", "codex", "--yolo", "resume"])
-        .env("AI_MEMORY_NATIVE_BIN", &native)
-        .env("AI_MEMORY_DOCKER", &docker)
-        .env("AI_MEMORY_SERVER_URL", "http://192.168.0.90:49374")
-        .env("AI_MEMORY_AUTH_TOKEN", "remote-test-token")
-        .env("PATH", &host_path)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "wrapper failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let record = std::fs::read_to_string(record).unwrap();
-    assert_eq!(
-        record,
-        format!(
+    let commands: &[&[&str]] = &[
+        &["run", "codex", "--yolo", "resume"],
+        &["show", "--json", "--no-scan"],
+        &["continue", "--workspace", "work", "--yolo"],
+    ];
+    for args in commands {
+        let output = shell_script_command(&repo_root().join("bin/ai-memory"))
+            .args(args.iter().copied())
+            .env("AI_MEMORY_NATIVE_BIN", &native)
+            .env("AI_MEMORY_DOCKER", &docker)
+            .env("AI_MEMORY_SERVER_URL", "http://192.168.0.90:49374")
+            .env("AI_MEMORY_AUTH_TOKEN", "remote-test-token")
+            .env("PATH", &host_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "wrapper failed for {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut expected = format!(
             "server=http://192.168.0.90:49374\n\
              auth=remote-test-token\n\
-             path={host_path}\n\
-             arg=run\n\
-             arg=codex\n\
-             arg=--yolo\n\
-             arg=resume\n"
-        )
+             path={host_path}\n"
+        );
+        for arg in *args {
+            expected.push_str(&format!("arg={arg}\n"));
+        }
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), expected);
+    }
+    assert!(
+        !docker_record.exists(),
+        "managed host command entered Docker"
     );
-    assert!(!docker_record.exists(), "managed run entered Docker");
 }
 
 #[cfg(unix)]

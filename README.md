@@ -239,10 +239,11 @@ priors are at the [bottom](#influences-and-prior-art).
 
   It picks the checkout whose managed launch is most recent, revalidates the
   path and its resolved scope, then continues there exactly as bare
-  `ai-memory run` would. A link whose directory moved, was replaced, or now
-  resolves to a different project is reported on stderr and skipped, so a
-  resume never quietly lands in the wrong project. `--workspace` narrows the
-  search; `--yolo` and `--fresh` are forwarded.
+  `ai-memory run` would. A link whose directory moved, was replaced, now
+  resolves to a different project, or has a corrupt ordering timestamp is
+  reported on stderr and skipped, so a resume never quietly lands in the wrong
+  project. `--workspace` narrows the search; `--yolo` and `--fresh` are
+  forwarded.
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok
@@ -518,6 +519,8 @@ ai-memory run claude
 ai-memory run codex --yolo
 # omit the name to continue the newest usable local harness session
 ai-memory run
+# or resume the newest managed checkout without changing directories first
+ai-memory continue
 ```
 
 To remove ai-memory later, run `ai-memory uninstall --apply` from the
@@ -553,10 +556,11 @@ one matching entry.
   MCP/hooks. Explicit `--server-url` flags still work, but are no longer
   required when the env vars are set. Any non-loopback server should use
   bearer auth.
-- **Managed-launch wrapper:** `ai-memory run` and `ai-memory show` must be
-  intercepted by the current host wrapper so local checkouts, native harnesses,
-  and session stores remain accessible. An old wrapper may pass either command
-  into Docker and fail to find a checkout or host executable. Run
+- **Managed-launch wrapper:** `ai-memory run`, `ai-memory show`, and
+  `ai-memory continue` must be intercepted by the current host wrapper so local
+  checkouts, native harnesses, and session stores remain accessible. An old
+  wrapper may pass these commands into Docker and fail to find a checkout or
+  host executable. Run
   `ai-memory upgrade` on the agent machine to refresh it. The host-native runner
   inherits `AI_MEMORY_SERVER_URL`, `AI_MEMORY_AUTH_TOKEN`, and the host `PATH`.
 - **Upgrades:** for Docker-wrapper installs, run `ai-memory upgrade` on each

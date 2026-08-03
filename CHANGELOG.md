@@ -14,10 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprints, so it requires a `cd` first. `continue` orders the client-local
   checkout links by their `linked_at` stamp, revalidates the newest one's path
   and resolved scope, and then delegates to the same bare-mode launch. Stale,
-  retargeted, or scope-mismatched links are announced on stderr and skipped
-  rather than silently resuming a different project. It accepts `--workspace`,
+  retargeted, scope-mismatched, or corrupt-ordering links are announced on
+  stderr and skipped rather than silently resuming a different project. It
+  accepts `--workspace`,
   `--yolo`, and `--fresh`; native harness arguments and `--executable` remain
-  unavailable because bare mode does not know which harness it will pick
+  unavailable because bare mode does not know which harness it will pick.
+  Docker-wrapper installs route the command through the checksum-verified host
+  client so it can inspect local checkouts, session stores, and harnesses
   (#350).
 - New `GET /admin/sessions/by-agent` endpoint reporting how many sessions
   each agent CLI opened in one scope (`claude-code`, `cursor`, `codex`, …),

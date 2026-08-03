@@ -34,8 +34,15 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
         );
     }
 
-    let mut rejected = Vec::new();
-    for link in newest_first(candidates) {
+    let (candidates, invalid_timestamps) = newest_first(candidates);
+    let mut rejected = invalid_timestamps.len();
+    for link in invalid_timestamps {
+        eprintln!(
+            "skipping {}: client registry has an invalid linked_at timestamp",
+            scope_label(&link)
+        );
+    }
+    for link in candidates {
         let target = match resolve_target(config, &link) {
             Ok(target) => target,
             Err(reason) => {
@@ -47,7 +54,7 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 // the terminal.
                 let label = scope_label(&link);
                 eprintln!("skipping {label}: {}", terminal_text(&reason.to_string()));
-                rejected.push(label);
+                rejected += 1;
                 continue;
             }
         };
@@ -79,7 +86,7 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
     bail!(
         "no linked checkout is still usable ({} skipped); \
          pick one explicitly with `ai-memory show`",
-        rejected.len()
+        rejected
     )
 }
 
@@ -92,17 +99,25 @@ fn filter_workspace(links: Vec<ProjectLink>, workspace: Option<&str>) -> Vec<Pro
 
 /// Order links newest-first.
 ///
-/// An unparsable `linked_at` sorts last rather than aborting: one corrupt
-/// row must not make every other checkout unreachable. Ties break on
-/// `(workspace, project)` so the choice is deterministic.
-fn newest_first(mut links: Vec<ProjectLink>) -> Vec<ProjectLink> {
-    links.sort_by(|a, b| {
-        linked_at(b)
-            .cmp(&linked_at(a))
-            .then_with(|| a.workspace.cmp(&b.workspace))
-            .then_with(|| a.project.cmp(&b.project))
+/// Corrupt timestamps are returned separately and are never launch candidates.
+/// One bad row must not strand valid checkouts. Ties break on `(workspace,
+/// project)` so the choice is deterministic.
+fn newest_first(links: Vec<ProjectLink>) -> (Vec<ProjectLink>, Vec<ProjectLink>) {
+    let mut valid = Vec::with_capacity(links.len());
+    let mut invalid = Vec::new();
+    for link in links {
+        match linked_at(&link) {
+            Some(timestamp) => valid.push((timestamp, link)),
+            None => invalid.push(link),
+        }
+    }
+    valid.sort_by(|(a_timestamp, a_link), (b_timestamp, b_link)| {
+        b_timestamp
+            .cmp(a_timestamp)
+            .then_with(|| a_link.workspace.cmp(&b_link.workspace))
+            .then_with(|| a_link.project.cmp(&b_link.project))
     });
-    links
+    (valid.into_iter().map(|(_, link)| link).collect(), invalid)
 }
 
 fn linked_at(link: &ProjectLink) -> Option<jiff::Timestamp> {
@@ -152,11 +167,12 @@ mod tests {
 
     #[test]
     fn newest_linked_checkout_wins() {
-        let ordered = newest_first(vec![
+        let (ordered, invalid) = newest_first(vec![
             link("default", "older", "2026-07-01T10:00:00Z"),
             link("default", "newest", "2026-08-01T09:00:00Z"),
             link("default", "middle", "2026-07-20T23:59:59Z"),
         ]);
+        assert!(invalid.is_empty());
         assert_eq!(projects(&ordered), ["newest", "middle", "older"]);
     }
 
@@ -164,41 +180,47 @@ mod tests {
     /// that sorts earlier lexically can still be the newer instant.
     #[test]
     fn ordering_compares_instants_not_raw_strings() {
-        let ordered = newest_first(vec![
+        let (ordered, invalid) = newest_first(vec![
             link("default", "utc", "2026-08-01T09:00:00Z"),
             link("default", "offset", "2026-08-01T11:30:00+02:00"),
         ]);
+        assert!(invalid.is_empty());
         assert_eq!(projects(&ordered), ["offset", "utc"]);
     }
 
     /// One corrupt row must not strand every other checkout.
     #[test]
-    fn unparsable_timestamps_sort_last_without_failing() {
-        let ordered = newest_first(vec![
+    fn unparsable_timestamps_are_rejected_without_stranding_valid_links() {
+        let (ordered, invalid) = newest_first(vec![
             link("default", "corrupt", "not-a-timestamp"),
             link("default", "valid", "2026-01-01T00:00:00Z"),
         ]);
-        assert_eq!(projects(&ordered), ["valid", "corrupt"]);
+        assert_eq!(projects(&ordered), ["valid"]);
+        assert_eq!(projects(&invalid), ["corrupt"]);
     }
 
     #[test]
     fn equal_timestamps_break_ties_deterministically() {
         let same = "2026-08-01T09:00:00Z";
-        let first = newest_first(vec![
+        let (first, first_invalid) = newest_first(vec![
             link("b-workspace", "zeta", same),
             link("a-workspace", "alpha", same),
         ]);
-        let second = newest_first(vec![
+        let (second, second_invalid) = newest_first(vec![
             link("a-workspace", "alpha", same),
             link("b-workspace", "zeta", same),
         ]);
+        assert!(first_invalid.is_empty());
+        assert!(second_invalid.is_empty());
         assert_eq!(projects(&first), ["alpha", "zeta"]);
         assert_eq!(projects(&first), projects(&second));
     }
 
     #[test]
     fn empty_registry_orders_to_nothing() {
-        assert!(newest_first(Vec::new()).is_empty());
+        let (ordered, invalid) = newest_first(Vec::new());
+        assert!(ordered.is_empty());
+        assert!(invalid.is_empty());
     }
 
     fn config_at(path: &std::path::Path) -> Config {
