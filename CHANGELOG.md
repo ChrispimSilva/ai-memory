@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+- Documented provider-neutral coexistence with structural code-intelligence
+  tools: use ai-memory for historical intent and continuity, use the current
+  checkout or structural provider for live symbols and impact analysis, verify
+  historical structural claims before acting, and keep source, builds, tests,
+  and observed runtime behavior authoritative. No provider coupling, automatic
+  querying, or persisted structural-evidence schema was added (#353).
+
 ### Fixed
 - Antigravity CLI's generated native `PreToolUse` hook now returns the required
   `{"decision":"allow"}` response on normal capture, malformed input, and
