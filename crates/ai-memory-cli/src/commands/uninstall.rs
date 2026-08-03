@@ -284,6 +284,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             Zed,
             Devin,
             KimiCode,
+            KiroCli,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -938,6 +939,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::KimiCode
+        | McpClient::KiroCli
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
@@ -974,13 +976,19 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
 }
 
 /// URL forms uninstall matches for `client`: the endpoint as given, plus
-/// for KimiCode the `flavor=moonshot` form install-mcp actually writes
-/// (`--mcp-url` keeps the unflavored default). Every other client keeps
-/// exact-match semantics.
+/// for clients whose installer appends a schema flavor, the form
+/// `install-mcp` actually writes (`--mcp-url` keeps the unflavored default).
+/// Every other client keeps exact-match semantics.
 fn mcp_url_candidates(client: McpClient, url: &str) -> Vec<String> {
     let mut candidates = vec![url.to_string()];
     if matches!(client, McpClient::KimiCode) {
         let flavored = install_mcp::moonshot_flavored_mcp_url(url);
+        if !candidates.contains(&flavored) {
+            candidates.push(flavored);
+        }
+    }
+    if matches!(client, McpClient::KiroCli) {
+        let flavored = install_mcp::bedrock_flavored_mcp_url(url);
         if !candidates.contains(&flavored) {
             candidates.push(flavored);
         }
@@ -1989,7 +1997,7 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
     }
 
     #[test]
-    fn mcp_url_candidates_adds_moonshot_flavor_for_kimi_code_only() {
+    fn mcp_url_candidates_adds_client_schema_flavors() {
         assert_eq!(
             mcp_url_candidates(McpClient::KimiCode, "http://127.0.0.1:49374/mcp"),
             vec![
@@ -2003,6 +2011,13 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
                 "http://127.0.0.1:49374/mcp?flavor=moonshot"
             ),
             vec!["http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()]
+        );
+        assert_eq!(
+            mcp_url_candidates(McpClient::KiroCli, "https://memory.example/mcp"),
+            vec![
+                "https://memory.example/mcp".to_string(),
+                "https://memory.example/mcp?flavor=bedrock".to_string()
+            ]
         );
         assert_eq!(
             mcp_url_candidates(McpClient::Cursor, "http://127.0.0.1:49374/mcp"),
@@ -2026,6 +2041,22 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["mcpServers"].get("ai-memory").is_none());
         assert!(v["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn strip_mcp_kiro_matches_bedrock_flavored_url() {
+        let content = r#"{"mcpServers":{"ai-memory":{"url":"https://memory.example/mcp?flavor=bedrock"},"other":{"url":"https://other.example/mcp"}}}"#;
+        let (out, removed) = strip_mcp_json_client(
+            content,
+            McpClient::KiroCli,
+            Some("ai-memory"),
+            "https://memory.example/mcp",
+        )
+        .unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(value["mcpServers"].get("ai-memory").is_none());
+        assert!(value["mcpServers"].get("other").is_some());
     }
 
     /// The plan matched the flavored Kimi Code entry but apply dispatched

@@ -1130,6 +1130,11 @@ pub enum McpClient {
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
     KimiCode,
+    /// Kiro CLI - `$KIRO_HOME/settings/mcp.json` (default
+    /// `~/.kiro/settings/mcp.json`). MCP-only: Kiro v2 and v3 use
+    /// incompatible hook and session formats.
+    #[value(alias = "kiro")]
+    KiroCli,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -2109,6 +2114,25 @@ mod tests {
             panic!("expected install-mcp command for grok");
         };
         assert!(matches!(mcp_args.client, McpClient::Grok));
+    }
+
+    #[test]
+    fn kiro_mcp_aliases_parse() {
+        for alias in ["kiro-cli", "kiro"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "https://memory.example/mcp",
+            ])
+            .unwrap_or_else(|e| panic!("failed to parse Kiro MCP alias {alias}: {e}"));
+            let Command::InstallMcp(args) = cli.command else {
+                panic!("expected install-mcp command for Kiro alias {alias}");
+            };
+            assert!(matches!(args.client, McpClient::KiroCli));
+        }
     }
 
     #[test]
