@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-08-04
+
 ### Added
 - MCP-only clients are now visible in the operator's traffic picture.
   Every MCP tool call is counted against its caller — the sanitized
@@ -3019,7 +3021,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.23.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.24.0...HEAD
+[1.24.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.24.0
 [1.23.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.23.0
 [1.22.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.22.0
 [1.21.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.21.0
