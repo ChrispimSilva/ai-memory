@@ -1123,7 +1123,7 @@ fn uninstall_kiro_cli_hooks_preserves_user_and_v3_entries() {
         r#"{"name":"local","hooks":{"stop":[{"command":"/x/hooks/kiro-cli/stop.sh"}]}}"#,
     );
 
-    // v3 is unsupported because its command-input contract is undocumented.
+    // v3 remains unsupported without accepted live payload fixtures.
     // Uninstall must leave even an ai-memory-looking standalone file untouched.
     let hooks_dir = kiro.join("hooks");
     std::fs::create_dir_all(&hooks_dir).unwrap();

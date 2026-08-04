@@ -1016,7 +1016,8 @@ pub enum AgentChoice {
     KimiCode,
     /// Kiro CLI (AWS), v2 agent engine — camelCase lifecycle hooks embedded
     /// in agent configs under `~/.kiro/agents/*.json`. Kiro v3's standalone
-    /// hooks do not yet document a command-input payload contract.
+    /// schema is documented but lacks accepted live lifecycle and built-in
+    /// tool payload fixtures.
     #[value(alias = "kiro")]
     KiroCli,
 }
@@ -2190,7 +2191,7 @@ mod tests {
             .unwrap_err();
             assert!(
                 error.to_string().contains("invalid value"),
-                "v3 must remain unsupported until its payload contract is verified: {error}"
+                "v3 must remain unsupported until its live payload fixtures are verified: {error}"
             );
         }
     }
