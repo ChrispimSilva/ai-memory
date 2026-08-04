@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
 
-use ai_memory_consolidate::Consolidator;
+use ai_memory_consolidate::{Consolidator, ConsolidatorError};
 use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, NewHandoff, NewObservation, NewSession,
@@ -2713,6 +2713,25 @@ fn build_auto_handoff(
     }
 }
 
+/// Whether a failed LLM consolidation may degrade to the rule-based
+/// checkpoint that a zero-LLM install would have written anyway.
+///
+/// Only the "the model could not answer" class degrades: a provider refusing
+/// the request (context overflow, rate limit, outage) or replying with
+/// unmappable JSON says nothing about whether this session deserves a page.
+///
+/// Everything else is policy or infrastructure — an admission webhook
+/// rejecting this actor or scope, a wiki or store failure, a session that does
+/// not resolve. The rule-based path writes with `admission_ctx: None`, so
+/// degrading on those would launder exactly the rejection that just fired.
+/// Those fail closed.
+fn checkpoint_degrades_to_synth(error: &ConsolidatorError) -> bool {
+    matches!(
+        error,
+        ConsolidatorError::Llm(_) | ConsolidatorError::Serde(_)
+    )
+}
+
 /// Write a fresh `sessions/<id>.md` for the current session without
 /// ending it. Used by the PreCompact and PostCompaction branches to checkpoint
 /// state before/after the agent's working context collapses.
@@ -2725,32 +2744,52 @@ async fn consolidate_or_synth(
     actor: ai_memory_core::ActorContext,
 ) -> anyhow::Result<()> {
     if let Some(c) = state.consolidator.as_ref() {
-        let outcome = c
+        let result = c
             // The hook path has no per-call override, so `None` lets the
             // project's standing `_prompts/consolidation.md` preferences
             // apply; the actor is the session's own operator so the
             // checkpoint is attributed to them, not to whoever delivered
             // the event.
             .consolidate_session(session_id, false, actor.clone(), None, None)
-            .await?;
-        debug!(
-            session = %session_id,
-            path = %outcome.path,
-            "{}: LLM consolidation written",
-            checkpoint_label
-        );
-        let _ = state
-            .wiki
-            .commit_all(&format!(
-                "{}(session {}): checkpoint",
-                checkpoint_label,
-                short_id(&session_id.to_string()),
-            ))
-            .map_err(|e| {
-                tracing::warn!(error = %e, "{}: checkpoint auto-commit failed", checkpoint_label);
-                e
-            });
-        return Ok(());
+            .await;
+        match result {
+            Ok(outcome) => {
+                debug!(
+                    session = %session_id,
+                    path = %outcome.path,
+                    "{}: LLM consolidation written",
+                    checkpoint_label
+                );
+                let _ = state
+                    .wiki
+                    .commit_all(&format!(
+                        "{}(session {}): checkpoint",
+                        checkpoint_label,
+                        short_id(&session_id.to_string()),
+                    ))
+                    .map_err(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "{}: checkpoint auto-commit failed",
+                            checkpoint_label
+                        );
+                        e
+                    });
+                return Ok(());
+            }
+            // Nothing to checkpoint. The rule-based path below no-ops on the
+            // same condition, so this is success, not a failure worth logging.
+            Err(ConsolidatorError::EmptySession(_)) => return Ok(()),
+            Err(e) if checkpoint_degrades_to_synth(&e) => {
+                warn!(
+                    error = %e,
+                    session = %session_id,
+                    "{}: LLM consolidation unavailable; falling back to rule-based checkpoint",
+                    checkpoint_label
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     let observations = state.reader.observations_for_session(session_id).await?;
     if observations.is_empty() {
@@ -2851,6 +2890,41 @@ mod tests {
         }
     }
 
+    /// Provider that rejects every request the way a local engine rejects a
+    /// prompt larger than its context window.
+    struct ContextOverflowLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ContextOverflowLlm {
+        fn name(&self) -> &'static str {
+            "overflow"
+        }
+        fn model(&self) -> &str {
+            "overflow-test"
+        }
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Err(self.overflow())
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Err(self.overflow())
+        }
+    }
+
+    impl ContextOverflowLlm {
+        fn overflow(&self) -> ai_memory_llm::LlmError {
+            ai_memory_llm::LlmError::Provider {
+                status: 400,
+                body: "request (116349 tokens) exceeds the available context size \
+                       (8192 tokens), try increasing it"
+                    .into(),
+            }
+        }
+    }
+
     /// Build a minimal `HookState` backed by a real on-disk store.
     async fn make_state(tmp: &TempDir) -> HookState {
         let store = Store::open(tmp.path()).unwrap();
@@ -2889,6 +2963,117 @@ mod tests {
             ingest_gates: IngestGates::default(),
             per_user_slots: false,
         }
+    }
+
+    /// Regression: a configured-but-failing LLM used to make PreCompact
+    /// strictly worse than no LLM at all. `consolidate_or_synth` propagated the
+    /// provider error, the caller only warned, and the rule-based page a
+    /// zero-LLM install would have written never happened — so compaction threw
+    /// the session's working state away with nothing on disk. Observed in the
+    /// wild as 11,836 consecutive `exceed_context_size_error` 400s.
+    #[tokio::test]
+    async fn checkpoint_falls_back_to_rule_based_page_when_the_provider_rejects_the_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            Arc::new(ContextOverflowLlm),
+            state.workspace_id,
+            state.project_id,
+        )));
+
+        let session_id = SessionId::new();
+        state
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        state
+            .writer
+            .insert_observation_ingest(
+                Sanitized::new(
+                    NewObservation {
+                        session_id,
+                        workspace_id: state.workspace_id,
+                        project_id: state.project_id,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: "keep-this-working-state".into(),
+                        body: "state that must survive compaction".into(),
+                        importance: 8,
+                    },
+                    &state.sanitizer,
+                ),
+                "overflow-fallback".into(),
+            )
+            .await
+            .unwrap();
+
+        consolidate_or_synth(
+            &state,
+            session_id,
+            state.workspace_id,
+            state.project_id,
+            "pre-compact",
+            ai_memory_core::ActorContext::anonymous(),
+        )
+        .await
+        .expect("a provider 400 must not lose the checkpoint");
+
+        let path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md")).unwrap();
+        let page = state
+            .wiki
+            .read_page(state.workspace_id, state.project_id, &path)
+            .expect("rule-based checkpoint page must exist after the LLM failed");
+        assert!(
+            page.body.contains("keep-this-working-state"),
+            "fallback page must carry the session's observations, got: {}",
+            page.body
+        );
+        assert!(
+            page.body.contains("**observations:** 1"),
+            "fallback page must account for every captured observation, got: {}",
+            page.body
+        );
+    }
+
+    /// The fallback is narrow on purpose: the rule-based path writes with
+    /// `admission_ctx: None`, so degrading on an admission or store rejection
+    /// would launder the very policy decision that just fired.
+    #[test]
+    fn only_provider_failures_degrade_to_the_rule_based_checkpoint() {
+        assert!(checkpoint_degrades_to_synth(&ConsolidatorError::Llm(
+            ai_memory_llm::LlmError::Provider {
+                status: 400,
+                body: "exceed_context_size_error".into(),
+            }
+        )));
+        assert!(checkpoint_degrades_to_synth(&ConsolidatorError::Serde(
+            "expected value".into()
+        )));
+
+        assert!(
+            !checkpoint_degrades_to_synth(&ConsolidatorError::SessionNotFound(SessionId::new())),
+            "an unresolvable session must fail closed"
+        );
+        // An admission webhook rejecting a write surfaces as
+        // `WikiError::Io(io::Error::other(..))` (see `AdmissionChain::notify`).
+        assert!(
+            !checkpoint_degrades_to_synth(&ConsolidatorError::Wiki(ai_memory_wiki::WikiError::Io(
+                std::io::Error::other("admission webhook rejected the write")
+            ))),
+            "an admission rejection must never be laundered through the synth path"
+        );
     }
 
     #[test]

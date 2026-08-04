@@ -498,6 +498,11 @@ breadth_weight = 0.0               # opt-in reward for distinct operators
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context
 
+[consolidation]                    # LLM consolidation prompt sizing
+max_input_tokens = 100000          # WHOLE prompt budget; default assumes 200k ctx
+                                   # lower to a small local model's real capacity,
+                                   # or the provider rejects every consolidation
+
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review
 min_observations = 8

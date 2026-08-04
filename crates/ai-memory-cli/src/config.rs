@@ -183,6 +183,9 @@ pub struct Config {
     pub maintenance: MaintenanceSettings,
     /// Memory-slot behaviour.
     pub slots: SlotSettings,
+    /// LLM consolidation prompt sizing. Must match the configured model's
+    /// real input capacity; the default assumes a 200k-context provider.
+    pub consolidation: ConsolidationSettings,
     /// Auto-improvement reviewer. The scheduler launches background review for
     /// newly completed sessions; manual CLI/admin/MCP runs remain available.
     /// Both approve validated proposals by default unless `require_approval` is
@@ -503,6 +506,7 @@ impl Default for Config {
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
             slots: SlotSettings::default(),
+            consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
@@ -513,6 +517,29 @@ impl Default for Config {
             cors_allow_origins: Vec::new(),
             admission_webhooks: Vec::new(),
             runtime_env: RuntimeEnv::default(),
+        }
+    }
+}
+
+/// `[consolidation]` LLM consolidation prompt sizing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsolidationSettings {
+    /// Approximate chars/4 budget for the ENTIRE consolidation prompt:
+    /// observation dump, current page body, system prompt, page conventions,
+    /// slot snapshots, and the structured-output schema.
+    ///
+    /// The default assumes a 200k-context provider. A smaller model needs this
+    /// lowered to its real input capacity, minus room for the 32k output
+    /// reservation — otherwise the provider rejects the whole request and the
+    /// session is never consolidated.
+    pub max_input_tokens: usize,
+}
+
+impl Default for ConsolidationSettings {
+    fn default() -> Self {
+        Self {
+            max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
         }
     }
 }
@@ -808,6 +835,20 @@ impl Config {
         if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
             anyhow::bail!(
                 "decay.breadth_weight must be a finite number greater than or equal to zero"
+            );
+        }
+
+        // Fail at startup rather than shipping a prompt that is all scaffolding
+        // and no observations: below this floor the fixed system prompt and page
+        // conventions consume the entire budget, so every consolidation would
+        // either be evidence-free or rejected by the provider.
+        let min_input_tokens = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_INPUT_TOKENS;
+        if config.consolidation.max_input_tokens < min_input_tokens {
+            anyhow::bail!(
+                "consolidation.max_input_tokens must be at least {min_input_tokens} \
+                 (got {}); below that the system prompt and page conventions leave \
+                 no room for observations",
+                config.consolidation.max_input_tokens
             );
         }
 
@@ -1238,6 +1279,51 @@ mod tests {
                 "unexpected error for {value}: {error:#}"
             );
         }
+    }
+
+    /// The consolidation budget must be big enough to leave room for
+    /// observations after the fixed system prompt and page conventions.
+    /// Below the floor every consolidation would be evidence-free, so it
+    /// fails at startup instead of once per PreCompact.
+    #[test]
+    fn load_rejects_a_consolidation_budget_below_the_prompt_reserve() {
+        let min = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_INPUT_TOKENS;
+        for value in [0, 1, min - 1] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[consolidation]\nmax_input_tokens = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an unusable consolidation budget must fail closed");
+            assert!(
+                error.to_string().contains("consolidation.max_input_tokens"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// A small-context provider is configured by lowering this one key, so it
+    /// has to survive the config round-trip.
+    #[test]
+    fn load_accepts_a_small_context_consolidation_budget() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[consolidation]\nmax_input_tokens = 7000\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.consolidation.max_input_tokens, 7_000);
+    }
+
+    #[test]
+    fn defaults_bound_consolidation_prompts_for_a_large_context_provider() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.consolidation.max_input_tokens,
+            ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS
+        );
     }
 
     #[test]

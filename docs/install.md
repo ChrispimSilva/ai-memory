@@ -1301,6 +1301,26 @@ or returns a malformed response shape. For an incompatible endpoint, opt out:
 -e AI_MEMORY_LLM_COMPAT_STRICT=false
 ```
 
+#### Match the consolidation budget to a local model's context window
+
+Consolidation prompts default to a ~100k-token budget, sized for a
+200k-context provider. A local model with a smaller window rejects the whole
+request — `exceed_context_size_error` from llama.cpp, HTTP 400 from most
+gateways — and the session is never consolidated. Lower the budget to the
+model's real input capacity, leaving room for the 32k output reservation:
+
+```bash
+# e.g. a model loaded with an 8k context window
+-e AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS=7000
+```
+
+Note the double underscore: it separates the `[consolidation]` section from
+the key. The budget covers the entire prompt (observations, current page body,
+system prompt, page conventions, slot snapshots, schema), so a smaller value
+trades recalled context for a request the provider actually accepts. A
+provider failure now degrades to the rule-based checkpoint rather than losing
+the checkpoint, but a right-sized budget is what gets real LLM consolidation.
+
 ---
 
 ## Common subcommands
