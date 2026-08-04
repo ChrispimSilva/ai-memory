@@ -16,8 +16,9 @@ use ai_memory_core::{
 use ai_memory_workstream::{
     ExportedTranscript, LaunchMode, LaunchPlan, ManagedHarness, NativeSessionCandidate,
     allows_native_session_adoption, apply_yolo, build_launch_plan, discover_native_session,
-    export_transcript, has_native_session_selector, inspect_repository, list_native_sessions,
-    native_session_exists, wait_for_transcript_flush,
+    export_transcript, has_native_session_selector, inspect_repository,
+    kiro_selects_non_default_engine, list_native_sessions, native_session_exists,
+    wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -36,14 +37,13 @@ const PREPARE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const IMPORT_BATCH_EVENTS: usize = 400;
 const IMPORT_BATCH_BYTES: usize = 1024 * 1024;
 const ADOPTION_CANDIDATE_LIMIT: usize = 8;
-const AUTO_HARNESSES: [ManagedHarness; 7] = [
+const AUTO_HARNESSES: [ManagedHarness; 6] = [
     ManagedHarness::Claude,
     ManagedHarness::Codex,
     ManagedHarness::OpenCode,
     ManagedHarness::Pi,
     ManagedHarness::Crush,
     ManagedHarness::Kimi,
-    ManagedHarness::Kiro,
 ];
 
 #[derive(Debug, Clone)]
@@ -642,7 +642,7 @@ fn filter_usable_auto_sessions(
 
 fn no_auto_session_error() -> anyhow::Error {
     anyhow!(
-        "no Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, or Kiro CLI session was found for this directory; start one explicitly with `ai-memory run claude`, `ai-memory run codex`, `ai-memory run opencode`, `ai-memory run pi`, `ai-memory run crush`, `ai-memory run kimi`, or `ai-memory run kiro`"
+        "no Claude Code, Codex, OpenCode, Pi, Crush, or Kimi Code session was found for this directory; start one explicitly with `ai-memory run claude`, `ai-memory run codex`, `ai-memory run opencode`, `ai-memory run pi`, `ai-memory run crush`, or `ai-memory run kimi`"
     )
 }
 
@@ -1232,6 +1232,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Crush => ManagedHarness::Crush,
         RunHarnessChoice::Omp => ManagedHarness::Omp,
         RunHarnessChoice::Kimi => ManagedHarness::Kimi,
+        RunHarnessChoice::Kiro => ManagedHarness::Kiro,
         RunHarnessChoice::Grok => ManagedHarness::Grok,
         RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
     }
@@ -1245,6 +1246,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Pi => Some(ManagedHarness::Pi),
         AgentKind::Crush => Some(ManagedHarness::Crush),
         AgentKind::KimiCode => Some(ManagedHarness::Kimi),
+        AgentKind::KiroCli => Some(ManagedHarness::Kiro),
         AgentKind::Grok => Some(ManagedHarness::Grok),
         AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
         _ => None,

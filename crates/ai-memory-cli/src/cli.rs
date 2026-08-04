@@ -234,6 +234,9 @@ pub enum RunHarnessChoice {
     /// Moonshot AI Kimi Code.
     #[value(name = "kimi", alias = "kimi-code", alias = "kimi-cli")]
     Kimi,
+    /// Amazon Kiro CLI (v2 engine).
+    #[value(name = "kiro", alias = "kiro-cli")]
+    Kiro,
     /// Grok Build CLI (xAI).
     #[value(alias = "grok-build")]
     Grok,

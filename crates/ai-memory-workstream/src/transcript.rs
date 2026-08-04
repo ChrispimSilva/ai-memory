@@ -51,8 +51,9 @@ struct FileCursor {
     offset: u64,
     /// Hash of every committed byte through `offset`. Kimi Code and Grok can
     /// rewrite their journals in place (Kimi on fork/compaction/resume, Grok
-    /// on rewind), so those adapters validate this prefix before trusting the
-    /// byte offset. Other JSONL adapters remain offset-only.
+    /// on rewind); Kiro's append-only behavior is not documented. Those
+    /// adapters validate this prefix before trusting the byte offset. Other
+    /// JSONL adapters remain offset-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefix_sha256: Option<String>,
 }
@@ -60,7 +61,10 @@ struct FileCursor {
 /// Harnesses whose JSONL journal can be rewritten in place, requiring
 /// prefix-validated cursors and content-hash record ids.
 const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
-    matches!(harness, ManagedHarness::Kimi | ManagedHarness::Grok)
+    matches!(
+        harness,
+        ManagedHarness::Kimi | ManagedHarness::Kiro | ManagedHarness::Grok
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -338,6 +342,13 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
+            ManagedHarness::Kiro => parse_kiro(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
             ManagedHarness::Grok => parse_grok(
                 &value,
                 native_session_id,
@@ -367,17 +378,6 @@ fn export_jsonl(
         events,
         losses: deduplicate_losses(losses),
     })
-}
-
-/// Journals the harness may rewrite in place (fork/compaction/resume),
-/// where a byte-offset cursor would silently change meaning: the adapter
-/// validates a prefix hash before trusting the offset and derives record
-/// ids from the raw line bytes. Kimi is a confirmed rewriter; Kiro's
-/// event stream is not verified append-only, so it gets the same
-/// tolerance defensively (a rewrite resets the cursor and the stable
-/// line-hash record ids dedupe the replay server-side).
-const fn rewrite_tolerant_journal(harness: ManagedHarness) -> bool {
-    matches!(harness, ManagedHarness::Kimi | ManagedHarness::Kiro)
 }
 
 fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
@@ -1766,13 +1766,16 @@ fn locate_session_file(
     id: &str,
 ) -> Result<Option<PathBuf>> {
     let root = session_root(harness, home, session_dir);
+    if !valid_native_session_id(id) {
+        return Ok(None);
+    }
     if harness == ManagedHarness::Antigravity {
         // The conversation id is the file name, so no scan is ever needed.
         if Uuid::parse_str(id).is_err() {
             return Ok(None);
         }
         let exact = root.join(format!("{id}.db"));
-        return Ok(exact.is_file().then_some(exact));
+        return Ok(session_path_matches(harness, &exact, id, cwd)?.then_some(exact));
     }
     if harness == ManagedHarness::Claude {
         let encoded = cwd.to_string_lossy().replace('/', "-");
@@ -1788,32 +1791,47 @@ fn locate_session_file(
         if let Ok(buckets) = fs::read_dir(&root) {
             for bucket in buckets.flatten() {
                 let candidate = bucket.path().join(id).join("agents/main/wire.jsonl");
-                if candidate.is_file() {
+                if session_path_matches(harness, &candidate, id, cwd)? {
                     return Ok(Some(candidate));
                 }
             }
         }
     }
     if harness == ManagedHarness::Kiro {
-        // The store is flat: `<root>/<session-id>.jsonl`.
+        // The store is flat and shared by every checkout. Require both the
+        // UUID file name and its sibling metadata to identify this checkout;
+        // a server-linked id is untrusted input and must not select another
+        // project's transcript.
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
         let exact = root.join(format!("{id}.jsonl"));
-        if exact.is_file() {
+        if session_path_matches(harness, &exact, id, cwd)? {
             return Ok(Some(exact));
         }
+        return Ok(None);
     }
     let mut files = collect_files(&root, |path| transcript_file(harness, path))?;
     files.sort_by_key(|path| temporary_transcript(path));
-    for path in &files {
-        if path.to_string_lossy().contains(id) {
-            return Ok(Some(path.clone()));
-        }
-    }
     for path in files.into_iter().take(2_000) {
-        if session_header(harness, &path)?.is_some_and(|(found, _)| found == id) {
+        if session_path_matches(harness, &path, id, cwd)? {
             return Ok(Some(path));
         }
     }
     Ok(None)
+}
+
+fn session_path_matches(
+    harness: ManagedHarness,
+    path: &Path,
+    id: &str,
+    cwd: &Path,
+) -> Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    Ok(session_header(harness, path)?
+        .is_some_and(|(found, recorded_cwd)| found == id && same_path(&recorded_cwd, cwd)))
 }
 
 fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
@@ -1832,6 +1850,13 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .and_then(|dir| dir.file_name())
                 .and_then(|name| name.to_str())
                 == Some("main");
+    }
+    if harness == ManagedHarness::Kiro {
+        return path.extension().is_some_and(|ext| ext == "jsonl")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| Uuid::parse_str(stem).is_ok());
     }
     if harness == ManagedHarness::Antigravity {
         // One SQLite database per conversation, named by its id.
@@ -1852,6 +1877,9 @@ fn temporary_transcript(path: &Path) -> bool {
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::Kimi {
         return kimi_session_header(path);
+    }
+    if harness == ManagedHarness::Kiro {
+        return kiro_session_header(path);
     }
     if harness == ManagedHarness::Grok {
         return grok_session_header(path);
@@ -1888,6 +1916,7 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             ManagedHarness::OpenCode
             | ManagedHarness::Crush
             | ManagedHarness::Kimi
+            | ManagedHarness::Kiro
             | ManagedHarness::Grok
             | ManagedHarness::Antigravity => (None, None),
         };
@@ -1918,6 +1947,34 @@ fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     let Some(id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    Ok(Some((id.to_string(), PathBuf::from(cwd))))
+}
+
+/// Kiro v2 sessions pair a flat `<uuid>.jsonl` event stream with
+/// `<uuid>.json` metadata. Missing, malformed, or mismatched metadata makes
+/// the transcript ineligible for discovery or resume.
+fn kiro_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    if Uuid::parse_str(stem).is_err() {
+        return Ok(None);
+    }
+    let Ok(raw) = fs::read_to_string(path.with_extension("json")) else {
+        return Ok(None);
+    };
+    let Ok(metadata) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(None);
+    };
+    let Some(id) = metadata.get("session_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if id != stem {
+        return Ok(None);
+    }
+    let Some(cwd) = metadata.get("cwd").and_then(Value::as_str) else {
         return Ok(None);
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
@@ -2258,6 +2315,7 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Crush => home.join(".crush"),
         ManagedHarness::Omp => home.join(".omp/agent/sessions"),
         ManagedHarness::Kimi => home.join(".kimi-code/sessions"),
+        ManagedHarness::Kiro => home.join(".kiro/sessions/cli"),
         ManagedHarness::Grok => home.join(".grok/sessions"),
         ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
     }
@@ -2353,6 +2411,9 @@ fn valid_native_session_id(value: &str) -> bool {
     !value.trim().is_empty()
         && value.len() <= MAX_NATIVE_SESSION_ID_BYTES
         && !value.starts_with('-')
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\'])
         && !value.chars().any(char::is_control)
 }
 
@@ -2423,6 +2484,7 @@ mod tests {
                     ManagedHarness::OpenCode
                     | ManagedHarness::Crush
                     | ManagedHarness::Kimi
+                    | ManagedHarness::Kiro
                     | ManagedHarness::Grok
                     | ManagedHarness::Antigravity => {
                         unreachable!()
@@ -2952,7 +3014,16 @@ mod tests {
             "session_bbb",
         )
         .unwrap();
-        assert_eq!(found.as_deref(), Some(wire_b.as_path()));
+        assert!(found.is_none());
+        let found_for_other = locate_session_file(
+            ManagedHarness::Kimi,
+            temp.path(),
+            &other,
+            Some(root.path()),
+            "session_bbb",
+        )
+        .unwrap();
+        assert_eq!(found_for_other.as_deref(), Some(wire_b.as_path()));
         assert!(
             native_session_exists(
                 ManagedHarness::Kimi,
@@ -3597,6 +3668,200 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("hook capture"), "{error}");
+    }
+
+    const KIRO_SESSION_A: &str = "3f6d1c2a-0000-4000-8000-000000000aaa";
+    const KIRO_SESSION_B: &str = "3f6d1c2a-0000-4000-8000-000000000bbb";
+
+    fn write_kiro_session(root: &Path, id: &str, cwd: &Path, lines: &[Value]) {
+        fs::write(
+            root.join(format!("{id}.json")),
+            json!({
+                "session_id": id,
+                "cwd": cwd,
+                "created_at": "2026-08-01T10:00:00Z",
+                "updated_at": "2026-08-01T10:05:00Z",
+                "title": "sanitized structural fixture",
+                "session_state": {"version": "v1", "conversation_metadata": {}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let transcript = lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(root.join(format!("{id}.jsonl")), transcript).unwrap();
+    }
+
+    #[tokio::test]
+    async fn kiro_discovery_and_exact_lookup_are_checkout_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let root = temp.path().join("kiro-sessions");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_kiro_session(&root, KIRO_SESSION_A, &cwd, &[]);
+        write_kiro_session(&root, KIRO_SESSION_B, &other, &[]);
+
+        let sessions =
+            list_native_sessions(ManagedHarness::Kiro, temp.path(), &cwd, Some(&root), 8)
+                .await
+                .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, KIRO_SESSION_A);
+
+        assert_eq!(
+            locate_session_file(
+                ManagedHarness::Kiro,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                KIRO_SESSION_A,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(root.join(format!("{KIRO_SESSION_A}.jsonl")).as_path())
+        );
+        assert!(
+            locate_session_file(
+                ManagedHarness::Kiro,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                KIRO_SESSION_B,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            locate_session_file(
+                ManagedHarness::Kiro,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                "../../outside",
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_mismatched_metadata_never_becomes_resumable() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let root = temp.path().join("kiro-sessions");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(format!("{KIRO_SESSION_A}.json")),
+            json!({"session_id": KIRO_SESSION_B, "cwd": cwd}).to_string(),
+        )
+        .unwrap();
+        fs::write(root.join(format!("{KIRO_SESSION_A}.jsonl")), "{}\n").unwrap();
+
+        assert!(
+            list_native_sessions(ManagedHarness::Kiro, temp.path(), &cwd, Some(&root), 8,)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Kiro,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                KIRO_SESSION_A,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn kiro_export_maps_only_visible_v1_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let stream = temp.path().join(format!("{KIRO_SESSION_A}.jsonl"));
+        let records = [
+            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m1","content":[{"kind":"text","data":"hello kiro"}],"meta":{"timestamp":1_700_000_000_000_i64}}}),
+            json!({"version":"v1","kind":"AssistantMessage","data":{"message_id":"m2","content":[
+                {"kind":"text","data":"visible answer"},
+                {"kind":"toolUse","data":{"name":"fs_read","tool_use_id":"call_1","input":{"path":"README.md"}}}
+            ]}}),
+            json!({"version":"v1","kind":"ToolResults","data":{"message_id":"m3","content":[
+                {"kind":"toolResult","data":{"tool_use_id":"call_1","content":[{"kind":"text","data":"result ok"}],"is_error":false}}
+            ]}}),
+            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m4","content":[{"kind":"image","data":{"format":"png"}}]}}),
+            json!({"version":"v2","kind":"Prompt","data":{"message_id":"m5","content":[{"kind":"text","data":"future"}]}}),
+        ];
+        fs::write(
+            &stream,
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let export = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_SESSION_A, None).unwrap();
+        assert_eq!(export.events.len(), 4);
+        assert_eq!(export.events[0].content, "hello kiro");
+        assert_eq!(export.events[0].role.as_deref(), Some("user"));
+        assert_eq!(
+            export.events[0].occurred_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(export.events[1].content, "visible answer");
+        assert_eq!(export.events[2].kind, WorkstreamEventKind::ToolCall);
+        assert_eq!(export.events[3].content, "result ok");
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("non-text content"))
+        );
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("unsupported envelope version v2"))
+        );
+    }
+
+    #[test]
+    fn kiro_cursor_restarts_after_an_in_place_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let stream = temp.path().join(format!("{KIRO_SESSION_A}.jsonl"));
+        fs::write(
+            &stream,
+            format!(
+                "{}\n",
+                json!({"version":"v1","kind":"Prompt","data":{"message_id":"m1","content":[{"kind":"text","data":"first"}]}})
+            ),
+        )
+        .unwrap();
+        let first = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_SESSION_A, None).unwrap();
+
+        fs::write(
+            &stream,
+            format!(
+                "{}\n",
+                json!({"version":"v1","kind":"Prompt","data":{"message_id":"m2","content":[{"kind":"text","data":"rewritten"}]}})
+            ),
+        )
+        .unwrap();
+        let rewritten = export_jsonl(
+            ManagedHarness::Kiro,
+            &stream,
+            KIRO_SESSION_A,
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(rewritten.events.len(), 1);
+        assert_eq!(rewritten.events[0].content, "rewritten");
     }
 
     #[test]
