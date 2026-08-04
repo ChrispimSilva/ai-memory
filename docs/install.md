@@ -794,8 +794,12 @@ semantics. Add v3 only after real payload fixtures can exercise that boundary.
 
 `ai-memory uninstall --only hooks --apply --yes` removes only exact ai-memory v2
 entries from global agents and the current project's `.kiro/agents` directory;
-it leaves standalone v3 files untouched. Managed `ai-memory run kiro` support
-is tracked separately in [#356](https://github.com/akitaonrails/ai-memory/issues/356).
+it leaves standalone v3 files untouched. Explicit `ai-memory run kiro` (alias
+`kiro-cli`) manages the default v2 engine and honors `$KIRO_HOME`; Kiro stays
+outside no-argument automatic selection until its current event stream is
+validated in a logged-in real-harness acceptance run. `--v3`, `--mode`, and
+non-v2 `--agent-engine` invocations pass through without managed session
+injection. See [managed workstreams](managed-workstreams.md#native-adapter-behavior).
 
 ### OpenCode
 

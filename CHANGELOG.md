@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added explicit Kiro CLI v2 managed-workstream launches through `ai-memory run
+  kiro` / `kiro-cli`, including native `--resume-id` reuse, `$KIRO_HOME`
+  discovery, v2 `--yolo` translation, read-only visible-event import, and
+  checkout-scoped UUID/metadata validation. Non-v2 engines pass through
+  without session injection. Kiro remains outside bare automatic selection
+  until a logged-in current-format acceptance run is available, and v3 managed
+  sessions remain unsupported (#356).
 - Added verified Kiro CLI v2 lifecycle hooks. CamelCase hooks merge into
   existing agent configs, honor `$KIRO_HOME`, preserve unrelated hooks and
   per-agent project strategies, fail before changing any target when one is
