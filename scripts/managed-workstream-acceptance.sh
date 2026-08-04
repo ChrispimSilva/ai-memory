@@ -217,6 +217,37 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
     packet=$(jq -r '.options.global_context_paths[-1]' "$CRUSH_GLOBAL_CONFIG/crush.json")
     cp "$packet" "$AI_MEMORY_ACCEPTANCE_CRUSH_PACKET_LOG"
     ;;
+  kiro)
+    printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    # Honor `--resume-id <id>` (resume); a fresh launch mints its own id
+    # because Kiro CLI session ids are server-assigned UUIDs.
+    session_id=""
+    previous_arg=""
+    for arg in "$@"; do
+      if [ "$previous_arg" = --resume-id ]; then
+        session_id=$arg
+      fi
+      previous_arg=$arg
+    done
+    if [ -z "$session_id" ]; then
+      session_id=$(cat /proc/sys/kernel/random/uuid)
+    fi
+    # Real layout: flat store, one `<uuid>.json` metadata + `<uuid>.jsonl`
+    # event-stream pair per session; discovery must read the metadata cwd.
+    store="${KIRO_HOME:?kiro fake mode requires KIRO_HOME}/sessions/cli"
+    mkdir -p "$store"
+    stream="$store/$session_id.jsonl"
+    if [ ! -f "$store/$session_id.json" ]; then
+      printf '{"session_id":"%s","cwd":"%s","created_at":"2026-08-01T10:00:00Z","updated_at":"2026-08-01T10:00:00Z","title":"acceptance","session_state":{"version":"v1","conversation_metadata":{}}}\n' \
+        "$session_id" "$PWD" >"$store/$session_id.json"
+      : >"$stream"
+    fi
+    sentinel=${AI_MEMORY_ACCEPTANCE_SENTINEL:-AMWS-FAKE-KIRO}
+    printf '{"version":"v1","kind":"Prompt","data":{"message_id":"m-%s-u","content":[{"kind":"text","data":"%s"}],"meta":{"timestamp":%s}}}\n' \
+      "$(date +%s)" "$sentinel" "$(date +%s)000" >>"$stream"
+    printf '{"version":"v1","kind":"AssistantMessage","data":{"message_id":"m-%s-a","content":[{"kind":"text","data":"%s reply"}],"meta":{"timestamp":%s}}}\n' \
+      "$(date +%s)" "$sentinel" "$(date +%s)000" >>"$stream"
+    ;;
   kimi)
     printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
     # Honor `--session <id>` (resume); a fresh launch mints its own id

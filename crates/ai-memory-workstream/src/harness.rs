@@ -97,6 +97,28 @@ impl ManagedHarness {
     }
 }
 
+/// Whether a Kiro CLI invocation targets an agent engine other than the
+/// default v2 engine — `--v3`, `--mode` (a v3-only option), or an
+/// `--agent-engine` value that is not `v2` (the `chat` subcommand's
+/// engine selector, verified on kiro-cli 2.16.0).
+///
+/// Kiro v3 sessions live in a separate id space and cannot be resumed by
+/// the v2 engine (nor vice versa), and the v3 persisted-session format is
+/// not publicly documented, so managed continuity covers the v2 engine
+/// only. Any non-v2 engine selection makes the whole invocation pass
+/// through — no session injection, no adoption, no import — which keeps
+/// incompatible v2/v3 sessions from being cross-resumed by construction.
+#[must_use]
+pub fn kiro_selects_non_default_engine(args: &[OsString]) -> bool {
+    if has_flag(args, &["--v3", "--mode"]) {
+        return true;
+    }
+    if !has_flag(args, &["--agent-engine"]) {
+        return false;
+    }
+    flag_value(args, &["--agent-engine"]).as_deref() != Some("v2")
+}
+
 /// Whether the planned native invocation participates in session continuity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchMode {
@@ -315,10 +337,41 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
 }
 
 fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
-    if has_flag(args, &["--help", "-h", "--version", "-v"])
+    // Kiro's `-v` is verbose (its version short flag is `-V`), so the
+    // generic version-flag check must not send `kiro-cli -v` through
+    // unmanaged.
+    let version_flags: &[&str] = if harness == ManagedHarness::Kiro {
+        &["--help", "-h", "--version", "-V", "--help-all"]
+    } else {
+        &["--help", "-h", "--version", "-v"]
+    };
+    if has_flag(args, version_flags)
         || has_flag(args, &["--no-session", "--no-session-persistence"])
     {
         return LaunchMode::Passthrough;
+    }
+    if harness == ManagedHarness::Kiro {
+        // Managed continuity is verified for the default v2 engine only;
+        // any other engine selection passes straight through (see
+        // `kiro_selects_non_default_engine`). Headless `--no-interactive`
+        // runs persist to the v1 SQLite store rather than the v2 session
+        // files this adapter reads, and the one-shot list/delete flags
+        // never open a session, so none of them is session-bearing.
+        if kiro_selects_non_default_engine(args)
+            || has_flag(
+                args,
+                &[
+                    "--no-interactive",
+                    "--list-sessions",
+                    "-l",
+                    "--list-models",
+                    "--delete-session",
+                    "-d",
+                ],
+            )
+        {
+            return LaunchMode::Passthrough;
+        }
     }
     if harness == ManagedHarness::Codex
         && first_arg_is(args, "exec")

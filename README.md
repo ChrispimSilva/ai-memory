@@ -74,13 +74,15 @@ priors are at the [bottom](#influences-and-prior-art).
   and full-ledger search. Delivered packets are origin-marked; Claude transcript
   import rejects a packet that Claude persisted and read back through a tool.
   `ai-memory run` with no harness continues the newest usable Claude Code,
-  Codex, OpenCode, Pi, Crush, or Kimi Code session for this checkout. On first
+  Codex, OpenCode, Pi, Crush, Kimi Code, or Kiro CLI session for this checkout.
+  On first
   explicit use, an interactive launcher can adopt a previous session from the
   same checkout; later switches cannot select unrelated native history. Native
   arguments pass through unchanged except the wrapper-owned `--yolo` and
   `--fresh`; direct
   commands are unaffected. `kimi-code` and `kimi-cli` are accepted aliases for
-  the installed `kimi` command.
+  the installed `kimi` command, and `kiro-cli` for the installed `kiro-cli`
+  command (`ai-memory run kiro`, default v2 engine only).
 - **Per-repository capture exclusions.** A nearest-marker `[capture]`
   `ignore_paths` policy drops matching recognized file-tool events before they
   reach the local spool or server. See [the capture policy reference](docs/marker-file.md#capture-exclusions).

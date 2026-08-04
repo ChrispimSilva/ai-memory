@@ -300,7 +300,9 @@ fn export_jsonl(
             // on fork/compaction/resume, Grok on rewind) — a byte-offset id
             // would silently change meaning. Hashing the raw line keeps
             // record ids (and therefore server-side event dedup) stable
-            // across rewrites.
+            // across rewrites. Kiro records reuse one message_id across an
+            // exchange's Prompt/AssistantMessage/ToolResults records, so
+            // the line hash is its unique record id as well.
             let raw = line.strip_suffix(b"\n").unwrap_or(&line);
             format!("{:x}", Sha256::digest(raw))
         } else {
@@ -365,6 +367,17 @@ fn export_jsonl(
         events,
         losses: deduplicate_losses(losses),
     })
+}
+
+/// Journals the harness may rewrite in place (fork/compaction/resume),
+/// where a byte-offset cursor would silently change meaning: the adapter
+/// validates a prefix hash before trusting the offset and derives record
+/// ids from the raw line bytes. Kimi is a confirmed rewriter; Kiro's
+/// event stream is not verified append-only, so it gets the same
+/// tolerance defensively (a rewrite resets the cursor and the stable
+/// line-hash record ids dedupe the replay server-side).
+const fn rewrite_tolerant_journal(harness: ManagedHarness) -> bool {
+    matches!(harness, ManagedHarness::Kimi | ManagedHarness::Kiro)
 }
 
 fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
@@ -942,6 +955,185 @@ fn kimi_timestamp(value: &Value) -> Option<String> {
     jiff::Timestamp::from_millisecond(millis)
         .ok()
         .map(|timestamp| timestamp.to_string())
+}
+
+/// Import one Kiro v2-engine session event: a versioned envelope
+/// `{"version":"v1","kind":…,"data":{"message_id":…,"content":[…],"meta":…}}`
+/// whose `content` parts carry their own `kind`/`data`. Visible kinds:
+/// `Prompt` (user), `AssistantMessage` (assistant text + `toolUse` parts),
+/// `ToolResults` (`toolResult` parts). Unknown record kinds within the
+/// `v1` envelope are ignored so newer Kiro versions stay
+/// forward-compatible; a non-`v1` envelope version is annotated instead —
+/// that axis signals a schema break, not an additive record type.
+fn parse_kiro(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    match value.get("version").and_then(Value::as_str) {
+        Some("v1") => {}
+        Some(other) => {
+            losses.push(format!(
+                "Kiro records with unsupported envelope version {other} were skipped"
+            ));
+            return;
+        }
+        None => {
+            losses.push("Kiro records without an envelope version were skipped".into());
+            return;
+        }
+    }
+    let data = value.get("data").unwrap_or(&Value::Null);
+    let occurred_at = kiro_timestamp(data);
+    let parts = data
+        .get("content")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    match value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "Prompt" => {
+            for (index, part) in parts.iter().enumerate() {
+                match part.get("kind").and_then(Value::as_str).unwrap_or_default() {
+                    "text" => {
+                        if let Some(text) = part.get("data").and_then(Value::as_str) {
+                            push_event(
+                                events,
+                                AgentKind::KiroCli,
+                                session,
+                                record_id,
+                                index,
+                                WorkstreamEventKind::Message,
+                                Some("user"),
+                                text,
+                                occurred_at.clone(),
+                                json!({}),
+                            );
+                        }
+                    }
+                    _ => {
+                        losses
+                            .push("Kiro non-text content parts were intentionally excluded".into());
+                    }
+                }
+            }
+        }
+        "AssistantMessage" => {
+            for (index, part) in parts.iter().enumerate() {
+                match part.get("kind").and_then(Value::as_str).unwrap_or_default() {
+                    "text" => {
+                        if let Some(text) = part.get("data").and_then(Value::as_str) {
+                            push_event(
+                                events,
+                                AgentKind::KiroCli,
+                                session,
+                                record_id,
+                                index,
+                                WorkstreamEventKind::Message,
+                                Some("assistant"),
+                                text,
+                                occurred_at.clone(),
+                                json!({}),
+                            );
+                        }
+                    }
+                    "toolUse" => {
+                        let tool = part.get("data").unwrap_or(&Value::Null);
+                        let name = first_string(tool, &["name", "toolName", "tool_name"])
+                            .unwrap_or("tool");
+                        let arguments = tool
+                            .get("input")
+                            .or_else(|| tool.get("args"))
+                            .or_else(|| tool.get("arguments"))
+                            .map(compact_json)
+                            .unwrap_or_else(|| compact_json(tool));
+                        push_event(
+                            events,
+                            AgentKind::KiroCli,
+                            session,
+                            record_id,
+                            index,
+                            WorkstreamEventKind::ToolCall,
+                            Some("assistant"),
+                            &format!("{name}: {arguments}"),
+                            occurred_at.clone(),
+                            json!({
+                                "tool": name,
+                                "tool_call_id": first_string(tool, &["tool_use_id", "toolUseId", "id"])
+                            }),
+                        );
+                    }
+                    _ => {
+                        losses
+                            .push("Kiro non-text content parts were intentionally excluded".into());
+                    }
+                }
+            }
+        }
+        "ToolResults" => {
+            for (index, part) in parts.iter().enumerate() {
+                if part.get("kind").and_then(Value::as_str) != Some("toolResult") {
+                    continue;
+                }
+                let result = part.get("data").unwrap_or(&Value::Null);
+                let body = kiro_result_text(result)
+                    .filter(|text| !text.trim().is_empty())
+                    .unwrap_or_else(|| compact_json(result));
+                push_event(
+                    events,
+                    AgentKind::KiroCli,
+                    session,
+                    record_id,
+                    index,
+                    WorkstreamEventKind::ToolResult,
+                    Some("tool"),
+                    &body,
+                    occurred_at.clone(),
+                    json!({
+                        "tool_call_id": first_string(result, &["tool_use_id", "toolUseId", "id"]),
+                        "is_error": result
+                            .get("is_error")
+                            .or_else(|| result.get("isError"))
+                            .and_then(Value::as_bool)
+                    }),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Kiro event timestamps ride `data.meta.timestamp` as a unix epoch in
+/// milliseconds.
+fn kiro_timestamp(data: &Value) -> Option<String> {
+    let millis = data.get("meta")?.get("timestamp").and_then(Value::as_i64)?;
+    jiff::Timestamp::from_millisecond(millis)
+        .ok()
+        .map(|timestamp| timestamp.to_string())
+}
+
+/// Text of a Kiro tool result: its `content` is an array of the same
+/// `{kind, data}` parts the message records use (text parts join), with
+/// plain-string `content`/`output`/`text` fields tolerated as fallbacks.
+fn kiro_result_text(result: &Value) -> Option<String> {
+    if let Some(parts) = result.get("content").and_then(Value::as_array) {
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter(|part| part.get("kind").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("data").and_then(Value::as_str))
+            .collect();
+        if !texts.is_empty() {
+            return Some(texts.join("\n"));
+        }
+    }
+    ["content", "output", "text"]
+        .iter()
+        .find_map(|key| result.get(*key).and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 /// Subagent journals (`agents/<id != main>/wire.jsonl`) are not imported in
@@ -1600,6 +1792,13 @@ fn locate_session_file(
                     return Ok(Some(candidate));
                 }
             }
+        }
+    }
+    if harness == ManagedHarness::Kiro {
+        // The store is flat: `<root>/<session-id>.jsonl`.
+        let exact = root.join(format!("{id}.jsonl"));
+        if exact.is_file() {
+            return Ok(Some(exact));
         }
     }
     let mut files = collect_files(&root, |path| transcript_file(harness, path))?;

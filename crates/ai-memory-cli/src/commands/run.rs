@@ -36,13 +36,14 @@ const PREPARE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const IMPORT_BATCH_EVENTS: usize = 400;
 const IMPORT_BATCH_BYTES: usize = 1024 * 1024;
 const ADOPTION_CANDIDATE_LIMIT: usize = 8;
-const AUTO_HARNESSES: [ManagedHarness; 6] = [
+const AUTO_HARNESSES: [ManagedHarness; 7] = [
     ManagedHarness::Claude,
     ManagedHarness::Codex,
     ManagedHarness::OpenCode,
     ManagedHarness::Pi,
     ManagedHarness::Crush,
     ManagedHarness::Kimi,
+    ManagedHarness::Kiro,
 ];
 
 #[derive(Debug, Clone)]
@@ -293,6 +294,16 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         }
     }
     if args.yolo || trailing_yolo {
+        // Kiro's official dangerous mode exists on the v2 engine only
+        // (`--trust-all-tools`); the v3 engine replaced it with
+        // permissions.yaml and documents no CLI equivalent, so the wrapper
+        // maps nothing there and says so instead of failing silently.
+        if harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args) {
+            eprintln!(
+                "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
+                 (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+            );
+        }
         apply_yolo(harness, &mut plan.args);
     }
     if plan.mode == LaunchMode::Session
@@ -631,7 +642,7 @@ fn filter_usable_auto_sessions(
 
 fn no_auto_session_error() -> anyhow::Error {
     anyhow!(
-        "no Claude Code, Codex, OpenCode, Pi, Crush, or Kimi Code session was found for this directory; start one explicitly with `ai-memory run claude`, `ai-memory run codex`, `ai-memory run opencode`, `ai-memory run pi`, `ai-memory run crush`, or `ai-memory run kimi`"
+        "no Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, or Kiro CLI session was found for this directory; start one explicitly with `ai-memory run claude`, `ai-memory run codex`, `ai-memory run opencode`, `ai-memory run pi`, `ai-memory run crush`, `ai-memory run kimi`, or `ai-memory run kiro`"
     )
 }
 
@@ -1646,6 +1657,32 @@ mod tests {
             args.native_args,
             ["--model", "kimi-for-coding"].map(OsString::from).to_vec()
         );
+    }
+
+    #[test]
+    fn kiro_cli_alias_selects_the_kiro_adapter() {
+        for name in ["kiro", "kiro-cli"] {
+            let cli = Cli::try_parse_from([
+                OsStr::new("ai-memory"),
+                OsStr::new("run"),
+                OsStr::new(name),
+                OsStr::new("--model"),
+                OsStr::new("sonnet"),
+            ])
+            .unwrap();
+            let CliCommand::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            assert!(
+                matches!(args.harness, Some(crate::cli::RunHarnessChoice::Kiro)),
+                "{name}"
+            );
+            assert_eq!(
+                args.native_args,
+                ["--model", "sonnet"].map(OsString::from).to_vec()
+            );
+            assert_eq!(managed_harness(args.harness.unwrap()), ManagedHarness::Kiro);
+        }
     }
 
     #[test]

@@ -118,8 +118,8 @@ directory, including automatic harness selection. `continue` therefore accepts
 ## Automatic harness selection
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for
-Claude Code, Codex, OpenCode, Pi, Crush, and Kimi Code. For an empty workstream
-it resumes
+Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and Kiro CLI. For an empty
+workstream it resumes
 the newest session automatically. For an established workstream, server state
 takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
@@ -225,6 +225,7 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
 | Crush | native default creation | `--session <id>` | `<project>/.crush/crush.db` opened read-only |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
+| Kiro CLI | native default creation | `--resume-id <id>` | `$KIRO_HOME/sessions/cli/<uuid>.jsonl` (+ sibling `<uuid>.json` metadata) |
 | OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
@@ -276,6 +277,7 @@ ai-memory install-hooks --agent opencode --apply
 ai-memory install-hooks --agent pi --apply
 ai-memory install-hooks --agent omp --apply
 ai-memory install-hooks --agent kimi-code --apply
+ai-memory install-hooks --agent kiro-cli --apply
 ```
 
 Kimi Code hooks installed as native `ai-memory hook` commands automatically
