@@ -1391,6 +1391,8 @@ fn configure_consolidator(
     info!(
         provider = llm.name(),
         model = llm.model(),
+        max_input_tokens = config.consolidation.max_input_tokens,
+        max_output_tokens = config.consolidation.max_output_tokens,
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
     let consolidator = Arc::new(
@@ -1402,7 +1404,11 @@ fn configure_consolidator(
             workspace_id,
             project_id,
         )
-        .with_per_user_slots(config.slots.per_user),
+        .with_per_user_slots(config.slots.per_user)
+        .with_prompt_limits(
+            config.consolidation.max_input_tokens,
+            config.consolidation.max_output_tokens,
+        ),
     );
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
     // Optional post-RRF reranking rides on the same provider, so it is

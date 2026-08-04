@@ -1302,6 +1302,31 @@ or returns a malformed response shape. For an incompatible endpoint, opt out:
 -e AI_MEMORY_LLM_COMPAT_STRICT=false
 ```
 
+#### Match the consolidation budget to a local model's context window
+
+Consolidation defaults to an approximate 100k-token input target plus a 32k
+output limit, sized for a 200k-context provider. A local model with a smaller
+window can reject the whole request (`exceed_context_size_error` from
+llama.cpp, HTTP 400 from most gateways). Lower both limits so their sum fits
+the real context window, with additional headroom for tokenizer variance:
+
+```bash
+# e.g. a model loaded with an 8k context window
+-e AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS=6500
+-e AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS=1000
+```
+
+The double underscore separates the `[consolidation]` section from each key.
+The input target accounts for the rendered observations, current page body,
+system prompt, page conventions, bounded slot snapshots, structured-output
+schema, and provider-envelope reserve. Tokenizers differ, so this is a
+conservative estimate rather than an exact provider token count. An automatic
+checkpoint provider failure degrades to a rule-based page rather than losing
+the checkpoint, but right-sized limits are what allow LLM consolidation to
+succeed. Startup rejects input targets below 6,000 and output limits below
+1,000 because the batch schema and a useful response cannot fit reliably below
+those floors.
+
 ---
 
 ## Common subcommands

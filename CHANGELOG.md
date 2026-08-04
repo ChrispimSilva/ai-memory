@@ -43,11 +43,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   v2 tool payloads, and uninstall only exact ai-memory entries. Kiro v3 hook
   capture remains unsupported pending sanitized live lifecycle and built-in
   tool payload fixtures, despite its now-documented standalone schema (#355).
+- Added `[consolidation] max_input_tokens` and `max_output_tokens`
+  (`AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS` /
+  `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS`) for provider-specific context
+  limits. Input sizing now accounts for the rendered system/user messages,
+  bounded current-page or slot context, structured-output schema, and provider
+  envelope reserve instead of budgeting only the observation dump. Unsupported
+  minimums are rejected at startup (#369).
 
 ### Fixed
 - Mixed-case and trailing-period usernames now use deterministic hashed
   per-operator slot namespaces, preventing distinct identities from sharing one
   physical directory on case-insensitive filesystems (#364).
+- Consolidation prompts no longer ignore system, schema, instructions, and
+  dynamic slot/current-page overhead when allocating observations. The
+  provider-neutral estimate is deliberately conservative and documents the
+  remaining tokenizer variance instead of claiming an exact token ceiling
+  (#369).
+- A failing LLM no longer costs a session its PreCompact/PostCompaction
+  checkpoint. Provider failures (context overflow, rate limit, outage) and
+  unmappable structured output now degrade to the rule-based checkpoint a
+  zero-LLM install writes, so configuring a provider can no longer be worse
+  than leaving it unset. The fallback keeps the `consolidate` admission event;
+  admission rejections, wiki/store failures, and unresolvable sessions still
+  fail closed (#369).
 - Native-session checkout matching now fails closed when either path cannot be
   canonicalized, instead of treating two missing or inaccessible paths as the
   same checkout during managed resume or adoption (#356).
