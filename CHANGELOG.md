@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- MCP-only clients are now visible in the operator's traffic picture.
+  Every MCP tool call is counted against its caller — the sanitized
+  `clientInfo.name` from the initialize handshake when the HTTP
+  transport runs stateful (`--http-stateful`) or over stdio, else the
+  `X-Memory-Actor-Agent` overlay an ingress proxy asserts, else
+  `unknown` — split into reads and writes and bucketed per UTC day in a
+  new `client_activity` table (V46). A new root-gated
+  `GET /admin/activity/by-client?since_days=N` reports the aggregate,
+  volume-descending with a name tiebreak (`0`/absent = whole history).
+  Counts buffer in memory and fold into the store at most once per
+  minute, so a query burst costs the writer one tiny batch rather than
+  one write per call — the M8 access-bump trade; up to a minute of
+  telemetry is lost on shutdown by design. Unknown future tools count
+  as writes, so an unclassified tool surfaces as suspicious growth
+  instead of hiding among reads. This complements
+  `/admin/sessions/by-agent`: hook-driven agents open sessions,
+  MCP-only clients (VS Code Copilot, Claude Desktop, scripts) never do,
+  and until now left no trace at all.
 - Added explicit Kiro CLI v2 managed-workstream launches through `ai-memory run
   kiro` / `kiro-cli`, including native `--resume-id` reuse, `$KIRO_HOME`
   discovery, v2 `--yolo` translation, read-only visible-event import, and

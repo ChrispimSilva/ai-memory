@@ -375,6 +375,11 @@ pub struct AiMemoryServer {
     /// Optional post-RRF reranker. When `None`, `memory_query` returns
     /// fused, authority-adjusted order and stays on the zero-LLM path.
     reranker: Option<Arc<dyn ai_memory_llm::Reranker>>,
+    /// Per-client MCP tool-call counters, buffered in memory and folded
+    /// into `client_activity` at most once per flush interval so a query
+    /// burst costs the writer one tiny upsert batch, not one write per
+    /// call (same reasoning as the M8 access-bump throttle).
+    client_activity: Arc<std::sync::Mutex<ClientActivityBuffer>>,
     /// Shared across cloned request handlers so concurrent searches cannot
     /// create an unbounded number of billable provider calls.
     rerank_gate: Arc<tokio::sync::Semaphore>,
@@ -590,6 +595,64 @@ const RERANK_MAX_IN_FLIGHT: usize = 4;
 /// Wall-clock budget for one rerank call. Past this, `memory_query`
 /// answers from the adjusted pre-rerank order instead of waiting.
 const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Microseconds in one UTC day, for `client_activity` bucketing.
+const US_PER_DAY: i64 = 86_400_000_000;
+/// How long buffered client-activity counts may age before the next
+/// tool call flushes them to the store. Counts inside the window are
+/// lost on process exit — acceptable for telemetry, and the price of
+/// not putting a write on every read's hot path.
+const CLIENT_ACTIVITY_FLUSH: std::time::Duration = std::time::Duration::from_secs(60);
+/// Cap on a sanitized client name. MCP `clientInfo.name` is untrusted
+/// free text; anything longer is truncated on a char boundary.
+const MAX_CLIENT_NAME_CHARS: usize = 64;
+
+/// In-memory accumulation of per-client tool-call counts between
+/// flushes. Keyed by `(client, utc_day)` so a flush that straddles
+/// midnight books each call to the day it actually happened.
+struct ClientActivityBuffer {
+    last_flush: std::time::Instant,
+    pending: HashMap<(String, i64), (u32, u32)>,
+}
+
+impl ClientActivityBuffer {
+    fn new() -> Self {
+        Self {
+            last_flush: std::time::Instant::now(),
+            pending: HashMap::new(),
+        }
+    }
+}
+
+/// Whether an MCP tool mutates server state, for the reads/writes split
+/// in `client_activity`. Anything unknown counts as a write: failing
+/// toward "write" means a future tool added without updating this list
+/// shows up as suspicious growth in the write column instead of being
+/// silently misfiled as harmless reads.
+fn tool_call_is_write(tool: &str) -> bool {
+    !matches!(
+        tool,
+        "memory_query"
+            | "memory_read_page"
+            | "memory_recent"
+            | "memory_briefing"
+            | "memory_explore"
+            | "memory_status"
+    )
+}
+
+/// Trim, drop control characters, and cap an untrusted client name.
+/// `None` when nothing printable remains.
+fn sanitize_client_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_CLIENT_NAME_CHARS)
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
 
 /// Cap on the free-text `reason` stored with a feedback signal.
 const MAX_FEEDBACK_REASON_CHARS: usize = 500;
@@ -1007,6 +1070,7 @@ impl AiMemoryServer {
             decay_breadth_weight: 0.0,
             embedder: None,
             reranker: None,
+            client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
             rerank_gate: Arc::new(tokio::sync::Semaphore::new(RERANK_MAX_IN_FLIGHT)),
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
@@ -3419,6 +3483,20 @@ impl ServerHandler for AiMemoryServer {
     }
 
     // Declared manually so `#[tool_handler]` skips its generated
+    // `call_tool`: every tool invocation passes through here once, which
+    // is the single choke point where the caller's client identity is
+    // still attached (issue-style: guard the door, not each room).
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
+        self.record_client_activity(&request.name, &context);
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    // Declared manually so `#[tool_handler]` skips its generated
     // `list_tools` and the flavor patch runs on every tools/list.
     async fn list_tools(
         &self,
@@ -3542,6 +3620,66 @@ impl AiMemoryServer {
     /// breadth — the signal `[decay] breadth_weight` exists to read — would
     /// under-count exactly on the busy pages it matters for. Failures are
     /// logged at warn but never surfaced to the caller.
+    /// Record one MCP tool call against its client and flush the buffer
+    /// when it is older than [`CLIENT_ACTIVITY_FLUSH`]. Client identity
+    /// prefers the MCP `clientInfo.name` from the initialize handshake
+    /// (present in stateful HTTP / stdio); a stateless transport carries
+    /// no handshake, so the `X-Memory-Actor-Agent` overlay is the
+    /// fallback, then the literal `unknown`.
+    fn record_client_activity(
+        &self,
+        tool: &str,
+        context: &rmcp::service::RequestContext<RoleServer>,
+    ) {
+        let client = context
+            .peer
+            .peer_info()
+            .and_then(|init| sanitize_client_name(&init.client_info.name))
+            .or_else(|| {
+                context
+                    .extensions
+                    .get::<http::request::Parts>()
+                    .and_then(|parts| parts.extensions.get::<ai_memory_core::ActorContext>())
+                    .and_then(|actor| actor.agent.as_deref())
+                    .and_then(sanitize_client_name)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let day = jiff::Timestamp::now()
+            .as_microsecond()
+            .div_euclid(US_PER_DAY);
+        let is_write = tool_call_is_write(tool);
+        let due = {
+            let mut buffer = self
+                .client_activity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let slot = buffer.pending.entry((client, day)).or_insert((0, 0));
+            if is_write {
+                slot.1 = slot.1.saturating_add(1);
+            } else {
+                slot.0 = slot.0.saturating_add(1);
+            }
+            if buffer.last_flush.elapsed() >= CLIENT_ACTIVITY_FLUSH {
+                buffer.last_flush = std::time::Instant::now();
+                Some(std::mem::take(&mut buffer.pending))
+            } else {
+                None
+            }
+        };
+        if let Some(pending) = due {
+            let entries: Vec<(String, i64, u32, u32)> = pending
+                .into_iter()
+                .map(|((client, day), (reads, writes))| (client, day, reads, writes))
+                .collect();
+            let writer = self.writer.clone();
+            tokio::spawn(async move {
+                if let Err(e) = writer.bump_client_activity(entries).await {
+                    tracing::warn!(error = %e, "client activity flush failed");
+                }
+            });
+        }
+    }
+
     fn spawn_access_bump(&self, ids: Vec<PageId>, actor: Option<&ai_memory_core::IdentityKey>) {
         if ids.is_empty() {
             return;
@@ -9574,5 +9712,46 @@ mod tests {
         // Each operator is still throttled against THEMSELVES.
         assert!(select_bumpable(&mut seen, vec![page], Some(&alice), t10, cooldown).is_empty());
         assert!(select_bumpable(&mut seen, vec![page], Some(&bob), t10, cooldown).is_empty());
+    }
+    #[test]
+    fn tool_write_classification_fails_toward_write() {
+        for read in [
+            "memory_query",
+            "memory_read_page",
+            "memory_recent",
+            "memory_briefing",
+            "memory_explore",
+            "memory_status",
+        ] {
+            assert!(!tool_call_is_write(read), "{read}");
+        }
+        for write in [
+            "memory_write_page",
+            "memory_delete_page",
+            "memory_feedback",
+            "memory_consolidate",
+            "memory_forget_sweep",
+            "memory_handoff_begin",
+        ] {
+            assert!(tool_call_is_write(write), "{write}");
+        }
+        // The deliberate default: a tool this list has never met counts as
+        // a write, so forgetting to classify a future tool is visible.
+        assert!(tool_call_is_write("memory_some_future_tool"));
+    }
+
+    #[test]
+    fn client_names_are_sanitized_and_bounded() {
+        assert_eq!(
+            sanitize_client_name("  Visual Studio Code  ").as_deref(),
+            Some("Visual Studio Code"),
+        );
+        assert_eq!(
+            sanitize_client_name("evil\u{7}name").as_deref(),
+            Some("evilname")
+        );
+        assert_eq!(sanitize_client_name("   \u{0}\u{1} "), None);
+        let long = "x".repeat(500);
+        assert_eq!(sanitize_client_name(&long).unwrap().chars().count(), 64);
     }
 }

@@ -1099,6 +1099,31 @@ pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) ->
     Ok(())
 }
 
+/// Fold per-client MCP tool-call deltas into their `(client, day)`
+/// buckets. UPSERT per bucket inside one transaction: the buffer layer
+/// in the MCP server coalesces a minute of calls into a handful of
+/// entries, so this stays a few tiny rows per flush regardless of
+/// traffic.
+pub(crate) fn bump_client_activity(
+    conn: &mut Connection,
+    entries: &[(String, i64, u32, u32)],
+) -> StoreResult<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO client_activity (client, day, reads, writes)              VALUES (?1, ?2, ?3, ?4)              ON CONFLICT(client, day) DO UPDATE SET                  reads = reads + excluded.reads,                  writes = writes + excluded.writes",
+        )?;
+        for (client, day, reads, writes) in entries {
+            stmt.execute(params![client, day, reads, writes])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Bump `access_count` + `last_accessed_at` for the pages whose ids
 /// appear in `page_ids`. Idempotent for unknown ids (no-op).
 /// Used by the read path to feed the M8 reinforcement term.

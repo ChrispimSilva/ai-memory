@@ -11,6 +11,7 @@
 //! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
 //! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent.
 //! - `GET  /admin/sessions/by-agent` — session counts per agent CLI for one scope.
+//! - `GET  /admin/activity/by-client` — MCP tool-call counts per client (server-wide).
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -564,6 +565,7 @@ pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -
         .route("/admin/projects", get(handle_list_projects))
         .route("/admin/open-sessions", get(handle_open_sessions))
         .route("/admin/sessions/by-agent", get(handle_sessions_by_agent))
+        .route("/admin/activity/by-client", get(handle_activity_by_client))
         .route(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
@@ -907,6 +909,45 @@ struct OpenSessionsQuery {
 struct OpenSessionEntry {
     session_id: String,
     cwd: Option<String>,
+}
+
+/// Query string for `GET /admin/activity/by-client` — MCP tool-call
+/// counts per client. Server-wide: MCP-only clients (the reason this
+/// exists) are not reliably scoped to one project per call, and the
+/// endpoint mirrors the buffer's own granularity.
+///
+/// `since_days = 0` means the whole history, mirroring
+/// `/admin/sessions/by-agent`.
+#[derive(Debug, Deserialize)]
+struct ActivityByClientQuery {
+    #[serde(default)]
+    since_days: u32,
+}
+
+async fn handle_activity_by_client(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ActivityByClientQuery>,
+) -> impl IntoResponse {
+    let since_day = (query.since_days > 0).then(|| {
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_sub(i64::from(query.since_days).saturating_mul(US_PER_DAY))
+            .div_euclid(US_PER_DAY)
+    });
+    match state.reader.client_activity_since(since_day).await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(&rows)
+                    .map(|list| serde_json::json!({ "by_client": list }))
+                    .unwrap_or_else(|_| serde_json::json!({ "by_client": [] })),
+            ),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
 }
 
 /// Query string for `GET /admin/sessions/by-agent` — how many sessions each
@@ -5386,6 +5427,91 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+    }
+
+    /// The MCP-only complement: per-client tool-call counters served
+    /// back with the same window semantics as by-agent.
+    #[tokio::test]
+    async fn activity_by_client_aggregates_and_bounds_the_window() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let today = jiff::Timestamp::now()
+            .as_microsecond()
+            .div_euclid(US_PER_DAY);
+        store
+            .writer
+            .bump_client_activity(vec![
+                ("vscode".into(), today, 4, 1),
+                ("vscode".into(), today - 40, 7, 0),
+                ("claude-desktop".into(), today, 1, 0),
+            ])
+            .await
+            .unwrap();
+
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49376".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        // Whole history: the 40-day-old bucket counts.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/activity/by-client")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_client"],
+            serde_json::json!([
+                { "client": "vscode", "reads": 11, "writes": 1 },
+                { "client": "claude-desktop", "reads": 1, "writes": 0 },
+            ]),
+            "volume-desc across all history: {json}"
+        );
+
+        // A 7-day window drops the old bucket.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/activity/by-client?since_days=7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_client"][0],
+            serde_json::json!({ "client": "vscode", "reads": 4, "writes": 1 }),
+            "{json}"
+        );
     }
 
     /// The dashboard read: session counts grouped per agent CLI, with the
