@@ -789,8 +789,12 @@ metadata rather than exposing file content.
 
 Kiro v3 hook capture is intentionally not advertised or installed. Its
 [migration guide](https://kiro.dev/docs/cli/v3/hooks-migration/) documents the
-standalone registration schema but not the JSON sent to command hooks. Supporting
-it without that contract would risk silently losing capture and exclusion
+standalone registration schema, and the
+[shared hook reference](https://kiro.dev/docs/hooks/types/) documents generic
+command context plus `agentSpawn` and MCP tool examples. It does not yet
+establish the exact built-in file and shell tool payloads, and ai-memory has no
+sanitized live fixtures covering the complete v3 lifecycle. Supporting it
+without that evidence would risk silently losing capture and exclusion
 semantics. Add v3 only after real payload fixtures can exercise that boundary.
 
 `ai-memory uninstall --only hooks --apply --yes` removes only exact ai-memory v2
