@@ -213,6 +213,7 @@ async fn run_session_consolidation_worker(
     consolidator: Arc<Consolidator>,
     notify: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
+    #[cfg(test)] completed: Arc<tokio::sync::Notify>,
 ) {
     loop {
         let now = jiff::Timestamp::now().as_microsecond();
@@ -266,13 +267,17 @@ async fn run_session_consolidation_worker(
 
         match result {
             Ok(outcome) => match writer.complete_session_consolidation(job).await {
-                Ok(()) => info!(
-                    session = %session_id,
-                    generation,
-                    attempts,
-                    path = %outcome.path,
-                    "SessionEnd: queued LLM consolidation written (opt-in)",
-                ),
+                Ok(()) => {
+                    info!(
+                        session = %session_id,
+                        generation,
+                        attempts,
+                        path = %outcome.path,
+                        "SessionEnd: queued LLM consolidation written (opt-in)",
+                    );
+                    #[cfg(test)]
+                    completed.notify_one();
+                }
                 Err(error) => tracing::warn!(
                     %error,
                     session = %session_id,
@@ -502,6 +507,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                             consolidator,
                             notify.clone(),
                             cancel.child_token(),
+                            #[cfg(test)]
+                            Arc::new(tokio::sync::Notify::new()),
                         ));
                         info!(
                             max_attempts = ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
@@ -2237,32 +2244,31 @@ mod tests {
             project_id,
         ));
         let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_session_consolidation_worker(
             store.writer.clone(),
             consolidator,
             notify.clone(),
             cancel.child_token(),
+            completed.clone(),
         ));
         notify.notify_one();
 
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("worker should complete the queued job");
+
         let path = format!("sessions/{session_id}.md");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if store
-                    .reader
-                    .page_body_by_ids(workspace_id, project_id, &path)
-                    .await
-                    .unwrap()
-                    .is_some_and(|page| page.body.contains("Durable worker completed"))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("worker should consume the queued job");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(workspace_id, project_id, &path)
+                .await
+                .unwrap()
+                .is_some_and(|page| page.body.contains("Durable worker completed")),
+            "queue completion must follow the durable wiki write"
+        );
 
         cancel.cancel();
         task.await.unwrap();

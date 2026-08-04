@@ -738,9 +738,10 @@ Kimi Code hook entries accept only `event`, `matcher`, `command`, and
 ### Kiro CLI
 
 Kiro CLI has one MCP surface. ai-memory supports the documented v2 lifecycle
-hook surface; Kiro v3 uses an incompatible standalone registration format and
-does not document the command-input payload yet. The global MCP file is
-`$KIRO_HOME/settings/mcp.json`, defaulting to
+hook surface. Kiro v3 now documents its incompatible standalone registration
+schema and generic command context, but ai-memory does not install it without
+sanitized live lifecycle and built-in tool payload fixtures. The global MCP
+file is `$KIRO_HOME/settings/mcp.json`, defaulting to
 `~/.kiro/settings/mcp.json`; pass `--config-file .kiro/settings/mcp.json` for a
 project-scoped entry.
 

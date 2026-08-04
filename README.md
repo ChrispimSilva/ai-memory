@@ -147,6 +147,12 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Built-in `/web` browser.** Read-only HTML UI for the wiki -
   project list, folder tree, FTS5 search, markdown rendering, dark
   mode. Mounted on the same axum server as MCP.
+- **Server-wide MCP client activity.**
+  `GET /admin/activity/by-client?since_days=7` shows which MCP clients are
+  calling memory tools, split into reads and writes. Counts use bounded UTC-day
+  buckets, so arbitrary client names cannot grow the database with request
+  volume; shared deployments keep the endpoint root-only. See
+  [MCP client activity](docs/users.md#mcp-client-activity).
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
   Code, Codex, Devin CLI, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
   Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, OpenClaw, Oh My Pi

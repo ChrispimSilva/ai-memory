@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- MCP-only clients are now visible in the operator's traffic picture.
+  Every MCP tool call is counted against its caller — the sanitized
+  `clientInfo.name` from the initialize handshake when the HTTP
+  transport runs stateful (`--http-stateful`) or over stdio, else the
+  `X-Memory-Actor-Agent` overlay an ingress proxy asserts, else
+  `unknown` — split into reads and writes and bucketed per UTC day in a
+  new `client_activity` table (V46). A new multi-user root-gated
+  `GET /admin/activity/by-client?since_days=N` reports the aggregate,
+  volume-descending with a name tiebreak (`0`/absent = whole history).
+  Counts buffer in memory and flush from one background task on a one-minute
+  interval, even when the server becomes quiet; failed batches remain bounded
+  in memory and retry once per interval. Process exit can still lose the
+  current interval. Each UTC day retains at most 128 distinct names and folds
+  additional names into `other`, preventing untrusted client names from
+  causing traffic-proportional row growth. Unknown future tools count as
+  writes, so an unclassified tool surfaces as suspicious growth instead of
+  hiding among reads. This complements
+  `/admin/sessions/by-agent`: hook-driven agents open sessions,
+  MCP-only clients (VS Code Copilot, Claude Desktop, scripts) never do,
+  and until now left no trace at all. (#366)
 - Added explicit Kiro CLI v2 managed-workstream launches through `ai-memory run
   kiro` / `kiro-cli`, including native `--resume-id` reuse, `$KIRO_HOME`
   discovery, v2 `--yolo` translation, read-only visible-event import, and
@@ -21,8 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalid, infer remote connectivity from the managed Kiro MCP entry, inject
   handoffs through `agentSpawn` stdout, enforce capture exclusions for known
   v2 tool payloads, and uninstall only exact ai-memory entries. Kiro v3 hook
-  capture remains unsupported until its command-input payload is documented
-  and can be fixture-tested (#355).
+  capture remains unsupported pending sanitized live lifecycle and built-in
+  tool payload fixtures, despite its now-documented standalone schema (#355).
 - Added `[consolidation] max_input_tokens` (`AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS`)
   to bound the whole LLM consolidation prompt — observation dump, current page
   body, system prompt, page conventions, slot snapshots, and schema — instead of

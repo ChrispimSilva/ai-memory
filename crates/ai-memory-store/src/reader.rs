@@ -430,6 +430,22 @@ pub struct OpenSession {
     pub cwd: Option<String>,
 }
 
+/// Aggregate MCP tool-call counts for one client, from
+/// `client_activity` — the MCP-only complement to
+/// [`AgentSessionCount`]: hook-less clients (VS Code Copilot, Claude
+/// Desktop, scripts) never open sessions but still read and write
+/// memory through tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClientActivity {
+    /// Sanitized client name (`clientInfo.name`, actor overlay, or
+    /// `unknown`).
+    pub client: String,
+    /// Read-shaped tool calls (query/read/recent/briefing/…).
+    pub reads: u64,
+    /// Write-shaped tool calls (write_page/feedback/consolidate/…).
+    pub writes: u64,
+}
+
 /// How many sessions one agent CLI opened in a scope — the shape behind
 /// "where is this project's memory actually coming from".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1694,6 +1710,55 @@ impl ReaderPool {
             row_opt
                 .map(|bytes| SessionId::from_slice(&bytes).map_err(StoreError::from))
                 .transpose()
+        })
+        .await
+    }
+
+    /// Sum per-client MCP tool-call counters, optionally bounded to
+    /// buckets at or after `since_day` (UTC days since the epoch;
+    /// `None` = whole history). Ordered by total volume descending
+    /// with a client-name tiebreak so equal totals do not reorder
+    /// between calls.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn client_activity_since(
+        &self,
+        since_day: Option<i64>,
+    ) -> StoreResult<Vec<ClientActivity>> {
+        self.with_conn(move |conn| {
+            let since_clause = if since_day.is_some() {
+                " WHERE day >= :since"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT client, SUM(reads), SUM(writes) FROM client_activity\
+                 {since_clause} \
+                 GROUP BY client \
+                 ORDER BY SUM(reads) + SUM(writes) DESC, client ASC"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let map = |row: &rusqlite::Row<'_>| {
+                let client: String = row.get(0)?;
+                let reads: i64 = row.get(1)?;
+                let writes: i64 = row.get(2)?;
+                Ok((client, reads, writes))
+            };
+            let rows = match &since_day {
+                Some(since) => stmt.query_map(&[(":since", since as &dyn rusqlite::ToSql)], map)?,
+                None => stmt.query_map([], map)?,
+            };
+            let mut out = Vec::new();
+            for row in rows {
+                let (client, reads, writes) = row?;
+                out.push(ClientActivity {
+                    client,
+                    reads: u64::try_from(reads).unwrap_or(0),
+                    writes: u64::try_from(writes).unwrap_or(0),
+                });
+            }
+            Ok(out)
         })
         .await
     }

@@ -1877,7 +1877,7 @@ fn apply_to_kiro_cli_agent_configs(
                 p.is_file(),
                 "{} does not exist. Kiro CLI v2 hooks live inside an existing agent config; \
                  create one first (`kiro-cli agent create`) and re-run. Kiro v3 hooks remain \
-                 unsupported until its command-input payload contract is documented.",
+                 unsupported pending fixture-verified lifecycle and built-in tool payloads.",
                 p.display()
             );
             vec![p.clone()]
@@ -1889,8 +1889,8 @@ fn apply_to_kiro_cli_agent_configs(
         "no Kiro CLI agent configs found in {}. The v2 engine only fires hooks defined in an \
          agent config and the built-in default agent has no file on disk, so create an agent \
          first (`kiro-cli agent create`, then `kiro-cli agent set-default <name>`) and re-run. \
-         Kiro v3 hooks remain unsupported until its command-input payload contract is \
-         documented.",
+         Kiro v3 hooks remain unsupported pending fixture-verified lifecycle and built-in tool \
+         payloads.",
         kiro_cli_agents_dir()?.display()
     );
     let prepared = preflight_kiro_cli_agent_configs(
@@ -3852,8 +3852,8 @@ fn render_kiro_cli(
     println!("// preserving third-party hook entries. The v2 engine fires hooks");
     println!("// only for the active agent config; the built-in default agent has");
     println!("// no file, so create one first (`kiro-cli agent create`). Kiro v3");
-    println!("// hooks remain unsupported because their command-input payload is");
-    println!("// not documented; do not reuse this v2 registration there.");
+    println!("// hooks remain unsupported pending fixture-verified lifecycle and");
+    println!("// built-in tool payloads; do not reuse this v2 registration there.");
     println!("// Hook scripts: {}", hooks_dir.display());
     println!("// AI-memory server URL: {server_url}");
     if auth_token.is_some() {
