@@ -310,20 +310,26 @@ contract was verified against Kimi Code v0.29.0. The managed launcher accepts
 `kimi`, `kimi-code`, and `kimi-cli`; all three resolve the installed `kimi`
 executable.
 
-Kiro's explicit adapter covers only the default v2 engine. Official Kiro docs
-define UUID session IDs, checkout scoping, `--resume-id`, `$KIRO_HOME`, and the
-flat `$KIRO_HOME/sessions/cli/<uuid>.json` plus `<uuid>.jsonl` store. The current
-2.16.0 binary also exposes the v1 `Prompt`, `AssistantMessage`, and `ToolResults`
-event variants, but authentication prevented producing a new isolated live
-transcript during this audit. The parser therefore accepts only the known v1
-envelope, records unsupported versions as extraction loss, imports visible text
-and completed tool records only, and stays outside automatic selection until a
-logged-in current-format acceptance run is recorded. Exact lookups require a
-UUID, matching sibling `session_id`, and an exact canonical `cwd`; a linked ID
-cannot select another checkout's flat-store transcript. `--v3`, `--mode`, and a
-non-v2 `--agent-engine` select incompatible engines and pass through unchanged.
-The v2 `--yolo` translation is `--trust-all-tools`; an explicit narrower
-`--trust-tools` choice is never widened.
+Kiro's explicit adapter covers only the default v2 engine. The audited 2.16.0
+binary and v2 fixtures expose UUID session IDs, checkout scoping, `--resume-id`,
+`$KIRO_HOME`, and the flat `$KIRO_HOME/sessions/cli/<uuid>.json` plus
+`<uuid>.jsonl` store with v1 `Prompt`, `AssistantMessage`, and `ToolResults`
+events. Current official Kiro session documentation instead describes
+per-directory database persistence without publishing a filename, schema, or
+read-only transcript contract; its v3 guide confirms that v3 sessions are not
+backward-compatible or resumable in v2. Authentication prevented producing a
+new isolated live transcript during this audit. The parser therefore accepts
+only the known v1 flat-store envelope, records unsupported versions as
+extraction loss, imports visible text and completed tool records only, and stays
+outside automatic selection until a logged-in current-format acceptance run is
+recorded. Exact lookups require a UUID, matching sibling `session_id`, and an
+exact canonical `cwd`; a linked ID cannot select another checkout's flat-store
+transcript. `--v3`, `--mode`, and a non-v2 `--agent-engine` select incompatible
+engines and pass through unchanged. The v2 `--yolo` translation is
+`--trust-all-tools`; an explicit narrower `--trust-tools` choice is never
+widened. See Kiro's current
+[session management](https://kiro.dev/docs/cli/chat/session-management/) and
+[v3 compatibility](https://kiro.dev/docs/cli/v3/) references.
 
 Grok needs no ai-memory hook installation for managed delivery either. Grok
 ignores `SessionStart` stdout and its `UserPromptSubmit` hook is passive, so

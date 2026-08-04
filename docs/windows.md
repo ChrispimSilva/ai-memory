@@ -155,9 +155,10 @@ For Kiro CLI, `install-mcp --client kiro-cli --apply` writes
 `%USERPROFILE%\.kiro\settings\mcp.json` unless `$env:KIRO_HOME` overrides the
 root. `install-hooks --agent kiro-cli --apply` updates existing v2 agent files
 under `.kiro\agents`; use `--config-file` for a project-local agent. Kiro v3
-hook capture remains unsupported until its command-input payload is documented.
-Run these commands from the same native Windows environment that launches Kiro
-so generated executable paths remain valid.
+hook capture remains unsupported pending sanitized live lifecycle and built-in
+tool payload fixtures for its documented standalone schema. Run these commands
+from the same native Windows environment that launches Kiro so generated
+executable paths remain valid.
 
 ## Scenario C: Prebuilt Release Binary (No Toolchain)
 
