@@ -599,7 +599,7 @@ Each agent CLI needs two things:
    Without this, the agent can still query memory but capture
    becomes manual.
 
-Claude Desktop, Kiro CLI, VS Code Copilot, and Zed are MCP-only today. The
+Claude Desktop, VS Code Copilot, and Zed are MCP-only today. The
 hook-capable clients in the [README Support Matrix](../README.md#support-matrix),
 including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 
@@ -737,9 +737,12 @@ Kimi Code hook entries accept only `event`, `matcher`, `command`, and
 
 ### Kiro CLI
 
-Kiro CLI is MCP-only in this release. Its global MCP file is
-`$KIRO_HOME/settings/mcp.json`, defaulting to `~/.kiro/settings/mcp.json`;
-pass `--config-file .kiro/settings/mcp.json` for a project-scoped entry.
+Kiro CLI has one MCP surface. ai-memory supports the documented v2 lifecycle
+hook surface; Kiro v3 uses an incompatible standalone registration format and
+does not document the command-input payload yet. The global MCP file is
+`$KIRO_HOME/settings/mcp.json`, defaulting to
+`~/.kiro/settings/mcp.json`; pass `--config-file .kiro/settings/mcp.json` for a
+project-scoped entry.
 
 ```bash
 ai-memory install-mcp --client kiro-cli --apply \
@@ -754,13 +757,45 @@ remain intact. Kiro requires HTTPS for non-loopback remote servers, so the CLI
 rejects a plain-HTTP homelab URL before changing the file. Configure a reverse
 proxy as described in [HTTPS via reverse proxy](https-via-proxy.md).
 
-Kiro v2 and the early-access v3 engine use incompatible hook and persisted
-session formats. `install-hooks --agent kiro-cli` and `ai-memory run kiro` are
-therefore deferred until both formats have fixtures and explicit compatibility
-tests; this MCP registration does not claim automatic capture or managed
-resume. Follow [#355](https://github.com/akitaonrails/ai-memory/issues/355) for
-hooks and [#356](https://github.com/akitaonrails/ai-memory/issues/356) for the
-managed-workstream adapter.
+Install v2 hooks with the `kiro-cli` agent value. When `--server-url` is omitted,
+`install-hooks` can infer the hook origin and bearer token from the managed MCP
+entry above.
+
+```bash
+# Default v2 engine: merge hooks into every existing global agent config.
+ai-memory install-hooks --agent kiro-cli --apply
+
+# A project-local v2 agent overrides a same-named global agent. Update the
+# selected local config explicitly instead of assuming the global copy runs.
+ai-memory install-hooks --agent kiro-cli --apply \
+    --config-file .kiro/agents/<agent-name>.json
+```
+
+The v2 engine stores camelCase hooks inside agent JSON files. ai-memory updates
+existing `$KIRO_HOME/agents/*.json` files only; it will not fabricate an agent
+that Kiro never selects. Create and select an agent first when that directory
+is empty. Kiro gives [project-local agents precedence over global agents](https://kiro.dev/docs/cli/custom-agents/configuration-reference/),
+so use `--config-file` when the active definition lives under
+`.kiro/agents/`. All target files are parsed before any one is changed, and
+unrelated agent fields, third-party hooks, and each agent's existing
+`--project-strategy` remain intact.
+
+The install registers spawn, user-prompt, pre-tool, post-tool, and stop capture,
+remains fail-open when ai-memory is unavailable, and delivers a pending handoff
+through successful `agentSpawn` stdout. Verified v2 tool payloads enforce
+`[capture] ignore_paths`; an unrecognized payload shape is stored as bounded
+metadata rather than exposing file content.
+
+Kiro v3 hook capture is intentionally not advertised or installed. Its
+[migration guide](https://kiro.dev/docs/cli/v3/hooks-migration/) documents the
+standalone registration schema but not the JSON sent to command hooks. Supporting
+it without that contract would risk silently losing capture and exclusion
+semantics. Add v3 only after real payload fixtures can exercise that boundary.
+
+`ai-memory uninstall --only hooks --apply --yes` removes only exact ai-memory v2
+entries from global agents and the current project's `.kiro/agents` directory;
+it leaves standalone v3 files untouched. Managed `ai-memory run kiro` support
+is tracked separately in [#356](https://github.com/akitaonrails/ai-memory/issues/356).
 
 ### OpenCode
 
@@ -905,6 +940,10 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "https://memory.example/mcp"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-hooks --agent kiro-cli       --auth-token "$TOKEN" \
+    --server-url "https://memory.example"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client vscode-copilot  --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
 
@@ -913,14 +952,14 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374/mcp"
 ```
 
-Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw support both
+Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, and OpenClaw support both
 `install-mcp` and `install-hooks`. Grok's `install-mcp --client grok` writes
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
 captures lifecycle events.
 Grok ignores `SessionStart` stdout, so handoffs must be accepted through MCP with
-`memory_handoff_accept` when resuming. Claude Desktop, Kiro CLI, VS Code
-Copilot, and Zed are MCP-only here, so you'll need to nudge the model to call
+`memory_handoff_accept` when resuming. Claude Desktop, VS Code Copilot, and Zed
+are MCP-only here, so you'll need to nudge the model to call
 `memory_query` / `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except

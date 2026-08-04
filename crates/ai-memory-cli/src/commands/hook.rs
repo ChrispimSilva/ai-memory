@@ -372,7 +372,12 @@ fn write_success_response<W: std::io::Write>(
     agent: AgentKind,
     event: HookEvent,
 ) -> std::io::Result<()> {
-    if agent == AgentKind::AntigravityCli && event == HookEvent::PreToolUse {
+    if agent == AgentKind::KiroCli {
+        // Kiro adds successful SessionStart/UserPromptSubmit stdout to model
+        // context, and v2 Stop parses stdout for a block decision. Capture-only
+        // hooks therefore stay silent unless SessionStart has real context.
+        Ok(())
+    } else if agent == AgentKind::AntigravityCli && event == HookEvent::PreToolUse {
         writeln!(stdout, r#"{{"decision": "allow"}}"#)
     } else {
         writeln!(stdout, "{{}}")
@@ -625,8 +630,14 @@ where
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
-                let envelope = session_start_handoff_envelope(agent_kind, handoff);
-                writeln!(stdout, "{envelope}")?;
+                if agent_kind == AgentKind::KiroCli {
+                    // Kiro v2 consumes agentSpawn stdout verbatim and defines
+                    // no wrapper envelope.
+                    writeln!(stdout, "{handoff}")?;
+                } else {
+                    let envelope = session_start_handoff_envelope(agent_kind, handoff);
+                    writeln!(stdout, "{envelope}")?;
+                }
                 return Ok(());
             }
         }
@@ -909,6 +920,8 @@ mod tests {
                 HookEvent::PreToolUse,
                 b"{}\n".as_slice(),
             ),
+            (AgentKind::KiroCli, HookEvent::PreToolUse, b"".as_slice()),
+            (AgentKind::KiroCli, HookEvent::SessionStart, b"".as_slice()),
         ] {
             let mut output = Vec::new();
             write_success_response(&mut output, agent, event).unwrap();
@@ -1812,6 +1825,18 @@ mod tests {
         }
     }
 
+    fn kiro_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "kiro-cli".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+        }
+    }
+
     fn antigravity_hook_args(event: &str, server_url: &str) -> HookArgs {
         HookArgs {
             event: event.into(),
@@ -1936,6 +1961,40 @@ mod tests {
         assert_eq!(stdout, b"{}\n");
         assert!(first_request(&mut requests).await.is_none());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn kiro_session_start_prints_handoff_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "KIRO-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            kiro_hook_args("session-start", &base),
+            serde_json::json!({
+                "session_id": "kiro-session",
+                "cwd": tmp.path()
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"KIRO-HANDOFF\n");
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=kiro-cli")
+                    && request.contains("session_id=kiro-session")
+            }),
+            "{recorded:?}"
+        );
     }
 
     #[tokio::test]

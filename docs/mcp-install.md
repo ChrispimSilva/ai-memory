@@ -38,7 +38,7 @@ ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
 not. Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop, Kiro CLI, VS Code Copilot, and Zed are **MCP-only** here: they
+Claude Desktop, VS Code Copilot, and Zed are **MCP-only** here: they
 expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
@@ -795,8 +795,8 @@ same pattern as Gemini CLI.
 
 ## Kiro CLI
 
-**Status:** MCP supported. Lifecycle hooks and managed workstreams are not yet
-supported.
+**Status:** MCP and v2 lifecycle hooks supported. Managed workstreams are
+tracked separately.
 
 **Config file:** `$KIRO_HOME/settings/mcp.json`, defaulting to
 `~/.kiro/settings/mcp.json`. Use `--config-file .kiro/settings/mcp.json` when
@@ -832,17 +832,31 @@ Kiro permits remote MCP URLs over HTTPS. Plain HTTP is accepted only for
 non-loopback HTTP URL before writing the config. See
 [HTTPS via reverse proxy](https-via-proxy.md) for a homelab deployment.
 
-Kiro CLI v3 changes both its hook schema and its persisted session format from
-v2. Until each version has fixtures and an explicit compatibility contract,
-`install-hooks --agent kiro-cli` and `ai-memory run kiro` are intentionally not
-advertised or accepted. Follow
-[#355](https://github.com/akitaonrails/ai-memory/issues/355) for hooks and
+ai-memory supports Kiro's documented v2 hook registration format:
+
+```bash
+# v2: update every existing global agent definition.
+ai-memory install-hooks --agent kiro-cli --apply
+
+# v2 project-local agent: target the active definition explicitly.
+ai-memory install-hooks --agent kiro-cli --apply \
+    --config-file .kiro/agents/<agent-name>.json
+```
+
+The v2 installer refuses to create a synthetic agent file and parses every
+target before changing any of them. Project-local Kiro agents override global
+agents, so `--config-file` is required when the active definition lives under
+`.kiro/agents/`. The integration remains fail-open, injects pending handoffs
+through `agentSpawn` stdout, and honors `$KIRO_HOME`. Kiro v3 hook capture is
+not installed because its registration migration guide does not document the
+command-input payload needed to validate capture and exclusion behavior. Follow
 [#356](https://github.com/akitaonrails/ai-memory/issues/356) for managed
 workstreams.
 
 Sources: <https://kiro.dev/docs/cli/mcp/configuration/>,
 <https://kiro.dev/docs/cli/reference/settings/>,
-<https://kiro.dev/docs/cli/v3/>.
+<https://kiro.dev/docs/cli/hooks/>, and
+<https://kiro.dev/docs/cli/v3/hooks-migration/>.
 
 ## OpenClaw
 

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added verified Kiro CLI v2 lifecycle hooks. CamelCase hooks merge into
+  existing agent configs, honor `$KIRO_HOME`, preserve unrelated hooks and
+  per-agent project strategies, fail before changing any target when one is
+  invalid, infer remote connectivity from the managed Kiro MCP entry, inject
+  handoffs through `agentSpawn` stdout, enforce capture exclusions for known
+  v2 tool payloads, and uninstall only exact ai-memory entries. Kiro v3 hook
+  capture remains unsupported until its command-input payload is documented
+  and can be fixture-tested (#355).
+
 ## [1.23.0] - 2026-08-03
 
 ### Changed

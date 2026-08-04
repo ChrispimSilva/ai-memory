@@ -1011,6 +1011,11 @@ pub enum AgentChoice {
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
     KimiCode,
+    /// Kiro CLI (AWS), v2 agent engine — camelCase lifecycle hooks embedded
+    /// in agent configs under `~/.kiro/agents/*.json`. Kiro v3's standalone
+    /// hooks do not yet document a command-input payload contract.
+    #[value(alias = "kiro")]
+    KiroCli,
 }
 
 impl AgentChoice {
@@ -1036,6 +1041,7 @@ impl AgentChoice {
             Self::Zero => AgentKind::Zero,
             Self::Devin => AgentKind::Devin,
             Self::KimiCode => AgentKind::KimiCode,
+            Self::KiroCli => AgentKind::KiroCli,
         }
     }
 
@@ -1131,8 +1137,8 @@ pub enum McpClient {
     #[value(alias = "kimi")]
     KimiCode,
     /// Kiro CLI - `$KIRO_HOME/settings/mcp.json` (default
-    /// `~/.kiro/settings/mcp.json`). MCP-only: Kiro v2 and v3 use
-    /// incompatible hook and session formats.
+    /// `~/.kiro/settings/mcp.json`). Pair with
+    /// `install-hooks --agent kiro-cli` for verified v2 lifecycle capture.
     #[value(alias = "kiro")]
     KiroCli,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
@@ -2150,6 +2156,40 @@ mod tests {
             panic!("expected install-hooks command for devin");
         };
         assert!(matches!(hook_args.agent, AgentChoice::Devin));
+    }
+
+    #[test]
+    fn kiro_v2_hook_aliases_parse_and_v3_is_not_advertised() {
+        for alias in ["kiro-cli", "kiro"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse Kiro v2 alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for Kiro v2 alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::KiroCli);
+        }
+        for unsupported in ["kiro-cli-v3", "kiro-v3"] {
+            let error = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                unsupported,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("invalid value"),
+                "v3 must remain unsupported until its payload contract is verified: {error}"
+            );
+        }
     }
 
     #[test]

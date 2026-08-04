@@ -38,7 +38,7 @@
 | Grok Build CLI | Supported | MCP config (`install-mcp --client grok` → `$GROK_HOME/config.toml`, default `~/.grok/config.toml`) + lifecycle hooks (`install-hooks --agent grok` → `$GROK_HOME/hooks/ai-memory.json`, default `~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle). Capture works; no hook handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. `ai-memory run grok` adds managed workstream resume with the context packet delivered natively through `--rules`. Skills root: `.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`). |
 | Zero | Supported | `install-mcp --client zero` (native HTTP + bearer in `~/.config/zero/config.json`) + lifecycle hooks via `install-hooks --agent zero --apply` (exec-form native commands in `~/.config/zero/hooks.json`, JSON payload on stdin, no shell). Capture works incl. specialist (subagent) events; no handoff injection — Zero discards `sessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `UserPromptSubmit` stdout (Kimi Code discards `SessionStart` hook stdout); `ai-memory run kimi` adds managed workstream resume. |
-| Kiro CLI | MCP-only | `install-mcp --client kiro-cli` (alias `kiro`) merges a native remote entry into `$KIRO_HOME/settings/mcp.json` (default `~/.kiro/settings/mcp.json`). Kiro's Bedrock-compatible schema flavor is applied automatically. Remote endpoints must use HTTPS; plain HTTP is accepted only on loopback. Hooks and managed workstreams are not yet supported because Kiro v2 and v3 use incompatible hook and session formats. |
+| Kiro CLI | Supported (v2) | MCP config uses `install-mcp --client kiro-cli` (alias `kiro`) and Kiro's Bedrock-compatible schema flavor. `install-hooks --agent kiro-cli` merges verified v2 hooks into existing agent configs, honors `$KIRO_HOME`, preserves unrelated entries, and injects pending handoffs through `agentSpawn` stdout. Kiro v3 hook capture is not yet supported because its command-input payload is undocumented. Managed workstreams are tracked separately. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | Zed | MCP-only | Native remote MCP under `context_servers` in Zed's user `settings.json`; no lifecycle hooks or managed-workstream support. |
 | Hermes Agent | Community | Core hook ingestion recognizes `agent=hermes` and Hermes' documented shell-hook `tool_name` / `tool_input` payload for concrete session attribution, tool-family titles, and capture exclusions. A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available, but no first-party installer is shipped; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. Hermes ignores session-start hook stdout, so recover handoffs through MCP. |
@@ -150,8 +150,7 @@ priors are at the [bottom](#influences-and-prior-art).
   Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, OpenClaw, Oh My Pi
   / OMP (`omp` / `oh-my-pi`), Pi via generated bridge extension, VS Code
   GitHub Copilot agent mode (MCP-only, workspace `.vscode/mcp.json`), Kiro CLI
-  (MCP-only, `$KIRO_HOME/settings/mcp.json`), and Zed (MCP-only, user
-  `settings.json`).
+  (MCP + v2 lifecycle hooks), and Zed (MCP-only, user `settings.json`).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth. Shared servers can opt into
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
@@ -452,7 +451,8 @@ docker run -d --name ai-memory \
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
 #    `--agent codex`, `--agent devin`, `--agent opencode`, `--agent gemini-cli`,
-#    `--agent grok`, `--agent kimi-code`, `--agent omp`, `--agent oh-my-pi`, `--client cursor`,
+#    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent omp`,
+#    `--agent oh-my-pi`, `--client cursor`,
 #    `--client gemini-cli`, `--client grok`, `--client kiro-cli`, etc.
 #    for additional agents; full list in docs/install.md.
 ai-memory install-mcp   --client claude-code --apply
@@ -460,6 +460,10 @@ ai-memory install-hooks --agent  claude-code --apply
 # Grok Build CLI example:
 # ai-memory install-mcp   --client grok --apply
 # ai-memory install-hooks --agent  grok --apply
+# Kiro CLI v2 example (requires an existing Kiro agent config):
+# ai-memory install-mcp   --client kiro-cli --apply
+# ai-memory install-hooks --agent  kiro-cli --apply
+# Kiro CLI v3 hook capture is not yet supported; see docs/install.md.
 ```
 
 On Linux/macOS, that's it. Start a Claude Code session as usual - every

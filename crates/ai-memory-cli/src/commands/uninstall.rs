@@ -42,6 +42,8 @@ enum RewriteOp {
     ZeroHooksJson,
     /// Kimi Code `[[hooks]]` rules inside config.toml.
     KimiCodeHooksToml,
+    /// Kiro CLI v2 agent-config hooks with exact generated command signatures.
+    KiroCliV2HooksJson,
     /// MCP JSON config for one client shape.
     McpJson(McpClient),
     /// Codex TOML MCP config.
@@ -196,6 +198,26 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 path,
                 removal.removed_events,
                 RewriteOp::HooksJson(shape),
+            );
+        }
+
+        let mut kiro_configs =
+            install_hooks::list_kiro_cli_agent_configs(&install_hooks::kiro_cli_agents_dir()?)?;
+        let cwd = std::env::current_dir().context("getting CWD for Kiro hook removal")?;
+        kiro_configs.extend(install_hooks::list_kiro_cli_agent_configs(
+            &cwd.join(".kiro/agents"),
+        )?);
+        kiro_configs.sort();
+        kiro_configs.dedup();
+        for path in kiro_configs {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let removal = strip_kiro_cli_v2_hooks(&content)?;
+            push_rewrite(
+                &mut plan,
+                path,
+                removal.removed_events,
+                RewriteOp::KiroCliV2HooksJson,
             );
         }
 
@@ -470,6 +492,7 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
                         }
                         RewriteOp::ZeroHooksJson => strip_zero_hooks(&out)?.new_content,
                         RewriteOp::KimiCodeHooksToml => strip_kimi_code_hooks(&out)?.new_content,
+                        RewriteOp::KiroCliV2HooksJson => strip_kiro_cli_v2_hooks(&out)?.new_content,
                         RewriteOp::McpJson(client) => {
                             strip_mcp_json_client(&out, client, name, url)?.0
                         }
@@ -768,6 +791,45 @@ fn strip_zero_hooks(content: &str) -> Result<HookRemoval> {
             }
             !ours
         });
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
+
+fn strip_kiro_cli_v2_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(hooks) = root
+            .get_mut("hooks")
+            .and_then(|value| value.as_object_mut())
+        else {
+            return Ok(());
+        };
+        let events: Vec<String> = hooks.keys().cloned().collect();
+        for event in events {
+            let Some(entries) = hooks.get_mut(&event).and_then(|value| value.as_array_mut()) else {
+                continue;
+            };
+            let original_len = entries.len();
+            entries.retain(|entry| {
+                !entry
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(install_hooks::is_ai_memory_kiro_hook_command)
+            });
+            if entries.len() != original_len {
+                removed_events.push(event.clone());
+            }
+            if entries.is_empty() {
+                hooks.remove(&event);
+            }
+        }
+        if hooks.is_empty() {
+            root.remove("hooks");
+        }
         Ok(())
     })?;
     Ok(HookRemoval {
