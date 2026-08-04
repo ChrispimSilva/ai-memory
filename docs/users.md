@@ -179,11 +179,11 @@ The "absent means shared" rule extends to memory slots, so a single-operator
 server behaves exactly as it always has. `_slots/current-focus.md` is injected
 into every operator's context; `_slots/<segment>/current-focus.md` is injected
 only into the operator whose `path_segment()` is `<segment>` (`u-alice`,
-`uh-<uuid>` for a path-hostile username, or `o-<uuid>` for a complete OIDC
-issuer/subject pair). What the feature scopes is injection, not access: a slot
-is an ordinary wiki page, so exact reads and searches remain project-wide like
-every other page. Every slot written before this is unnamespaced, therefore
-shared.
+`uh-<uuid>` for a mixed-case, trailing-period, or otherwise path-hostile
+username, or `o-<uuid>` for a complete OIDC issuer/subject pair). What the
+feature scopes is injection, not access: a slot is an ordinary wiki page, so
+exact reads and searches remain project-wide like every other page. Every slot
+written before this is unnamespaced, therefore shared.
 
 `[slots] per_user` (default off) is the switch for the whole regime. With it
 ON:
@@ -205,9 +205,13 @@ With it OFF a nested slot path means nothing in particular — every slot goes
 into every brief, exactly as before the feature existed — so turning it back
 off makes personal slots visible to everyone again rather than stranding them.
 
-The `<segment>` is derived from the qualified identity on this server: a safe
-username stays readable, while a path-hostile username or complete OIDC
-issuer/subject pair becomes a bounded deterministic identifier. The OIDC pair
+The `<segment>` is derived from the qualified identity on this server: a short,
+lowercase, path-safe ASCII username stays readable, while a mixed-case,
+trailing-period, or otherwise path-hostile username or complete OIDC
+issuer/subject pair becomes a bounded deterministic identifier. Restricting
+readable segments to lowercase without trailing periods prevents distinct
+identities from producing pathnames that compare alike on supported
+case-insensitive filesystems. The OIDC pair
 outranks the username; see "Identity keys" above. Every named operator owns a
 working namespace, and long or path-hostile values never fall back onto the
 shared slot. One consequence of qualified segments is worth stating: a nested
@@ -215,6 +219,16 @@ path written before the feature
 (`_slots/backend/…`) spells a segment no qualified identity can produce, so
 with the flag ON it belongs to nobody and reaches no brief until the flag is
 turned back off or an admin re-homes it.
+
+Before the case-insensitive namespace fix, a mixed-case username such as
+`Alice` used the readable segment `u-Alice`, and a username ending in a period
+kept that period; both now use deterministic `uh-<uuid>` segments. ai-memory
+cannot safely move the old directory automatically because a case-insensitive
+filesystem may already have combined it with another identity. Administrators
+upgrading a shared deployment with `[slots] per_user = true` must inspect any
+affected `u-…` slot directories and re-home confirmed content into the owning
+operator's new namespace. Preserve the old pages until ownership is
+established; do not infer it from filename casing alone.
 
 One gap is deliberate and documented rather than closed: `ai-memory bootstrap`
 writes pages at paths the model picks from the repository's own README, docs

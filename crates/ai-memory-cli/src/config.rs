@@ -672,9 +672,10 @@ pub struct SlotSettings {
     /// Namespace engine-written slots under the operator that produced them
     /// (`_slots/u-alice/current-focus.md` instead of
     /// `_slots/current-focus.md`). The segment is the operator's
-    /// `IdentityKey::path_segment()` — `u-<name>` for safe usernames and a
-    /// bounded deterministic identifier for path-hostile usernames or complete
-    /// OIDC issuer/subject pairs — never a raw OIDC value.
+    /// `IdentityKey::path_segment()` — `u-<name>` for lowercase safe usernames
+    /// and a bounded deterministic identifier for mixed-case, Windows-unsafe,
+    /// or otherwise path-hostile usernames and complete OIDC issuer/subject
+    /// pairs — never a raw OIDC value.
     ///
     /// Off by default, so nothing changes for an existing install: with the
     /// flag off a nested slot path carries no ownership meaning at all, and
