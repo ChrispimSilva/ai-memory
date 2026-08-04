@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and can be fixture-tested (#355).
 
 ### Fixed
+- Mixed-case and trailing-period usernames now use deterministic hashed
+  per-operator slot namespaces, preventing distinct identities from sharing one
+  physical directory on case-insensitive filesystems (#364).
 - Native-session checkout matching now fails closed when either path cannot be
   canonicalized, instead of treating two missing or inaccessible paths as the
   same checkout during managed resume or adoption (#356).
