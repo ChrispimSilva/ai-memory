@@ -500,9 +500,10 @@ breadth_weight = 0.0               # opt-in reward for distinct operators
 per_user = false                  # shared + own slots in agent context
 
 [consolidation]                    # LLM consolidation prompt sizing
-max_input_tokens = 100000          # WHOLE prompt budget; default assumes 200k ctx
-                                   # lower to a small local model's real capacity,
-                                   # or the provider rejects every consolidation
+max_input_tokens = 100000          # approximate whole-input target; min 6000
+max_output_tokens = 32000          # provider generation limit; min 1000
+                                   # their sum must fit the model context window;
+                                   # leave headroom for tokenizer variance
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review

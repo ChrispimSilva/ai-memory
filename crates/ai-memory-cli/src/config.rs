@@ -183,8 +183,8 @@ pub struct Config {
     pub maintenance: MaintenanceSettings,
     /// Memory-slot behaviour.
     pub slots: SlotSettings,
-    /// LLM consolidation prompt sizing. Must match the configured model's
-    /// real input capacity; the default assumes a 200k-context provider.
+    /// LLM consolidation prompt limits. Defaults are sized for a model with a
+    /// 200k-token context window.
     pub consolidation: ConsolidationSettings,
     /// Auto-improvement reviewer. The scheduler launches background review for
     /// newly completed sessions; manual CLI/admin/MCP runs remain available.
@@ -525,21 +525,23 @@ impl Default for Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConsolidationSettings {
-    /// Approximate chars/4 budget for the ENTIRE consolidation prompt:
+    /// Approximate token target for the entire consolidation prompt:
     /// observation dump, current page body, system prompt, page conventions,
     /// slot snapshots, and the structured-output schema.
     ///
-    /// The default assumes a 200k-context provider. A smaller model needs this
-    /// lowered to its real input capacity, minus room for the 32k output
-    /// reservation — otherwise the provider rejects the whole request and the
-    /// session is never consolidated.
+    /// The exact tokenizer is provider-specific, so leave headroom. This value
+    /// plus [`Self::max_output_tokens`] must fit the model's context window.
     pub max_input_tokens: usize,
+    /// Maximum tokens the provider may generate for a consolidation response.
+    /// Small-context models must lower this together with `max_input_tokens`.
+    pub max_output_tokens: u32,
 }
 
 impl Default for ConsolidationSettings {
     fn default() -> Self {
         Self {
             max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
+            max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
         }
     }
 }
@@ -849,6 +851,14 @@ impl Config {
                  (got {}); below that the system prompt and page conventions leave \
                  no room for observations",
                 config.consolidation.max_input_tokens
+            );
+        }
+        let min_output_tokens = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS;
+        if config.consolidation.max_output_tokens < min_output_tokens {
+            anyhow::bail!(
+                "consolidation.max_output_tokens must be at least {min_output_tokens} \
+                 (got {}); below that a structured consolidation response is unlikely to fit",
+                config.consolidation.max_output_tokens
             );
         }
 
@@ -1305,15 +1315,42 @@ mod tests {
         }
     }
 
-    /// A small-context provider is configured by lowering this one key, so it
-    /// has to survive the config round-trip.
+    #[test]
+    fn load_rejects_a_consolidation_output_limit_too_small_for_json() {
+        let min = ai_memory_consolidate::MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS;
+        for value in [0, 1, min - 1] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[consolidation]\nmax_output_tokens = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an unusable consolidation output limit must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("consolidation.max_output_tokens"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// A small-context provider needs both sides of the context allocation to
+    /// survive the config round-trip.
     #[test]
     fn load_accepts_a_small_context_consolidation_budget() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
-        std::fs::write(&config_path, "[consolidation]\nmax_input_tokens = 7000\n").unwrap();
+        std::fs::write(
+            &config_path,
+            "[consolidation]\nmax_input_tokens = 7000\nmax_output_tokens = 1000\n",
+        )
+        .unwrap();
         let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(cfg.consolidation.max_input_tokens, 7_000);
+        assert_eq!(cfg.consolidation.max_output_tokens, 1_000);
     }
 
     #[test]
@@ -1323,6 +1360,10 @@ mod tests {
         assert_eq!(
             cfg.consolidation.max_input_tokens,
             ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS
+        );
+        assert_eq!(
+            cfg.consolidation.max_output_tokens,
+            ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS
         );
     }
 

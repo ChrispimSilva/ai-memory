@@ -900,6 +900,25 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
+For small-context local models, configure both consolidation limits. The input
+target accounts for the complete rendered prompt, including bounded slot and
+current-page context plus the structured-output schema; the output limit is
+sent to the provider. Their sum must fit the model context window, with extra
+headroom because provider tokenizers differ:
+
+```toml
+[consolidation]
+max_input_tokens = 6500
+max_output_tokens = 1000
+```
+
+The equivalent environment variables are
+`AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS` and
+`AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS`. Provider failures during an
+automatic PreCompact/PostCompaction checkpoint fall back to the deterministic
+rule-based page; admission, storage, and scope errors still fail closed. The
+validated minimums are 6,000 input and 1,000 output tokens.
+
 Reranking is optional and off by default. With an LLM provider configured,
 `AI_MEMORY_RERANKER=llm` makes project and explicit-scope `memory_query`
 calls over-fetch from the hybrid stage, fuse scopes, and make at most one LLM
