@@ -741,7 +741,17 @@ fn sanitize_client_name(raw: &str) -> Option<String> {
     let printable: String = raw
         .trim()
         .chars()
-        .filter(|c| !c.is_control() && !is_bidi_control(*c))
+        .filter_map(|c| {
+            if is_bidi_control(c) {
+                None
+            } else if c.is_whitespace() {
+                Some(' ')
+            } else if c.is_control() {
+                None
+            } else {
+                Some(c)
+            }
+        })
         .collect();
     let cleaned: String = printable
         .split_whitespace()
