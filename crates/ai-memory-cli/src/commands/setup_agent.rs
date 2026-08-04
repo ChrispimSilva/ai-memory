@@ -38,9 +38,8 @@ use crate::cli::{AgentChoice, SetupAgentArgs};
 use crate::commands::install_mcp;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
-    build_claude_code_payload, build_devin_payload, build_grok_payload,
-    hook_script_for_current_platform,
+    GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, build_claude_code_payload,
+    build_devin_payload, build_grok_payload, hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -150,15 +149,10 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         // script listing is deduplicated below; apply-mode owns the exact
         // `[[hooks]]` TOML merge into the user's config.toml.
         AgentChoice::KimiCode => emit_other(&emit_root, agent_sub, &args, &[&KIMI_CODE_EVENTS]),
-        // Both Kiro engine surfaces stage the same `hooks/kiro-cli/`
-        // bundle; only the registration config differs (v2 agent-config
-        // entries vs the v3 standalone hooks file), and apply-mode owns
-        // those exact merges.
+        // Kiro v2 embeds its lifecycle hooks in agent configs. Kiro v3 is
+        // withheld until its command-input payload contract is documented.
         AgentChoice::KiroCli => {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V2_EVENTS]);
-        }
-        AgentChoice::KiroCliV3 => {
-            emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
         AgentChoice::OpenCode
         | AgentChoice::Pi
@@ -689,18 +683,9 @@ mod tests {
     }
 
     #[test]
-    fn kiro_cli_manual_script_paths_cover_both_engine_event_sets() {
-        // Both Kiro engines share one five-script bundle; only the
-        // trigger spellings differ (v2 camelCase in agent configs, v3
-        // PascalCase in the standalone hooks file). The parity gate
-        // keeps the bundle and both event tables from drifting apart.
+    fn kiro_cli_manual_script_paths_cover_v2_event_set() {
         let root = Path::new("/hooks/kiro-cli");
         let v2_paths = event_script_paths(root, &[&KIRO_CLI_V2_EVENTS]);
-        let v3_paths = event_script_paths(root, &[&KIRO_CLI_V3_EVENTS]);
-        assert_eq!(
-            v2_paths, v3_paths,
-            "both engines must stage the same bundle"
-        );
         let rendered = v2_paths
             .iter()
             .map(|path| path.to_string_lossy())
@@ -719,23 +704,9 @@ mod tests {
                 "Kiro CLI setup-agent must list {script}; got:\n{rendered}"
             );
         }
-        // The v2 vocabulary is exactly five camelCase triggers; the v3
-        // vocabulary is the same five in PascalCase. No PreCompact /
-        // SessionEnd / subagent equivalents exist on either engine.
+        // The documented v2 vocabulary has no PreCompact, SessionEnd, or
+        // subagent equivalents.
         assert_eq!(KIRO_CLI_V2_EVENTS.len(), 5);
-        assert_eq!(KIRO_CLI_V3_EVENTS.len(), 5);
         assert_eq!(v2_paths.len(), 5);
-        // Positional pairing: entry N of both tables is the same logical
-        // event registered under each engine's spelling (v2 `agentSpawn`
-        // pairs with v3 `SessionStart`), so the script must match
-        // position by position.
-        for ((v2_event, v2_script), (v3_event, v3_script)) in
-            KIRO_CLI_V2_EVENTS.iter().zip(KIRO_CLI_V3_EVENTS.iter())
-        {
-            assert_eq!(
-                v2_script, v3_script,
-                "v2 {v2_event} and v3 {v3_event} must run the same script"
-            );
-        }
     }
 }

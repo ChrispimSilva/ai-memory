@@ -89,33 +89,15 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
 /// the matching `.sh` and `.ps1` files under `hooks/kiro-cli/`; the
 /// install-hooks parity test fails if the bundle drifts.
 ///
-/// The v3 engine of the same binary uses an incompatible standalone
-/// hooks file with PascalCase triggers — see [`KIRO_CLI_V3_EVENTS`].
-/// Do not mix the two vocabularies.
+/// Kiro's v3 engine uses a different standalone registration format, but
+/// its command-input payload is not documented. Do not advertise or install
+/// v3 hooks until that input contract can be captured in fixtures and tested.
 pub(crate) const KIRO_CLI_V2_EVENTS: [(&str, &str); 5] = [
     ("agentSpawn", "session-start.sh"),
     ("userPromptSubmit", "user-prompt-submit.sh"),
     ("preToolUse", "pre-tool-use.sh"),
     ("postToolUse", "post-tool-use.sh"),
     ("stop", "stop.sh"),
-];
-
-/// Kiro CLI v3-engine lifecycle triggers (early access, `kiro-cli --v3`).
-/// Each pair is `(PascalCase trigger, POSIX hook-script-filename)`.
-///
-/// The v3 engine reads standalone versioned hooks files
-/// (`.kiro/hooks/*.json` per workspace, `~/.kiro/hooks/*.json` global)
-/// per kiro.dev/docs/cli/v3/hooks. v3 also defines task/file/manual
-/// triggers (PreTaskExec, PostFileSave, …) that ai-memory does not
-/// subscribe to; capture sticks to the shared five-event vocabulary.
-/// The same `hooks/kiro-cli/` script bundle serves both engines — only
-/// the registration surface differs.
-pub(crate) const KIRO_CLI_V3_EVENTS: [(&str, &str); 5] = [
-    ("SessionStart", "session-start.sh"),
-    ("UserPromptSubmit", "user-prompt-submit.sh"),
-    ("PreToolUse", "pre-tool-use.sh"),
-    ("PostToolUse", "post-tool-use.sh"),
-    ("Stop", "stop.sh"),
 ];
 
 /// Devin lifecycle events ai-memory hooks. Each pair is
@@ -304,20 +286,55 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
     project_strategy: Option<&str>,
     capture_assistant: bool,
 ) -> serde_json::Value {
+    build_claude_code_payload_with_data_dir_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        data_dir,
+        project_strategy,
+        capture_assistant,
+        HookCommandPlatform::for_bash_runner(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn build_claude_code_script_payload_for_test(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+    capture_assistant: bool,
+) -> serde_json::Value {
+    build_claude_code_payload_with_data_dir_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        data_dir,
+        project_strategy,
+        capture_assistant,
+        HookCommandPlatform::Posix,
+    )
+}
+
+fn build_claude_code_payload_with_data_dir_for_platform(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+    capture_assistant: bool,
+    platform: HookCommandPlatform,
+) -> serde_json::Value {
     build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
         auth_token,
         HookShape::Nested,
-        HookCommandContext::new(
-            HookCommandPlatform::for_bash_runner(),
-            "claude-code",
-            data_dir,
-            project_strategy,
-        )
-        .allow_claude_windows_exec()
-        .with_capture_assistant(capture_assistant),
+        HookCommandContext::new(platform, "claude-code", data_dir, project_strategy)
+            .allow_claude_windows_exec()
+            .with_capture_assistant(capture_assistant),
     )
 }
 
@@ -718,6 +735,31 @@ pub(crate) fn build_profile_payload_for_agent(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn build_profile_script_payload_for_test(
+    profile: &HookProfile,
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    agent: &str,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload(
+        profile.events,
+        emit_root,
+        server_url,
+        auth_token,
+        profile.shape,
+        HookCommandContext::new(
+            HookCommandPlatform::Posix,
+            agent,
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
 fn build_hook_payload(
     events: &[(&str, &str)],
     emit_root: &Path,
@@ -844,72 +886,6 @@ fn build_kiro_cli_v2_hooks_value_for_platform(
         hooks.insert(event.to_string(), json!([Value::Object(entry)]));
     }
     hooks
-}
-
-/// Build the standalone versioned hooks file for the Kiro CLI v3 engine
-/// (`~/.kiro/hooks/ai-memory.json`), per kiro.dev/docs/cli/v3/hooks:
-/// `{"version":"v1","hooks":[{name, description, trigger, action, timeout}]}`
-/// with PascalCase triggers and `{"type":"command","command":…}` actions.
-/// No `matcher` key — an omitted matcher always fires, and v3 matchers
-/// are regexes over tool names / prompt text, none of which a capture
-/// hook wants to filter. Every entry name carries the `ai-memory-`
-/// prefix; reapply and uninstall identify our entries by that prefix or
-/// by the command string, so third-party hooks that a user placed in
-/// the same file survive.
-///
-/// `timeout` is in SECONDS on v3 (not v2's `timeout_ms`). The scripts
-/// self-bound their network waits well under a second, so 10 s is a
-/// generous ceiling that still protects the session UX.
-pub(crate) fn build_kiro_cli_v3_hooks_file(
-    emit_root: &Path,
-    server_url: &str,
-    auth_token: Option<&str>,
-    data_dir: Option<&Path>,
-    project_strategy: Option<&str>,
-) -> Value {
-    build_kiro_cli_v3_hooks_file_for_platform(
-        emit_root,
-        server_url,
-        auth_token,
-        HookCommandPlatform::current(),
-        data_dir,
-        project_strategy,
-    )
-}
-
-/// Timeout (seconds) for ai-memory's Kiro v3 hook entries.
-pub(crate) const KIRO_CLI_V3_HOOK_TIMEOUT_SECONDS: u64 = 10;
-
-fn build_kiro_cli_v3_hooks_file_for_platform(
-    emit_root: &Path,
-    server_url: &str,
-    auth_token: Option<&str>,
-    platform: HookCommandPlatform,
-    data_dir: Option<&Path>,
-    project_strategy: Option<&str>,
-) -> Value {
-    let hooks: Vec<Value> = KIRO_CLI_V3_EVENTS
-        .iter()
-        .map(|(trigger, script)| {
-            let stem = script.trim_end_matches(".sh");
-            let script = script_for_platform(script, platform);
-            let abs = emit_root.join(script.as_ref());
-            let command = hook_command(
-                &abs,
-                server_url,
-                auth_token,
-                HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
-            );
-            json!({
-                "name": format!("ai-memory-{stem}"),
-                "description": "ai-memory lifecycle capture (fire-and-forget)",
-                "trigger": trigger,
-                "action": { "type": "command", "command": command },
-                "timeout": KIRO_CLI_V3_HOOK_TIMEOUT_SECONDS,
-            })
-        })
-        .collect();
-    json!({ "version": "v1", "hooks": hooks })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

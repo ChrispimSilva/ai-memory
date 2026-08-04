@@ -21,6 +21,7 @@ mod migrations;
 mod ops;
 mod reader;
 mod scope;
+mod session_consolidation;
 pub mod users;
 mod workstream;
 mod writer;
@@ -32,9 +33,13 @@ pub use auto_improve::{
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
     AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun, artifact_path_for,
+    OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
+    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
-pub use decay::{DecayParams, retention_score};
+pub use decay::{
+    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
+    retention_score_with_breadth, salience_after_feedback,
+};
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
@@ -42,25 +47,26 @@ pub use ops::{
     ReorgSummary,
 };
 pub use reader::{
-    ActivityWindow, AutoImproveCandidateSession, BriefPageBody, BriefingPage, BriefingSnapshot,
-    ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
-    DerivedIndexStatus, EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit,
-    OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, ScopeRow, SessionEndDisposition,
-    StatusCounts, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
-    f32_vec_to_bytes,
+    ActivityWindow, AgentSessionCount, AutoImproveCandidateSession, BriefPageBody, BriefingPage,
+    BriefingSnapshot, ContaminationFinding, ContaminationReport, ContaminationSummary,
+    DecayCandidate, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia,
+    HealthDetail, HealthPage, ObservationHit, OpenSession, PageAuthor, PageHit, PageHitWithMeta,
+    PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage,
+    RrfContributions, ScopeRow, SearchExplain, SessionEndDisposition, StatusCounts,
+    StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
     create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,
     lookup_global_scope, resolve_many_existing_scopes,
 };
+pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
     PreparedWorkstreamRun, StoredManagedRunStatus, WorkstreamSelection,
 };
-pub use writer::WriterHandle;
+pub use writer::{StartupContextAcceptance, WriterHandle};
 
 /// Filename used inside the data dir's `db/` subdirectory.
 pub const DB_FILENAME: &str = "memory.sqlite";
@@ -122,9 +128,10 @@ impl Store {
 mod tests {
     use super::*;
     use ai_memory_core::{
-        ActorContext, AgentKind, LinkTarget, NewObservation, NewPage, NewSession,
-        NewWorkstreamEvent, ObservationId, ObservationKind, PageId, PagePath, ProjectId, Sanitized,
-        Sanitizer, SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
+        ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, LinkTarget,
+        ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewWorkstreamEvent,
+        ObservationId, ObservationKind, PageId, PagePath, ProjectId, Sanitized, Sanitizer,
+        SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -142,6 +149,8 @@ mod tests {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
         }
     }
 
@@ -543,20 +552,39 @@ mod tests {
         migrations::run_to(&mut conn, 23).unwrap();
         let ws = ops::get_or_create_workspace(&mut conn, "default").unwrap();
         let proj = ops::get_or_create_project(&mut conn, &ws, "app", None).unwrap();
-        let id = auto_improve::stage_run(
-            &mut conn,
-            &stage_input(
-                ws,
-                proj,
-                vec![proposal(
-                    "notes/old.md",
-                    AutoImproveProposalOperation::Create,
-                    "old",
-                )],
-            ),
+        // Era-appropriate raw insert: this fixture stops at V23 on purpose,
+        // while `stage_run` writes whatever columns the CURRENT schema has, and
+        // every later migration that adds one would break a test about an older
+        // era.
+        let id = ai_memory_core::AutoImproveProposalId::new();
+        let run_id = ai_memory_core::AutoImproveRunId::new();
+        let now = jiff::Timestamp::now().as_microsecond();
+        conn.execute(
+            "INSERT INTO auto_improve_runs \
+             (id, workspace_id, project_id, warnings_json, rejected_candidates_json, \
+              config_json, proposal_actor_json, created_at) \
+             VALUES (?1, ?2, ?3, '[]', '[]', '{}', '{}', ?4)",
+            params![run_id.as_bytes(), ws.as_bytes(), proj.as_bytes(), now],
         )
-        .unwrap()
-        .proposal_ids[0];
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_proposals \
+             (id, run_id, workspace_id, project_id, status, operation, target_path, kind, \
+              title, confidence, rationale, evidence_json, body_markdown, body_sha256, \
+              artifact_path, staged_at) \
+             VALUES (?1, ?2, ?3, ?4, 'pending', 'create', 'notes/old.md', 'note', 'old', \
+                     0.9, 'r', '[]', 'body', ?5, ?6, ?7)",
+            params![
+                id.as_bytes(),
+                run_id.as_bytes(),
+                ws.as_bytes(),
+                proj.as_bytes(),
+                &sha256("body")[..],
+                auto_improve::artifact_path_for(id),
+                now,
+            ],
+        )
+        .unwrap();
         drop(conn);
 
         let store = Store::open(tmp.path()).unwrap();
@@ -683,6 +711,7 @@ mod tests {
                 project_id: other,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -1582,6 +1611,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -1794,12 +1824,16 @@ mod tests {
         assert_eq!(edges[0].to_project, "infra");
 
         // Briefing degree: app depends on 1 project; infra has 1 dependent.
-        let app_brief = store.reader.briefing_for_project(ws, app, 5).await.unwrap();
+        let app_brief = store
+            .reader
+            .briefing_for_project(ws, app, 5, ai_memory_core::OwnerFilter::Any)
+            .await
+            .unwrap();
         assert_eq!(app_brief.cross_project_dependencies, 1);
         assert_eq!(app_brief.cross_project_dependents, 0);
         let infra_brief = store
             .reader
-            .briefing_for_project(ws, infra, 5)
+            .briefing_for_project(ws, infra, 5, ai_memory_core::OwnerFilter::Any)
             .await
             .unwrap();
         assert_eq!(infra_brief.cross_project_dependents, 1);
@@ -1930,6 +1964,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::AntigravityCli,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2110,6 +2145,124 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn search_ranks_page_authority_without_hiding_session_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        let mut decision = sample_page(
+            ws,
+            proj,
+            "decisions/embedding-policy.md",
+            "The current decision keeps LLM embeddings optional and uses them only for reranking.",
+        );
+        decision.title = "LLM embedding policy".into();
+        decision.pinned = true;
+        decision.frontmatter_json =
+            serde_json::json!({"tags": ["decision", "canonical", "active"]});
+        store.writer.upsert_page(decision).await.unwrap();
+
+        let mut session = sample_page(
+            ws,
+            proj,
+            "sessions/2026-07-27.md",
+            "What is the current decision about LLM embeddings? This session preserves historical evidence and chronicleonlytoken.",
+        );
+        session.title = "What is the current decision about LLM embeddings?".into();
+        session.tier = Tier::Episodic;
+        store.writer.upsert_page(session).await.unwrap();
+
+        for idx in 0..5 {
+            let mut noisy_session = sample_page(
+                ws,
+                proj,
+                &format!("sessions/noisy-{idx}.md"),
+                "What is the current decision about LLM embeddings? This session repeats the question as historical evidence.",
+            );
+            noisy_session.title = "What is the current decision about LLM embeddings?".into();
+            noisy_session.tier = Tier::Episodic;
+            store.writer.upsert_page(noisy_session).await.unwrap();
+        }
+
+        let mut rejected = sample_page(
+            ws,
+            proj,
+            "sessions/rejected-fixture.md",
+            "What is the current decision about LLM embeddings? This obsolete answer repeats LLM embeddings current decision.",
+        );
+        rejected.title = "Current decision about LLM embeddings".into();
+        rejected.tier = Tier::Episodic;
+        rejected.frontmatter_json =
+            serde_json::json!({"tags": ["superseded", "do_not_answer_from"]});
+        store.writer.upsert_page(rejected).await.unwrap();
+
+        let query = "what is the current decision about LLM embeddings";
+        let scoped = store
+            .reader
+            .search_pages_for_project(ws, proj, query.into(), 10, None)
+            .await
+            .unwrap();
+        let scoped_paths: Vec<&str> = scoped.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(
+            scoped_paths[0], "decisions/embedding-policy.md",
+            "authority-ranked hits: {scoped:?}"
+        );
+        assert_eq!(
+            scoped_paths.last().copied(),
+            Some("sessions/rejected-fixture.md")
+        );
+        assert!(scoped.windows(2).all(|pair| pair[0].rank <= pair[1].rank));
+
+        let top_one = store
+            .reader
+            .search_pages_for_project(ws, proj, query.into(), 1, None)
+            .await
+            .unwrap();
+        assert_eq!(top_one[0].path.as_str(), "decisions/embedding-policy.md");
+
+        let global = store
+            .reader
+            .search_pages_with_meta(query.into(), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");
+
+        let hybrid = store
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                query.into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hybrid[0].path.as_str(), "decisions/embedding-policy.md");
+
+        let session_evidence = store
+            .reader
+            .search_pages_for_project(ws, proj, "chronicleonlytoken".into(), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(session_evidence.len(), 1);
+        assert_eq!(session_evidence[0].path.as_str(), "sessions/2026-07-27.md");
+    }
+
     /// Regression: bare `word:` in agent queries is FTS5 column syntax, not
     /// a literal token (`no such column: pick` / `memory`).
     #[tokio::test]
@@ -2241,7 +2394,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages_for_project(ws, proj, "ai-memory".into(), 10)
+            .search_pages_for_project(ws, proj, "ai-memory".into(), 10, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -2263,9 +2416,20 @@ mod tests {
             .await
             .unwrap();
 
-        store
+        let target_id = store
             .writer
             .upsert_page(sample_page(ws, proj, "target.md", "neighbor-only content"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .store_embedding(
+                target_id,
+                f32_vec_to_bytes(&[1.0, 0.0]),
+                "test".into(),
+                "two-dim".into(),
+                2,
+            )
             .await
             .unwrap();
         let mut source = sample_page(ws, proj, "source.md", "needle source content");
@@ -2283,6 +2447,7 @@ mod tests {
                 String::new(),
                 0,
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -2292,6 +2457,85 @@ mod tests {
             paths.contains(&"target.md"),
             "linked neighbor should be included"
         );
+
+        let explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                "needle".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        let explained_paths: Vec<&str> =
+            explained.iter().map(|(hit, _)| hit.path.as_str()).collect();
+        assert_eq!(paths, explained_paths, "explain must not change ranking");
+
+        let (source_hit, source_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "source.md")
+            .unwrap();
+        assert_eq!(source_details.fts_rank, Some(1));
+        assert!(source_details.vector_rank.is_none());
+        assert!(source_details.graph_rank.is_none());
+
+        let (target_hit, target_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "target.md")
+            .unwrap();
+        assert!(target_details.fts_rank.is_none());
+        assert!(target_details.vector_rank.is_none());
+        assert_eq!(target_details.graph_rank, Some(1));
+        let via = target_details.graph_via.as_ref().unwrap();
+        assert_eq!(via.seed_path, "source.md");
+        assert_eq!(via.direction, "outgoing");
+
+        for (hit, details) in [(source_hit, source_details), (target_hit, target_details)] {
+            let authority = details.authority.unwrap();
+            let expected_rank = -(details.fused * authority);
+            assert!(
+                (hit.rank - expected_rank).abs() < f64::EPSILON,
+                "rank must equal -(fused * authority): {hit:?} {details:?}"
+            );
+            assert!(
+                (details.fused
+                    - (details.rrf.fts
+                        + details.rrf.entity
+                        + details.rrf.vector
+                        + details.rrf.graph))
+                    .abs()
+                    < f64::EPSILON
+            );
+        }
+
+        let vector_explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                "needle".into(),
+                Some(vec![1.0, 0.0]),
+                "test".into(),
+                "two-dim".into(),
+                2,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        let (_, target_vector_details) = vector_explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "target.md")
+            .unwrap();
+        assert_eq!(target_vector_details.vector_rank, Some(1));
+        assert_eq!(target_vector_details.cosine, Some(1.0));
+        assert!(target_vector_details.rrf.vector > 0.0);
     }
 
     #[tokio::test]
@@ -2317,6 +2561,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2376,6 +2621,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2446,6 +2692,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2559,6 +2806,7 @@ mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2572,6 +2820,257 @@ mod tests {
                 .await
                 .unwrap(),
             Some(first)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_and_automatic_handoff_commit_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: Some("user:alice".into()),
+            })
+            .await
+            .unwrap();
+        let handoff = |project_id, owner: Option<&str>| NewHandoff {
+            workspace_id: ws,
+            project_id,
+            from_session_id: Some(session_id),
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: None,
+            summary: "continue".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: owner.map(str::to_string),
+        };
+
+        assert!(
+            store
+                .writer
+                .end_session_with_handoff(session_id, None, handoff(other, Some("user:alice")),)
+                .await
+                .is_err(),
+            "a mismatched handoff must reject the whole end transition"
+        );
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap(),
+            SessionEndDisposition::Open,
+            "failed handoff insertion must leave the session open"
+        );
+
+        assert!(
+            store
+                .writer
+                .end_session_with_handoff(session_id, None, handoff(proj, Some("user:bob")),)
+                .await
+                .is_err(),
+            "a mismatched owner must reject the whole end transition"
+        );
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap(),
+            SessionEndDisposition::Open,
+            "an owner mismatch must leave the session open"
+        );
+
+        store
+            .writer
+            .end_session_with_handoff(session_id, None, handoff(proj, Some("user:alice")))
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let ended: Option<i64> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let handoffs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM handoffs WHERE from_session_id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_some());
+        assert_eq!(handoffs, 1);
+    }
+
+    #[tokio::test]
+    async fn session_end_disposition_uses_observation_generation_not_wall_clock() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropInvalid,
+            "a missing session must not enter already-ended recovery"
+        );
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let other_proj = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, other_proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropInvalid
+        );
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropInvalid
+        );
+        let first_observation = store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "first".into(),
+                    body: "initial work".into(),
+                    importance: 8,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let ended_at: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE observations SET created_at = ?1 WHERE id = ?2",
+            params![ended_at + 1_000_000, first_observation.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::AlreadyEnded,
+            "a covered observation must stay covered even if its timestamp is in the future"
+        );
+
+        let resumed_observation = store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: "resumed".into(),
+                    body: "new work".into(),
+                    importance: 7,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        conn.execute(
+            "UPDATE observations SET created_at = 1 WHERE id = ?1",
+            params![resumed_observation.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::ReEndWithNewWork,
+            "a new observation must trigger re-end even if its timestamp predates ended_at"
+        );
+
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::AlreadyEnded,
+            "stamping the new generation must make the re-end converge"
         );
     }
 
@@ -2600,6 +3099,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2630,6 +3130,7 @@ mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2704,6 +3205,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2778,6 +3280,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2804,6 +3307,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2846,6 +3350,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2892,6 +3397,7 @@ mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2965,6 +3471,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3016,20 +3523,26 @@ mod tests {
             let ws = super::ops::get_or_create_workspace(&mut conn, "default").unwrap();
             let proj =
                 super::ops::get_or_create_project(&mut conn, &ws, "ai-memory", None).unwrap();
-            let page_id = super::ops::upsert_page(
-                &mut conn,
+            // Raw-SQL seeding: the v19-era schema predates the V36
+            // `expires_at` column that current `upsert_page` writes.
+            let page_id = super::ops::tests::insert_page_pre_v36(
+                &conn,
                 &sample_page(ws, proj, "notes/v103.md", "v1.0.3 upgrade fixture"),
-            )
-            .unwrap();
-            super::ops::begin_session(
-                &mut conn,
-                &NewSession {
-                    id: session_id,
-                    workspace_id: ws,
-                    project_id: proj,
-                    agent_kind: AgentKind::OpenCode,
-                    cwd: None,
-                },
+            );
+            // Era-appropriate raw insert: this fixture stops at V19 on
+            // purpose, while `begin_session` writes whatever columns the
+            // CURRENT schema has — including V40's `actor_user`, which a
+            // v19-era `sessions` table does not have.
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+                 VALUES (?1, ?2, ?3, 'open-code', NULL, ?4)",
+                params![
+                    session_id.as_bytes(),
+                    ws.as_bytes(),
+                    proj.as_bytes(),
+                    jiff::Timestamp::now().as_microsecond(),
+                ],
             )
             .unwrap();
             super::ops::insert_observation(
@@ -3047,7 +3560,11 @@ mod tests {
                 },
             )
             .unwrap();
-            super::ops::end_session(&mut conn, &session_id, Some(&page_id)).unwrap();
+            conn.execute(
+                "UPDATE sessions SET ended_at = 1, summary_page_id = ?1 WHERE id = ?2",
+                params![page_id.as_bytes(), session_id.as_bytes()],
+            )
+            .unwrap();
         }
 
         let store = Store::open(tmp.path()).unwrap();
@@ -3281,18 +3798,25 @@ mod tests {
             "explicit kind must win"
         );
 
-        assert_briefing_kinds(&store.reader.briefing(100).await.unwrap().recent_pages);
         assert_briefing_kinds(
             &store
                 .reader
-                .briefing_for_workspace(ws, 100)
+                .briefing(100, ai_memory_core::OwnerFilter::Any)
+                .await
+                .unwrap()
+                .recent_pages,
+        );
+        assert_briefing_kinds(
+            &store
+                .reader
+                .briefing_for_workspace(ws, 100, ai_memory_core::OwnerFilter::Any)
                 .await
                 .unwrap()
                 .recent_pages,
         );
         let project_briefing = store
             .reader
-            .briefing_for_project(ws, proj, 100)
+            .briefing_for_project(ws, proj, 100, ai_memory_core::OwnerFilter::Any)
             .await
             .unwrap();
         assert_briefing_kinds(&project_briefing.recent_pages);
@@ -3391,6 +3915,8 @@ mod tests {
             pinned: true,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
         };
         store.writer.upsert_page(page).await.unwrap();
 
@@ -3976,5 +4502,1223 @@ mod tests {
         assert_eq!(first[0].content, "only visible in workspace a");
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].content, "only visible in workspace b");
+    }
+
+    fn managed_prepare_input(
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner: &str,
+    ) -> PrepareWorkstreamRun {
+        PrepareWorkstreamRun {
+            workspace_id: ws,
+            project_id: proj,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            selection: WorkstreamSelection::Current,
+            lease_owner: owner.into(),
+        }
+    }
+
+    async fn open_managed_scope(store: &Store, project: &str) -> (WorkspaceId, ProjectId) {
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, project, None)
+            .await
+            .unwrap();
+        (ws, proj)
+    }
+
+    fn managed_event(
+        event_id: &str,
+        agent: AgentKind,
+        native: &str,
+        content: &str,
+    ) -> NewWorkstreamEvent {
+        NewWorkstreamEvent {
+            event_id: event_id.into(),
+            agent,
+            native_session_id: native.into(),
+            source_record_id: None,
+            kind: WorkstreamEventKind::Message,
+            role: Some("assistant".into()),
+            content: content.into(),
+            occurred_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn complete_finish(
+        run_id: ManagedRunId,
+        events: Vec<NewWorkstreamEvent>,
+    ) -> FinishWorkstreamRun {
+        FinishWorkstreamRun {
+            run_id,
+            native_session_id: None,
+            source_cursor: None,
+            events,
+            complete: true,
+            segment_path: None,
+            exit_code: Some(0),
+        }
+    }
+
+    fn set_managed_run_lease(db_path: &std::path::Path, run_id: ManagedRunId, lease: i64) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE managed_runs SET lease_expires_at = ?1 WHERE id = ?2",
+            params![lease, run_id.as_bytes()],
+        )
+        .unwrap();
+    }
+
+    fn managed_run_lease(db_path: &std::path::Path, run_id: ManagedRunId) -> i64 {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT lease_expires_at FROM managed_runs WHERE id = ?1",
+            params![run_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn managed_run_heartbeat_extends_only_an_active_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-heartbeat").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+
+        // Pull the lease close to expiry; a heartbeat must push it back out.
+        let initial = managed_run_lease(store.db_path(), run.run_id);
+        set_managed_run_lease(store.db_path(), run.run_id, initial - 5_000_000);
+        assert!(
+            store
+                .writer
+                .heartbeat_managed_run(run.run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            managed_run_lease(store.db_path(), run.run_id) >= initial,
+            "heartbeat must extend the lease"
+        );
+
+        // A still-active launcher can recover after the server was unavailable
+        // for longer than one lease window.
+        set_managed_run_lease(store.db_path(), run.run_id, 1);
+        assert!(
+            store
+                .writer
+                .heartbeat_managed_run(run.run_id)
+                .await
+                .unwrap()
+        );
+
+        // Unknown runs never heartbeat.
+        assert!(
+            !store
+                .writer
+                .heartbeat_managed_run(ManagedRunId::new())
+                .await
+                .unwrap()
+        );
+
+        // Neither do finished runs.
+        store
+            .writer
+            .finish_workstream_run(complete_finish(run.run_id, Vec::new()))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .writer
+                .heartbeat_managed_run(run.run_id)
+                .await
+                .unwrap()
+        );
+
+        // Once another prepare transaction has claimed the workstream, the
+        // superseded run is terminal and cannot displace the replacement.
+        let superseded = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:superseded"))
+            .await
+            .unwrap();
+        set_managed_run_lease(store.db_path(), superseded.run_id, 1);
+        let replacement = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:replacement"))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .writer
+                .heartbeat_managed_run(superseded.run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .writer
+                .cancel_managed_run(replacement.run_id)
+                .await
+                .unwrap()
+        );
+
+        // Nor cancelled runs.
+        let cancelled = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:2"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .cancel_managed_run(cancelled.run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .writer
+                .heartbeat_managed_run(cancelled.run_id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_run_after_complete_is_an_idempotent_no_op() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-idempotent-finish").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+
+        let finish = FinishWorkstreamRun {
+            run_id: run.run_id,
+            native_session_id: Some("native-1".into()),
+            source_cursor: Some("cursor-1".into()),
+            events: vec![
+                managed_event("ev-1", AgentKind::Codex, "native-1", "first"),
+                managed_event("ev-2", AgentKind::Codex, "native-1", "second"),
+            ],
+            complete: true,
+            segment_path: Some("segment.jsonl".into()),
+            exit_code: Some(0),
+        };
+        let first = store
+            .writer
+            .finish_workstream_run(finish.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.imported_events, 2);
+        assert_eq!(first.latest_sequence, 2);
+
+        // Re-finishing a completed run imports nothing, even with new input.
+        let second = store.writer.finish_workstream_run(finish).await.unwrap();
+        assert_eq!(second.imported_events, 0);
+        assert_eq!(second.latest_sequence, 2);
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "finished"
+        );
+        let events = store
+            .reader
+            .search_workstream_events(run.workstream_id, String::new(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "the no-op finish must not duplicate events"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_run_rejects_cancelled_and_unknown_runs() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-finish-closed").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        assert!(store.writer.cancel_managed_run(run.run_id).await.unwrap());
+
+        let cancelled = store
+            .writer
+            .finish_workstream_run(complete_finish(run.run_id, Vec::new()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(cancelled, StoreError::InvalidState(ref msg) if msg.contains("expired")),
+            "cancelled runs report their state: {cancelled}"
+        );
+
+        let unknown = store
+            .writer
+            .finish_workstream_run(complete_finish(ManagedRunId::new(), Vec::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(unknown, StoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn finish_run_rejects_foreign_events_and_rolls_back_the_batch() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-finish-foreign").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+
+        // A valid event followed by another agent's event must import nothing.
+        let wrong_agent = store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: run.run_id,
+                native_session_id: Some("native-1".into()),
+                source_cursor: None,
+                events: vec![
+                    managed_event("ev-1", AgentKind::Codex, "native-1", "valid"),
+                    managed_event("ev-2", AgentKind::ClaudeCode, "native-1", "foreign agent"),
+                ],
+                complete: false,
+                segment_path: None,
+                exit_code: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(wrong_agent, StoreError::InvalidState(ref msg) if msg.contains("ev-2")),
+            "{wrong_agent}"
+        );
+        assert!(
+            store
+                .reader
+                .search_workstream_events(run.workstream_id, String::new(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected batch must roll back its earlier inserts"
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+
+        // Events from a different native session are rejected the same way.
+        let wrong_session = store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: run.run_id,
+                native_session_id: Some("native-1".into()),
+                source_cursor: None,
+                events: vec![managed_event(
+                    "ev-3",
+                    AgentKind::Codex,
+                    "native-2",
+                    "foreign session",
+                )],
+                complete: false,
+                segment_path: None,
+                exit_code: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(wrong_session, StoreError::InvalidState(ref msg) if msg.contains("native session")),
+            "{wrong_session}"
+        );
+
+        // The run is still usable after the rejected batches.
+        let finished = store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: run.run_id,
+                native_session_id: Some("native-1".into()),
+                source_cursor: None,
+                events: vec![managed_event("ev-1", AgentKind::Codex, "native-1", "valid")],
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(finished.imported_events, 1);
+        assert_eq!(finished.latest_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn accept_context_marks_delivery_only_for_active_runs() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-accept").await;
+
+        assert!(
+            !store
+                .writer
+                .accept_managed_run_context(ManagedRunId::new())
+                .await
+                .unwrap(),
+            "unknown runs cannot accept context"
+        );
+
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .accept_managed_run_context(run.run_id)
+                .await
+                .unwrap()
+        );
+        let status = store
+            .reader
+            .managed_run_status(run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.context_delivered);
+        assert!(
+            store
+                .writer
+                .accept_managed_run_context(run.run_id)
+                .await
+                .unwrap(),
+            "re-acknowledging a live run stays idempotent"
+        );
+
+        store
+            .writer
+            .finish_workstream_run(complete_finish(run.run_id, Vec::new()))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .writer
+                .accept_managed_run_context(run.run_id)
+                .await
+                .unwrap(),
+            "finished runs cannot accept context"
+        );
+
+        let cancelled = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:2"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .cancel_managed_run(cancelled.run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .writer
+                .accept_managed_run_context(cancelled.run_id)
+                .await
+                .unwrap(),
+            "cancelled runs cannot accept context"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_context_claim_is_atomic_and_single_use() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "startup-claim").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        let insert_handoff = || NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "continue".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: None,
+        };
+        let acceptance = |handoff_id, receiving_cwd| HandoffAcceptance {
+            handoff_id,
+            workspace_id: ws,
+            project_id: proj,
+            accepting_agent: AgentKind::Codex,
+            accepting_session: None,
+            accepting_user: None,
+            owner_filter: ai_memory_core::OwnerFilter::Any,
+            receiving_cwd,
+        };
+
+        let first_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
+        let accepted = store
+            .writer
+            .accept_startup_context(Some(acceptance(first_handoff, None)), Some(run.run_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted,
+            StartupContextAcceptance {
+                handoff_accepted: true,
+                managed_context_accepted: true,
+            }
+        );
+        assert!(
+            store
+                .reader
+                .latest_open_handoff(ws, proj, None, ai_memory_core::OwnerFilter::Any)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let second_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
+        let rejected = store
+            .writer
+            .accept_startup_context(Some(acceptance(second_handoff, None)), Some(run.run_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected,
+            StartupContextAcceptance::default(),
+            "an already-delivered managed packet must reject the whole claim"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_open_handoff(ws, proj, None, ai_memory_core::OwnerFilter::Any)
+                .await
+                .unwrap()
+                .map(|handoff| handoff.id),
+            Some(second_handoff),
+            "a failed managed claim must roll back the handoff transition"
+        );
+
+        async fn insert_auto_handoff(
+            store: &Store,
+            workspace_id: WorkspaceId,
+            project_id: ProjectId,
+            cwd: &str,
+        ) -> HandoffId {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: session_id,
+                    workspace_id,
+                    project_id,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: Some(cwd.into()),
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id,
+                    project_id,
+                    from_session_id: Some(session_id),
+                    from_agent: AgentKind::ClaudeCode,
+                    to_agent: None,
+                    cwd: Some(cwd.into()),
+                    summary: cwd.into(),
+                    open_questions: Vec::new(),
+                    next_steps: Vec::new(),
+                    files_touched: Vec::new(),
+                    owner_user: None,
+                })
+                .await
+                .unwrap()
+        }
+
+        let stale_auto = insert_auto_handoff(&store, ws, proj, "/repo/api").await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let selected_auto = insert_auto_handoff(&store, ws, proj, "/repo").await;
+        let rejected_auto = store
+            .writer
+            .accept_startup_context(
+                Some(acceptance(selected_auto, Some("/repo/api/src".into()))),
+                Some(run.run_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_auto, StartupContextAcceptance::default());
+        for handoff_id in [stale_auto, selected_auto] {
+            assert_eq!(
+                store
+                    .reader
+                    .handoff_by_id(handoff_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                HandoffState::Open,
+                "a rejected managed claim must not accept or expire automatic handoffs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_context_delivers_newest_events_in_sequence_order() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-context").await;
+        let first = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        // Finish without a native session so the next run starts with an
+        // undelivered context window spanning the whole ledger.
+        store
+            .writer
+            .finish_workstream_run(complete_finish(
+                first.run_id,
+                vec![
+                    managed_event("ev-1", AgentKind::Codex, "native-x", "one"),
+                    managed_event("ev-2", AgentKind::Codex, "native-x", "two"),
+                    managed_event("ev-3", AgentKind::Codex, "native-x", "three"),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let second = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:2"))
+            .await
+            .unwrap();
+        assert_eq!(second.workstream_id, first.workstream_id);
+        assert_eq!(second.sync_after, 0);
+        assert_eq!(second.sync_through, 3);
+
+        let context = store
+            .reader
+            .managed_run_context(second.run_id, 256)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.workstream_name, "default");
+        assert_eq!(context.sync_after, 0);
+        assert_eq!(context.sync_through, 3);
+        assert!(!context.context_delivered);
+        let ids: Vec<&str> = context.events.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, ["ev-1", "ev-2", "ev-3"], "ascending sequence order");
+        let sequences: Vec<i64> = context.events.iter().map(|e| e.sequence).collect();
+        assert_eq!(sequences, [1, 2, 3]);
+
+        // A capped window keeps the newest events, still ascending.
+        let capped = store
+            .reader
+            .managed_run_context(second.run_id, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        let capped_ids: Vec<&str> = capped.events.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(capped_ids, ["ev-2", "ev-3"]);
+
+        // Accepting marks the delivery on the run's own context only.
+        assert!(
+            store
+                .writer
+                .accept_managed_run_context(second.run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .reader
+                .managed_run_context(second.run_id, 256)
+                .await
+                .unwrap()
+                .unwrap()
+                .context_delivered
+        );
+
+        // Finished and unknown runs have no active context window.
+        assert!(
+            store
+                .reader
+                .managed_run_context(first.run_id, 256)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .reader
+                .managed_run_context(ManagedRunId::new(), 256)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .reader
+                .managed_run_status(ManagedRunId::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_events_tails_in_descending_order_and_clamps_the_limit() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-search").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(complete_finish(
+                run.run_id,
+                vec![
+                    managed_event("ev-1", AgentKind::Codex, "native-x", "alpha one"),
+                    managed_event("ev-2", AgentKind::Codex, "native-x", "alpha two"),
+                    managed_event("ev-3", AgentKind::Codex, "native-x", "alpha zebra three"),
+                    managed_event("ev-4", AgentKind::Codex, "native-x", "alpha four"),
+                    managed_event("ev-5", AgentKind::Codex, "native-x", "alpha five"),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let ids = |events: Vec<ai_memory_core::WorkstreamEvent>| -> Vec<String> {
+            events.into_iter().map(|e| e.event_id).collect()
+        };
+
+        // An empty query tails the ledger, newest first.
+        let all = store
+            .reader
+            .search_workstream_events(run.workstream_id, String::new(), 10)
+            .await
+            .unwrap();
+        assert_eq!(ids(all), ["ev-5", "ev-4", "ev-3", "ev-2", "ev-1"]);
+
+        let top_two = store
+            .reader
+            .search_workstream_events(run.workstream_id, String::new(), 2)
+            .await
+            .unwrap();
+        assert_eq!(ids(top_two), ["ev-5", "ev-4"]);
+
+        // The limit is clamped into 1..=100.
+        let clamped_low = store
+            .reader
+            .search_workstream_events(run.workstream_id, String::new(), 0)
+            .await
+            .unwrap();
+        assert_eq!(ids(clamped_low), ["ev-5"]);
+        let clamped_high = store
+            .reader
+            .search_workstream_events(run.workstream_id, String::new(), 500)
+            .await
+            .unwrap();
+        assert_eq!(clamped_high.len(), 5);
+
+        // A text query matches through FTS only, and the `field:` prefixes
+        // accepted by the search surface are stripped before matching.
+        let fts = store
+            .reader
+            .search_workstream_events(run.workstream_id, "zebra".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(ids(fts), ["ev-3"]);
+        for prefixed in ["title:zebra", "body:zebra", "content:zebra"] {
+            let hit = store
+                .reader
+                .search_workstream_events(run.workstream_id, prefixed.into(), 10)
+                .await
+                .unwrap();
+            assert_eq!(ids(hit), ["ev-3"], "prefix must be stripped: {prefixed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn link_native_session_rejects_blank_wrong_agent_and_inactive_targets() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-link").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+
+        for blank in ["", "   "] {
+            assert!(
+                !store
+                    .writer
+                    .link_managed_run_session(run.run_id, AgentKind::Codex, blank)
+                    .await
+                    .unwrap(),
+                "blank native session ids are ignored"
+            );
+        }
+        assert!(
+            !store
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::ClaudeCode, "native-1")
+                .await
+                .unwrap(),
+            "a different harness cannot claim the run"
+        );
+        assert!(
+            !store
+                .writer
+                .link_managed_run_session(ManagedRunId::new(), AgentKind::Codex, "native-1")
+                .await
+                .unwrap(),
+            "unknown runs cannot be linked"
+        );
+
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("native-1")
+        );
+
+        assert!(store.writer.cancel_managed_run(run.run_id).await.unwrap());
+        assert!(
+            !store
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "native-2")
+                .await
+                .unwrap(),
+            "inactive runs cannot be linked"
+        );
+    }
+
+    #[tokio::test]
+    async fn workstream_selection_validates_names_and_finds_existing() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-selection").await;
+        let prepare = |selection| PrepareWorkstreamRun {
+            selection,
+            ..managed_prepare_input(ws, proj, "test:1")
+        };
+
+        let created = store
+            .writer
+            .prepare_workstream_run(prepare(WorkstreamSelection::New("alpha".into())))
+            .await
+            .unwrap();
+        assert_eq!(created.workstream_name, "alpha");
+        assert!(
+            store
+                .writer
+                .cancel_managed_run(created.run_id)
+                .await
+                .unwrap()
+        );
+
+        let named = store
+            .writer
+            .prepare_workstream_run(prepare(WorkstreamSelection::Named("alpha".into())))
+            .await
+            .unwrap();
+        assert_eq!(named.workstream_id, created.workstream_id);
+        assert!(store.writer.cancel_managed_run(named.run_id).await.unwrap());
+
+        let duplicate = store
+            .writer
+            .prepare_workstream_run(prepare(WorkstreamSelection::New("alpha".into())))
+            .await
+            .unwrap_err();
+        assert!(matches!(duplicate, StoreError::Duplicate(_)));
+
+        let missing = store
+            .writer
+            .prepare_workstream_run(prepare(WorkstreamSelection::Named("missing".into())))
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, StoreError::NotFound(_)));
+
+        for invalid in ["bad/name", "bad\\name", "   ", ""] {
+            let err = store
+                .writer
+                .prepare_workstream_run(prepare(WorkstreamSelection::New(invalid.into())))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StoreError::InvalidState(_)),
+                "invalid name '{invalid}' must be rejected: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_expires_a_stale_lease_and_reopens_the_workstream() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-expiry").await;
+        let stale = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+
+        // Force the lease into the past; the next prepare must expire the run
+        // instead of reporting the workstream busy.
+        set_managed_run_lease(store.db_path(), stale.run_id, 1);
+        let reopened = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:2"))
+            .await
+            .unwrap();
+        assert_ne!(reopened.run_id, stale.run_id);
+        assert_eq!(reopened.workstream_id, stale.workstream_id);
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(stale.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "expired"
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(reopened.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+    }
+    #[tokio::test]
+    async fn entity_stream_finds_and_weights_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "entities", None)
+            .await
+            .unwrap();
+
+        let with_entities = |path: &str, body: &str, entities: Vec<&str>| {
+            let mut page = sample_page(ws, proj, path, body);
+            page.entities = entities.into_iter().map(str::to_string).collect();
+            page
+        };
+        // `turbopuffer` is rare (one page); `sqlite` is common (three).
+        store
+            .writer
+            .upsert_page(with_entities(
+                "rare.md",
+                "no query words in this body at all",
+                vec!["turbopuffer", "sqlite"],
+            ))
+            .await
+            .unwrap();
+        for path in ["common1.md", "common2.md"] {
+            store
+                .writer
+                .upsert_page(with_entities(path, "unrelated prose", vec!["sqlite"]))
+                .await
+                .unwrap();
+        }
+        store
+            .writer
+            .upsert_page(with_entities(
+                "delimiters.md",
+                "more unrelated prose",
+                vec!["writer-actor", "queue_worker", "comma, entity"],
+            ))
+            .await
+            .unwrap();
+
+        // A query naming the entity finds the page whose body lacks the term.
+        let hits = store
+            .reader
+            .entity_hits_for_project(ws, proj, "how do we use Turbopuffer?", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].hit.path.as_str(), "rare.md");
+        assert_eq!(hits[0].matched, vec!["turbopuffer".to_string()]);
+
+        let delimiter_hits = store
+            .reader
+            .entity_hits_for_project(ws, proj, "actor worker comma", 10, None)
+            .await
+            .unwrap();
+        let delimiter_hit = delimiter_hits
+            .iter()
+            .find(|hit| hit.hit.path.as_str() == "delimiters.md")
+            .expect("word prefixes after hyphen and underscore must match");
+        assert_eq!(
+            delimiter_hit.matched,
+            vec![
+                "comma, entity".to_string(),
+                "queue_worker".to_string(),
+                "writer-actor".to_string(),
+            ],
+            "explain names must preserve commas and sort deterministically",
+        );
+
+        // Inverse frequency: the page carrying the rare entity outranks
+        // pages carrying only the common one.
+        let hits = store
+            .reader
+            .entity_hits_for_project(ws, proj, "turbopuffer sqlite", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].hit.path.as_str(), "rare.md");
+        assert!(
+            hits[0].weight > hits[1].weight,
+            "rare entity must weigh more: {:?}",
+            hits.iter()
+                .map(|h| (h.hit.path.as_str(), h.weight))
+                .collect::<Vec<_>>(),
+        );
+
+        // Prefix matching, and short tokens are ignored as noise.
+        assert_eq!(
+            store
+                .reader
+                .entity_hits_for_project(ws, proj, "turbopuff", 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "prefix should match the entity",
+        );
+        assert!(
+            store
+                .reader
+                .entity_hits_for_project(ws, proj, "a of", 10, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "sub-3-char tokens must not match",
+        );
+
+        // Hybrid search surfaces the entity-only hit and explains it.
+        let explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                "turbopuffer".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        let (hit, explain) = explained
+            .iter()
+            .find(|(h, _)| h.path.as_str() == "rare.md")
+            .expect("entity stream must feed hybrid search");
+        assert_eq!(explain.entity_rank, Some(1));
+        assert!(explain.entity_weight.is_some_and(|weight| weight > 0.0));
+        assert_eq!(explain.matched_entities, vec!["turbopuffer".to_string()]);
+        assert!(explain.rrf.entity > 0.0);
+        assert!(
+            (explain.fused
+                - (explain.rrf.fts + explain.rrf.entity + explain.rrf.vector + explain.rrf.graph))
+                .abs()
+                < f64::EPSILON,
+            "fused score must include the entity stream: {explain:?}",
+        );
+        assert!(
+            explain.fts_rank.is_none(),
+            "the body has no query term, so FTS must miss it",
+        );
+        // `rank` is the fused score after the bounded authority multiplier,
+        // so it tracks `fused` only up to that factor — which is exactly why
+        // the explain reports the factor alongside it.
+        let authority = explain.authority.unwrap_or(1.0);
+        assert!((hit.rank + explain.fused * authority).abs() < 1e-12);
+
+        // Rewriting the page replaces the latest version's entity set.
+        store
+            .writer
+            .upsert_page(with_entities("rare.md", "rewritten body", vec!["lancedb"]))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .entity_hits_for_project(ws, proj, "turbopuffer", 10, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rewrite must drop the old entity links",
+        );
+        assert_eq!(
+            store
+                .reader
+                .entity_hits_for_project(ws, proj, "lancedb", 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+        );
+
+        let mut expired = with_entities("expired.md", "historical prose", vec!["lancedb"]);
+        expired.expires_at = Some("2000-01-01T00:00:00Z".parse().unwrap());
+        store.writer.upsert_page(expired).await.unwrap();
+        let current_only = store
+            .reader
+            .entity_hits_for_project(ws, proj, "lancedb", usize::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(current_only.len(), 1, "expired entity pages stay hidden");
+        assert_eq!(
+            current_only[0].weight, 1.0,
+            "expired pages must not dilute inverse-frequency weighting"
+        );
+
+        // A project with no declared entities contributes nothing.
+        let bare = store
+            .writer
+            .get_or_create_project(ws, "bare", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, bare, "plain.md", "sqlite and turbopuffer"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .entity_hits_for_project(ws, bare, "turbopuffer", 10, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no entities declared → the stream stays silent",
+        );
+
+        let decoy = store
+            .writer
+            .get_or_create_project(ws, "decoy", None)
+            .await
+            .unwrap();
+        let mut decoy_page = sample_page(ws, decoy, "private.md", "unrelated");
+        decoy_page.entities = vec!["lancedb".into()];
+        store.writer.upsert_page(decoy_page).await.unwrap();
+        let scoped = store
+            .reader
+            .entity_hits_for_project(ws, proj, "lancedb", 10, None)
+            .await
+            .unwrap();
+        assert!(
+            scoped
+                .iter()
+                .all(|hit| hit.hit.path.as_str() != "private.md"),
+            "entity retrieval must not leak a sibling project's pages"
+        );
+
+        store
+            .writer
+            .delete_page(ws, proj, PagePath::new("delimiters.md").unwrap(), None)
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let deleted_entities: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND name IN ('writer-actor', 'queue_worker', 'comma, entity')",
+                params![ws.as_bytes(), proj.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            deleted_entities, 0,
+            "deleting every page version must remove unlinked derived entities"
+        );
     }
 }

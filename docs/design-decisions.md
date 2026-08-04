@@ -11,7 +11,7 @@
 A self-contained Rust binary that:
 
 1. Runs as an **MCP server** (stdio + HTTP/SSE) for coding-agent CLIs (Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, OpenClaw, OpenCode, OMP, and MCP-capable clients).
-2. Captures sanitized, bounded lifecycle observations **automatically** - no `write_note` ceremony - via hook scripts or generated extensions that agent CLIs invoke. Optional `ai-memory run` workstreams additionally read visible native transcript tails through host-side, read-only adapters.
+2. Captures sanitized, bounded lifecycle observations **automatically** - no `write_note` ceremony - via hook scripts or generated extensions that agent CLIs invoke. User prompts and post-compaction summaries retain at most 16 KiB; notifications and tool excerpts retain at most 2 KB; every sanitized durable body has a 16 KiB backstop. Optional `ai-memory run` workstreams additionally read visible native transcript tails through host-side, read-only adapters.
 3. Maintains a **Karpathy-style wiki**: incrementally-compiled markdown pages with cross-links, supersession, an `index.md` and a `log.md`.
 4. Serves retrieval via the MCP `tools/list` to coding agents: a handful of *narrow* tools, not 50.
 5. Ships a **Docker image** (`docker run -v ai-memory-data:/data -p 49374:49374 ai-memory`) so it can move between desktop and homelab.
@@ -89,15 +89,15 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 ## 5. Embedding & LLM
 
 **Embeddings:**
-- Default: **local model via `ort` (ONNX Runtime) crate or `fastembed-rs`** running `bge-small-en-v1.5` (384 dim) or `bge-small-en-v1.5-q` quantized. Same model basic-memory uses.
+- The original prototype proposed a default local `ort` / `fastembed-rs` model. The shipped v1 posture is instead **off by default**, with opt-in OpenAI, Voyage, Google Gemini, or keyless OpenAI-compatible embeddings. The compatible path requires an explicit base URL, model, and dimension because self-hosted engines have no safe common defaults, and it uses a distinct provider identity to prevent vector-family mixing. Local ONNX embeddings remain future work; the current provider and model reference lives in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - Persist `{provider, model, dim}` next to every vector. On mismatch, warn and ignore stale vectors until `ai-memory embed --force` or scheduled backfill re-embeds them (agentmemory #469 lesson, without blocking startup).
-- Cache path: `<data_dir>/models/`, never `/tmp` (basic-memory #741).
-- Trait-based: `trait Embedder { ... }` with implementations `LocalOrtEmbedder`, `OpenAIEmbedder`, `VoyageEmbedder`. User configures one.
+- Any future local model cache belongs under `<data_dir>/models/`, never `/tmp` (basic-memory #741).
+- The shipped provider implementations share the `Embedder` trait and are selected through typed configuration.
 
 **LLM for consolidation passes:**
 - **Off by default**, behaves like agentmemory after #138's fix. Without a provider, the system still works: synthetic compression (rule-based), no LLM-generated summaries, no `memory_consolidate` page-rewrite.
-- With a provider, LLM consolidation runs on PreCompact, on demand via `memory_consolidate`, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true` (off by default — session end always writes a rule-based summary page + handoff regardless). Optional 6h maintenance timer.
-- Provider trait `LlmProvider { complete(...); complete_structured(...) }`. Implementations: `AnthropicProvider`, `OpenAIProvider`, `GeminiProvider`, `OpenAICompatProvider` (the latter covers Ollama / vLLM / LM Studio and supersedes the earlier `OllamaProvider`).
+- With a provider, LLM consolidation runs on PreCompact, on demand via `memory_consolidate`, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true` (off by default — session end always writes a rule-based summary page + handoff regardless). SessionEnd provider work is persisted by observation generation and consumed outside the hook request by one bounded retrying worker, so client drain cancellation cannot lose it. The automatic handoff and completed-end watermark commit in one SQLite transaction; an already-ended keyed replay converges the remaining wiki commit, provider enqueue, and ingest-key completion. The completed end also stores the observation count it covered; a resumed session re-enters the end path only after that count advances, avoiding non-convergent wall-clock comparisons. Optional 6h maintenance timer.
+- Providers implement `LlmProvider { complete(...); complete_structured(...) }`. The current provider and authentication matrix lives in [`ARCHITECTURE.md`](ARCHITECTURE.md); this design boundary also covers OpenAI-compatible endpoints such as Ollama, vLLM, and LM Studio.
 - **Native HTTP per provider** - no LiteLLM-equivalent. The cognee tracker (#2412/#2430/#2537/#2608/#2749/#2782/#2840/#2842) showed silent-kwarg-drop in a generic gateway is the #1 source of provider bugs. Each provider's typed JSON, errors on unknown fields. Hand-coded but correct.
 - **Structured output via JSON schema, not XML, not Instructor-style wrapping.** Use each provider's native JSON-mode where available; for Anthropic, request a tool-use response with a typed schema. Validate with `serde_json` + `schemars`-derived schemas.
 
@@ -105,16 +105,16 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 
 Three capture surfaces, in priority order:
 
-1. **Lifecycle hooks/extensions** (Claude Code, Codex, Cursor, Gemini CLI, Antigravity CLI, OpenClaw, OpenCode, OMP). These are fast, reliable, structured. We ship hook scripts or generated TypeScript integrations the user installs once. Lessons from agentmemory:
+1. **Lifecycle hooks/extensions.** The current clients are listed in the README support matrix. These are fast, reliable, structured. We ship hook scripts or generated TypeScript integrations the user installs once. Lessons from agentmemory:
   - Hooks must be **fire-and-forget** (#221). No `await fetch()` blocking session start.
   - Sub-second hard timeouts on the writer side (`tokio::time::timeout`).
   - All hooks → single HTTP/Unix-socket POST → server queues → returns 202
     immediately, or 429 when saturated.
   - Privacy strip at the hook boundary, not later (agentmemory `stripPrivateData`).
 
-2. **Transcript tail** (universal fallback). Watch `~/.claude/projects/`, `~/.codex/`, `~/.config/opencode/sessions/`. Lossier but works for any agent. Required for the basic-memory #669/#687/#730 demand the tracker has been asking for.
+2. **Managed-workstream transcript import** (opt-in through `ai-memory run`). Each supported adapter reads its linked native session after a managed launch and appends portable visible events to the shared ledger. ai-memory does not ship a universal background watcher over private harness stores.
 
-3. **Manual MCP tool** (`memory_remember`) - only for ad-hoc explicit captures from the user ("remember this"). Not the primary path; not what the agent reaches for by default.
+3. **Manual MCP tool** (`memory_write_page`) - only for explicit durable project knowledge from the user ("remember this"). Routine session capture remains automatic.
 
 ### Capture-policy boundary (#194)
 
@@ -139,14 +139,24 @@ Adopt agentmemory's tier model **but** keep the surface narrow:
 | **Semantic** | Distilled facts/preferences/architecture notes - the wiki pages themselves | Indefinite, supersedeable | Versioned in place: old `is_latest=false`, new `supersedes=old_id` |
 | **Procedural** | Repeated patterns extracted from episodic clusters (`pattern` type with frequency ≥ 2) | Indefinite | Frequency-decay if not re-observed in N days |
 
-**Implementation note:** the four tiers map to one `pages` table with a `tier` enum column + an `observations` table for raw working/episodic, not four separate tables. Keeps schema migrations sane.
+**Implementation note:** the four tiers map to one `pages` table with a `tier` enum column + an `observations` table for bounded working/episodic projections, not four separate tables. Keeps schema migrations sane.
+
+**Retrieval authority:** tier is also one bounded signal after relevance
+candidate generation. The canonical page-kind classifier, `pinned`, and a
+small built-in tag vocabulary (`canonical`, `active`, `source-of-truth`,
+`superseded`, `historical`, `test-fixture`, `do-not-answer-from`) join it in a
+post-fusion multiplier. This is deliberately not an independent retriever or
+an absolute override: it resolves close contests between durable knowledge and
+episodic evidence without hiding targeted session/history matches. `pinned`
+continues to control retention and automated mutation first; its retrieval
+effect alone is small.
 
 ## 8. Consolidation (the Karpathy bit)
 
 Three scheduled MCP operations:
 
 - **`memory_ingest`** (auto-called by hooks): one observation → write-fan-out to ~5–15 wiki pages. New page if no match; supersede + version if the page already exists. No-LLM fallback: append to a per-day digest page if no provider configured.
-- **`memory_query`** (called by agent on demand): hierarchical - search `index.md` first, then page-level FTS+vector, then optional graph-walk expansion. RRF-fused. Agentmemory hit 95.2% R@5 with this pattern.
+- **`memory_query`** (called by agent on demand): project-scoped FTS + lexical entity + graph retrieval, with optional vectors, RRF-fused before bounded authority and optional LLM reranking. Agentmemory's earlier triple-stream result motivated the fusion shape.
 - **`memory_lint`** (scheduled hourly + on session-end): scans for contradictions, orphan pages, broken links, stale claims, low-confidence + zero-reinforcement entries. Pure LLM with strict JSON output.
 
 Decay/forget runs as a separate `memory_forget_sweep` job: applies the retention formula; soft-deletes via `is_latest=false` + `superseded_at`; hard-deletes only after 180 days *and* zero accesses. Never silently destroys anything user-pinned.
@@ -181,7 +191,13 @@ struct Handoff {
 }
 ```
 
-MCP tools `memory_handoff_begin` (writes a handoff row tagged `state=open`), `memory_handoff_accept` (acknowledges, returns the handoff content, marks `accepted_by`), and `memory_handoff_cancel` (marks an exact open handoff id expired when it was created by mistake). The user can stop Claude Code, start Codex, and Codex's session-start hook fetches the open handoff for the cwd. The cwd is matched by path-boundary (the prior art's check), not exact equality: a handoff left in `/repo` is delivered to a session in `/repo/api`, but never to `/repo-other`. A manual `memory_handoff_begin` handoff is stored with no cwd and so is project-wide, and is preferred over the auto SessionEnd handoff (then the most specific cwd, then the most recent) so an explicit "where we left off" baton is never shadowed by the heuristic one.
+MCP tools `memory_handoff_begin` (writes a handoff row tagged `state=open`), `memory_handoff_accept` (acknowledges, returns the handoff content, marks `accepted_by`), and `memory_handoff_cancel` (marks an exact open handoff id expired when it was created by mistake). The user can stop Claude Code, start Codex, and Codex's session-start hook fetches the open handoff for the cwd. On an operator-distinguishing server, delivery is owner-scoped first: callers see their own plus deliberately shared rows; `shared=true` publishes a manual handoff to the project, while root-only `any_owner=true` is the recovery escape hatch for accept/cancel. The cwd is matched by path-boundary (the prior art's check), not exact equality: a handoff left in `/repo` is delivered to a session in `/repo/api`, but never to `/repo-other`. A manual `memory_handoff_begin` handoff is project-wide by cwd and is preferred over the auto SessionEnd handoff so an explicit "where we left off" baton is never shadowed by the heuristic one. Among cwd-eligible automatic handoffs the newest wins, with cwd specificity only breaking timestamp ties, so stale subdirectory context cannot shadow a newer parent-session handoff. Creating an automatic handoff expires prior open automatic handoffs from the exact cwd and owner. Accepting one atomically expires older automatic candidates eligible for that receiving cwd and carrying the same owner; manual, sibling-directory, and other-owner handoffs remain open.
+
+Handoffs are a next-session transfer rather than live inter-agent messaging.
+Antigravity CLI exposes `PreInvocation` instead of SessionStart, and it fires
+before every model call; only `invocationNum = 0` may perform the destructive
+handoff fetch. This keeps a manual handoff created during wind-down open for
+the next session instead of feeding it back to the same execution loop.
 
 agentmemory has this informally (`/handoff` skill); we make it explicit from day one because every research report flagged cross-agent as the v0.1 weak spot.
 
@@ -191,7 +207,7 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 
 | Tool | Purpose | Annotation |
 |---|---|---|
-| `memory_query` | Search + retrieve, FTS5 + optional hybrid RRF | read-only |
+| `memory_query` | Search + retrieve, FTS5 + entity + graph + optional vector RRF | read-only |
 | `memory_recent` | Most-recently-updated `is_latest=1` pages for the project | read-only |
 | `memory_status` | Health, counts, last-consolidation-at | read-only |
 | `memory_briefing` | Structured zero-LLM snapshot: 7d/30d windows, pending handoffs, recent pages, `_rules/` | read-only |
@@ -199,11 +215,12 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_handoff_begin` | Mark session boundary, write handoff | destructive |
 | `memory_handoff_accept` | Fetch + ack the latest open handoff | destructive |
 | `memory_handoff_cancel` | Mark an exact mistakenly-created open handoff expired | destructive |
-| `memory_consolidate` | LLM-driven page rewrite (`multi_page=true` for atomic fan-out) | destructive |
+| `memory_consolidate` | LLM-driven page rewrite (`multi_page=true` for atomic fan-out); target-project `_prompts/consolidation.md` supplies bounded untrusted advisory preferences and `instructions` overrides them once | destructive |
 | `memory_auto_improve` | Manual learning review for a completed session; the server also schedules review for new sessions, and manual-review opt-in keeps proposals pending | write |
 | `memory_write_page` | Write durable wiki knowledge on explicit user request | destructive |
 | `memory_read_page` | Read a full page body by exact path or top search hit | read-only |
 | `memory_delete_page` | Delete a single exact-path page with admission hooks | destructive |
+| `memory_feedback` | Record bounded page-quality feedback; adjust episodic retention and flag stale/wrong current versions for lint review | write |
 | `memory_forget_sweep` | Retention sweep (M8); soft-delete below cold threshold; `dry_run=true` previews | destructive |
 | `memory_lint` | Rule-based + optional LLM contradiction findings → `wiki/_lint/<date>.md` | destructive |
 | `memory_install_self_routing` | Returns the canonical slim CLAUDE.md / AGENTS.md routing block, managed Agent Skill payloads, target hints, and overwrite guidance | read-only |
@@ -283,11 +300,12 @@ Top-line rules carved into the codebase:
 ## 15. Managed workstreams use a portable ledger, not native format conversion
 
 Managed cross-harness continuity is explicitly opt-in through `ai-memory run`.
-Direct Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and OMP launches
-retain the existing hook and single-use handoff behavior. There is no
-process-global mode or manual harness switch: the wrapper selects the current
-repository/worktree workstream and each adapter applies that harness's native
-create/resume syntax.
+Direct Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI,
+and Antigravity CLI launches retain the existing hook and single-use handoff
+behavior. There is
+no process-global mode or manual harness switch: the wrapper selects the
+current repository/worktree workstream and each adapter applies that harness's
+native create/resume syntax.
 
 One logical workstream owns one native session per harness plus an append-only
 portable event ledger. We rejected converting a Claude transcript into a fake
@@ -300,10 +318,13 @@ are excluded explicitly.
 
 A renewable single-writer lease resolves precedence and concurrency instead of
 attempting bidirectional file synchronization. SessionStart receives a bounded
-unseen delta; the full visible ledger stays searchable. Repository checkpoints
-are evidence at run boundaries and never commit, stash, reset, or otherwise
-mutate the checkout. The markdown wiki remains the durable knowledge surface;
-the managed ledger is an operational continuity substrate.
+unseen delta without replacing an explicitly pending handoff. When both exist,
+the curated handoff is rendered first and their delivery claims commit
+atomically after the complete startup response is assembled. The full visible
+ledger stays searchable. Repository checkpoints are evidence at run boundaries
+and never commit, stash, reset, or otherwise mutate the checkout. The markdown
+wiki remains the durable knowledge surface; the managed ledger is an
+operational continuity substrate.
 
 Native-session adoption is restricted to bootstrapping an otherwise-empty
 workstream. The interactive launcher may offer recent sessions recorded for the

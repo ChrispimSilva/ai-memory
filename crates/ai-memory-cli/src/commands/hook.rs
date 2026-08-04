@@ -268,24 +268,21 @@ fn session_id_query_suffix(
     format!("&session_id={}", url_encode(&session_id))
 }
 
-fn cwd_query_suffix_with(
+fn resolve_hook_cwd_with(
     agent: &str,
     raw: &serde_json::Value,
-    default_strategy: Option<&str>,
     env_lookup: impl FnMut(&str) -> Option<String>,
     current_dir: impl FnOnce() -> Option<PathBuf>,
-) -> String {
+) -> Option<String> {
     let agent_kind = AgentKind::from_wire(agent);
     let (canonical_cwd, _) = canonical_context(raw);
-    let cwd = if canonical_cwd.is_some() {
+    if canonical_cwd.is_some() {
         canonical_cwd
     } else if agent_kind == AgentKind::Devin {
         resolve_cwd_with_fallbacks(raw, env_lookup, current_dir)
     } else {
         extract_cwd(raw).filter(|s| !s.trim().is_empty())
-    };
-    cwd.map(|cwd| marker_query_suffix(&cwd, default_strategy))
-        .unwrap_or_default()
+    }
 }
 
 fn cwd_query_suffix(
@@ -293,9 +290,9 @@ fn cwd_query_suffix(
     raw: &serde_json::Value,
     default_strategy: Option<&str>,
 ) -> String {
-    cwd_query_suffix_with(agent, raw, default_strategy, env_lookup, || {
-        std::env::current_dir().ok()
-    })
+    resolve_hook_cwd_with(agent, raw, env_lookup, || std::env::current_dir().ok())
+        .map(|cwd| marker_query_suffix(&cwd, default_strategy))
+        .unwrap_or_default()
 }
 
 fn after_background_drain_event_enqueue(
@@ -363,6 +360,47 @@ fn parse_minutes(raw: Option<String>, default: Duration) -> Duration {
     }
 }
 
+fn should_process_hook_event(agent: AgentKind, event: HookEvent, raw: &serde_json::Value) -> bool {
+    if agent == AgentKind::AntigravityCli && event == HookEvent::SessionStart {
+        return raw.get("invocationNum").and_then(serde_json::Value::as_u64) == Some(0);
+    }
+    true
+}
+
+fn write_success_response<W: std::io::Write>(
+    stdout: &mut W,
+    agent: AgentKind,
+    event: HookEvent,
+) -> std::io::Result<()> {
+    if agent == AgentKind::KiroCli {
+        // Kiro adds successful SessionStart/UserPromptSubmit stdout to model
+        // context, and v2 Stop parses stdout for a block decision. Capture-only
+        // hooks therefore stay silent unless SessionStart has real context.
+        Ok(())
+    } else if agent == AgentKind::AntigravityCli && event == HookEvent::PreToolUse {
+        writeln!(stdout, r#"{{"decision": "allow"}}"#)
+    } else {
+        writeln!(stdout, "{{}}")
+    }
+}
+
+fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_json::Value {
+    if agent == AgentKind::AntigravityCli {
+        serde_json::json!({
+            "injectSteps": [{
+                "ephemeralMessage": handoff,
+            }]
+        })
+    } else {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": handoff,
+            }
+        })
+    }
+}
+
 /// Run a single hook end-to-end. Always returns Ok and always writes a JSON
 /// object to stdout — a hook must never fail the agent.
 ///
@@ -393,27 +431,26 @@ where
     W: std::io::Write,
     S: FnOnce(&Path) -> std::io::Result<()>,
 {
-    // Kiro CLI adds exit-0 stdout of its session-start and user-prompt
-    // hooks to the agent context verbatim (v2 agentSpawn / v3
-    // SessionStart + both engines' UserPromptSubmit, per the official
-    // hook contracts), and its v2 stop hook parses stdout for a
-    // {"decision":"block"} verdict. The Claude-style `{}` protocol
-    // output would therefore leak into the conversation as literal
-    // text, so for Kiro the hook prints nothing at all except an
-    // actually-fetched session-start handoff.
-    let inert_stdout = !matches!(AgentKind::from_wire(&args.agent), AgentKind::KiroCli);
+    let agent_kind = AgentKind::from_wire(&args.agent);
+    let hook_event = HookEvent::parse(&args.event);
     let (mut payload, mut json) = match parse_hook_payload(payload) {
         Ok(parsed) => parsed,
         Err(_) => {
             eprintln!(
                 "ai-memory hook warning: could not parse event payload as JSON; nothing was captured"
             );
-            if inert_stdout {
-                writeln!(stdout, "{{}}")?;
-            }
+            write_success_response(stdout, agent_kind, hook_event)?;
             return Ok(());
         }
     };
+    // Antigravity exposes PreInvocation rather than a true SessionStart. It
+    // fires before every model call; invocation zero is the only startup
+    // boundary. Fail closed when the documented counter is absent so a later
+    // invocation can never consume a handoff intended for the next session.
+    if !should_process_hook_event(agent_kind, hook_event, &json) {
+        write_success_response(stdout, agent_kind, hook_event)?;
+        return Ok(());
+    }
     // Assistant/Stop capture (#196). On an opted-in install
     // (`install-hooks --capture-assistant`), extract the assistant message,
     // sanitize + cap it, and splice the versioned `_ai_memory_assistant` marker
@@ -422,11 +459,7 @@ where
     // Reserialize only when the JSON actually changed, so unrelated events keep
     // byte-exact spool bodies (see `native_hook_accepts_plain_and_bom_prefixed_json`).
     let capture_assistant = if args.capture_assistant {
-        let transform = ai_memory_hooks::transform_for_client(
-            &mut json,
-            AgentKind::from_wire(&args.agent),
-            ai_memory_hooks::HookEvent::parse(&args.event),
-        );
+        let transform = ai_memory_hooks::transform_for_client(&mut json, agent_kind, hook_event);
         if transform.changed {
             payload = serde_json::to_string(&json)?;
         }
@@ -437,14 +470,18 @@ where
         }
         false
     };
+    if ai_memory_hooks::cap_lifecycle_body_for_client(&mut json, hook_event) {
+        payload = serde_json::to_string(&json)?;
+    }
     let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    let inspection_cwd = policy_cwd.as_deref().map(canonical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
     let tool_event = is_tool_event(&args.event);
     let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
         policy.inspect(
             AgentKind::from_wire(&args.agent),
             &json,
-            policy_cwd.as_deref().unwrap_or(""),
+            inspection_cwd.as_deref().unwrap_or(""),
         )
     });
     if args.check_capture {
@@ -463,9 +500,7 @@ where
     if let Some(decision) = decision {
         match decision.protocol().disposition() {
             CaptureDisposition::Drop => {
-                if inert_stdout {
-                    writeln!(stdout, "{{}}")?;
-                }
+                write_success_response(stdout, agent_kind, hook_event)?;
                 return Ok(());
             }
             CaptureDisposition::MetadataOnly => {
@@ -580,7 +615,7 @@ where
         // consume the handoff server-side (the GET is destructive) and then
         // discard the result — silently losing it. Those agents recover the
         // handoff on demand via the MCP `memory_handoff_accept` tool.
-        if AgentKind::from_wire(&args.agent).session_start_injects_handoff() {
+        if agent_kind.session_start_injects_handoff() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
             let native_session_qs = canonical_session_id
@@ -595,18 +630,13 @@ where
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
-                if inert_stdout {
-                    let envelope = serde_json::json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": "SessionStart",
-                            "additionalContext": handoff,
-                        }
-                    });
-                    writeln!(stdout, "{envelope}")?;
-                } else {
-                    // Kiro adds this stdout to the agent context verbatim
-                    // and documents no envelope, so print the raw handoff.
+                if agent_kind == AgentKind::KiroCli {
+                    // Kiro v2 consumes agentSpawn stdout verbatim and defines
+                    // no wrapper envelope.
                     writeln!(stdout, "{handoff}")?;
+                } else {
+                    let envelope = session_start_handoff_envelope(agent_kind, handoff);
+                    writeln!(stdout, "{envelope}")?;
                 }
                 return Ok(());
             }
@@ -700,9 +730,7 @@ where
         );
     }
 
-    if inert_stdout {
-        writeln!(stdout, "{{}}")?;
-    }
+    write_success_response(stdout, agent_kind, hook_event)?;
     Ok(())
 }
 
@@ -730,6 +758,14 @@ fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option
             session_id,
         )
     }
+}
+
+fn canonical_capture_cwd(cwd: &str) -> String {
+    Path::new(cwd)
+        .canonicalize()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| cwd.to_owned())
 }
 
 fn is_tool_event(event: &str) -> bool {
@@ -837,6 +873,103 @@ mod tests {
         assert!(!should_spawn_background_drainer("post-tool-use"));
         assert!(!should_spawn_background_drainer("pre-tool-use"));
         assert!(!should_spawn_background_drainer("user-prompt"));
+    }
+
+    #[test]
+    fn antigravity_preinvocation_only_maps_invocation_zero_to_session_start() {
+        for (raw, expected) in [
+            (serde_json::json!({"invocationNum": 0}), true),
+            (serde_json::json!({"invocationNum": 1}), false),
+            (serde_json::json!({"invocationNum": 0.5}), false),
+            (serde_json::json!({"invocationNum": "0"}), false),
+            (serde_json::json!({}), false),
+        ] {
+            assert_eq!(
+                should_process_hook_event(AgentKind::AntigravityCli, HookEvent::SessionStart, &raw,),
+                expected,
+                "{raw}"
+            );
+        }
+        assert!(should_process_hook_event(
+            AgentKind::ClaudeCode,
+            HookEvent::SessionStart,
+            &serde_json::json!({})
+        ));
+        assert!(should_process_hook_event(
+            AgentKind::AntigravityCli,
+            HookEvent::PostToolUse,
+            &serde_json::json!({})
+        ));
+    }
+
+    #[test]
+    fn hook_success_response_is_specific_to_antigravity_pre_tool_use() {
+        for (agent, event, expected) in [
+            (
+                AgentKind::AntigravityCli,
+                HookEvent::PreToolUse,
+                b"{\"decision\": \"allow\"}\n".as_slice(),
+            ),
+            (
+                AgentKind::AntigravityCli,
+                HookEvent::PostToolUse,
+                b"{}\n".as_slice(),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                HookEvent::PreToolUse,
+                b"{}\n".as_slice(),
+            ),
+            (AgentKind::KiroCli, HookEvent::PreToolUse, b"".as_slice()),
+            (AgentKind::KiroCli, HookEvent::SessionStart, b"".as_slice()),
+        ] {
+            let mut output = Vec::new();
+            write_success_response(&mut output, agent, event).unwrap();
+            assert_eq!(output, expected, "{agent:?} {event:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_native_pre_tool_use_allows_and_spools_valid_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("pre-tool-use", "http://127.0.0.1:1"),
+            serde_json::json!({
+                "conversationId": "agy-session",
+                "workspacePaths": [tmp.path()],
+                "toolCall": {"name": "view_file", "args": {"AbsolutePath": "README.md"}}
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{\"decision\": \"allow\"}\n");
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 1);
+    }
+
+    #[tokio::test]
+    async fn antigravity_native_pre_tool_use_fails_open_on_malformed_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("pre-tool-use", "http://127.0.0.1:1"),
+            "not-json".into(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{\"decision\": \"allow\"}\n");
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
     }
 
     #[test]
@@ -1097,15 +1230,14 @@ mod tests {
             "source": "startup"
         });
 
-        let suffix = cwd_query_suffix_with(
+        let cwd = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
             || Some(PathBuf::from("process-project")),
         );
 
-        assert_eq!(suffix, "&cwd=env-project");
+        assert_eq!(cwd.as_deref(), Some("env-project"));
     }
 
     #[test]
@@ -1115,15 +1247,14 @@ mod tests {
             "tool_name": "exec"
         });
 
-        let suffix = cwd_query_suffix_with(
+        let cwd = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |_| None,
             || Some(PathBuf::from("process-project")),
         );
 
-        assert_eq!(suffix, "&cwd=process-project");
+        assert_eq!(cwd.as_deref(), Some("process-project"));
     }
 
     #[test]
@@ -1133,23 +1264,21 @@ mod tests {
             "tool_name": "exec"
         });
 
-        let from_env = cwd_query_suffix_with(
+        let from_env = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
             || Some(PathBuf::from("process-project")),
         );
-        let from_process = cwd_query_suffix_with(
+        let from_process = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |_| None,
             || Some(PathBuf::from("process-project")),
         );
 
-        assert_eq!(from_env, "&cwd=env-project");
-        assert_eq!(from_process, "&cwd=process-project");
+        assert_eq!(from_env.as_deref(), Some("env-project"));
+        assert_eq!(from_process.as_deref(), Some("process-project"));
     }
 
     #[test]
@@ -1159,30 +1288,28 @@ mod tests {
             "cwd": "payload-project"
         });
 
-        let suffix = cwd_query_suffix_with(
+        let cwd = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
             || Some(PathBuf::from("process-project")),
         );
 
-        assert_eq!(suffix, "&cwd=payload-project");
+        assert_eq!(cwd.as_deref(), Some("payload-project"));
     }
 
     #[test]
     fn missing_cwd_process_fallback_is_devin_only() {
         let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
 
-        let suffix = cwd_query_suffix_with(
+        let cwd = resolve_hook_cwd_with(
             "claude-code",
             &raw,
-            None,
             |_| Some("env-project".into()),
             || Some(PathBuf::from("process-project")),
         );
 
-        assert!(suffix.is_empty());
+        assert!(cwd.is_none());
     }
 
     #[tokio::test]
@@ -1455,6 +1582,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hermes_file_exclusion_drops_before_spool_or_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        let called = std::cell::Cell::new(false);
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "hermes".into();
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "write_file",
+            "tool_input": {
+                "path": "secret/token.txt",
+                "content": "SENTINEL_MUST_NOT_BE_SPOOLED"
+            },
+            "session_id": "hermes-session",
+            "cwd": tmp.path(),
+            "extra": {"tool_call_id": "call-42", "status": "ok"}
+        });
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            raw.to_string(),
+            &mut stdout,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert!(!called.get());
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_drop_handles_symlinked_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let alias = tmp.path().join("project-alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        let called = std::cell::Cell::new(false);
+        run_with_payload(
+            Some(data_dir.clone()),
+            devin_hook_args("post-tool-use"),
+            serde_json::json!({
+                "cwd": alias,
+                "tool_name": "Edit",
+                "tool_input": {"path": "secret/SENTINEL"}
+            })
+            .to_string(),
+            &mut stdout,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert!(!called.get());
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
     async fn invalid_capture_marker_spools_only_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1541,7 +1750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn antigravity_workspace_path_drops_before_side_effects() {
+    async fn antigravity_pre_tool_capture_drop_still_allows_the_tool() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join(".ai-memory.toml"),
@@ -1549,7 +1758,7 @@ mod tests {
         )
         .unwrap();
         let data_dir = tmp.path().join("data");
-        let mut args = devin_hook_args("post-tool-use");
+        let mut args = devin_hook_args("pre-tool-use");
         args.agent = "antigravity-cli".into();
         let mut stdout = Vec::new();
         let raw = serde_json::json!({"workspacePaths":[tmp.path()],"toolCall":{"name":"Edit","args":{"path":"secret/a"}}});
@@ -1563,7 +1772,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stdout, b"{}\n");
+        assert_eq!(stdout, b"{\"decision\": \"allow\"}\n");
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
     }
 
@@ -1616,6 +1825,30 @@ mod tests {
         }
     }
 
+    fn kiro_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "kiro-cli".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+        }
+    }
+
+    fn antigravity_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "antigravity-cli".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+        }
+    }
+
     /// Recording HTTP stub: replies to every request with `status`/`body` and
     /// streams each request head back so tests can assert which endpoints the
     /// hook touched (session-start also drains the spool, so POSTs to `/hook`
@@ -1654,6 +1887,114 @@ mod tests {
             .await
             .ok()
             .flatten()
+    }
+
+    #[tokio::test]
+    async fn antigravity_initial_invocation_fetches_with_native_output_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AGY-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            antigravity_hook_args("session-start", &base),
+            serde_json::json!({
+                "invocationNum": 0,
+                "initialNumSteps": 0,
+                "conversationId": "agy-conversation",
+                "workspacePaths": [tmp.path()]
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "injectSteps": [{"ephemeralMessage": "AGY-HANDOFF"}]
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded
+                .iter()
+                .any(|request| request.starts_with("POST /hook")),
+            "{recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("session_id=agy-conversation")
+            }),
+            "{recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_later_invocation_has_no_capture_or_handoff_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "MUST-NOT-BE-CONSUMED").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args("session-start", &base),
+            serde_json::json!({
+                "invocationNum": 4,
+                "initialNumSteps": 12,
+                "conversationId": "agy-conversation",
+                "workspacePaths": [tmp.path()]
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Err(std::io::Error::other("must not spawn")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert!(first_request(&mut requests).await.is_none());
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[tokio::test]
+    async fn kiro_session_start_prints_handoff_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "KIRO-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            kiro_hook_args("session-start", &base),
+            serde_json::json!({
+                "session_id": "kiro-session",
+                "cwd": tmp.path()
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"KIRO-HANDOFF\n");
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=kiro-cli")
+                    && request.contains("session_id=kiro-session")
+            }),
+            "{recorded:?}"
+        );
     }
 
     #[tokio::test]
@@ -1915,129 +2256,6 @@ mod tests {
         let second = first_request(&mut requests).await.unwrap();
         assert!(second.starts_with("GET /handoff?"), "{second}");
         assert!(!second.contains("briefing"), "{second}");
-    }
-
-    fn kiro_hook_args(event: &str, server_url: &str) -> HookArgs {
-        HookArgs {
-            event: event.into(),
-            agent: "kiro-cli".into(),
-            server_url: server_url.into(),
-            auth_token: None,
-            project_strategy: None,
-            check_capture: false,
-            capture_assistant: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn kiro_session_start_prints_the_raw_handoff_without_an_envelope() {
-        // Both Kiro engines add session-start hook stdout to the agent
-        // context verbatim (v2 agentSpawn / v3 SessionStart) and document
-        // no envelope, so the handoff must be printed raw — a
-        // hookSpecificOutput wrapper would inject JSON noise as context.
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let cwd = tmp.path().join("repo");
-        std::fs::create_dir(&cwd).unwrap();
-        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-KIRO").await;
-
-        let mut stdout = Vec::new();
-        run_with_payload(
-            Some(data_dir),
-            kiro_hook_args("session-start", &base),
-            serde_json::json!({
-                "hook_event_name": "agentSpawn",
-                "session_id": "3f6d1c2a-aaaa-bbbb-cccc-000000000001",
-                "cwd": cwd
-            })
-            .to_string(),
-            &mut stdout,
-            |_| Ok(()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stdout, b"AMWS-HANDOFF-KIRO\n");
-
-        let mut saw_handoff = false;
-        while let Some(request) = first_request(&mut requests).await {
-            if request.starts_with("GET /handoff") {
-                saw_handoff = true;
-                assert!(request.contains("agent=kiro-cli"), "{request}");
-                assert!(
-                    request.contains("session_id=3f6d1c2a-aaaa-bbbb-cccc-000000000001"),
-                    "{request}"
-                );
-            }
-        }
-        assert!(saw_handoff, "session-start must fetch the handoff for kiro");
-    }
-
-    #[tokio::test]
-    async fn kiro_hooks_never_print_the_empty_object() {
-        // Kiro injects exit-0 stdout of session-start and user-prompt
-        // hooks into the agent context verbatim, and its v2 stop hook
-        // parses stdout for a block verdict — so the Claude-style `{}`
-        // protocol line must never be emitted for kiro-cli.
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let cwd = tmp.path().join("repo");
-        std::fs::create_dir(&cwd).unwrap();
-        let (base, mut requests) = serve_requests("404 Not Found", "").await;
-        let payload = serde_json::json!({
-            "session_id": "3f6d1c2a-aaaa-bbbb-cccc-000000000002",
-            "cwd": cwd,
-            "prompt": "hi"
-        })
-        .to_string();
-
-        // No pending handoff on session-start → nothing at all on stdout.
-        let mut stdout = Vec::new();
-        run_with_payload(
-            Some(data_dir.clone()),
-            kiro_hook_args("session-start", &base),
-            payload.clone(),
-            &mut stdout,
-            |_| Ok(()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stdout, b"", "empty handoff must print nothing");
-        // Drain the requests recorded so far — session-start legitimately
-        // fetched the handoff; the assertions below are about user-prompt.
-        while first_request(&mut requests).await.is_some() {}
-
-        // user-prompt: session-start owns the injection for kiro, so no
-        // handoff fetch happens here and stdout stays empty.
-        let mut stdout = Vec::new();
-        run_with_payload(
-            Some(data_dir.clone()),
-            kiro_hook_args("user-prompt-submit", &base),
-            payload.clone(),
-            &mut stdout,
-            |_| Ok(()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stdout, b"");
-        while let Some(request) = first_request(&mut requests).await {
-            assert!(!request.starts_with("GET /handoff"), "{request}");
-        }
-
-        // stop and an unparseable payload also stay silent (Claude would
-        // print `{}` in both cases).
-        for (event, body) in [("stop", payload.as_str()), ("stop", "not-json")] {
-            let mut stdout = Vec::new();
-            run_with_payload(
-                Some(data_dir.clone()),
-                kiro_hook_args(event, &base),
-                body.to_string(),
-                &mut stdout,
-                |_| Ok(()),
-            )
-            .await
-            .unwrap();
-            assert_eq!(stdout, b"", "{event} must print nothing");
-        }
     }
 
     #[tokio::test]

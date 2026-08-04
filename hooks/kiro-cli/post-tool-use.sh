@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kiro CLI post-tool-use hook (v2: postToolUse; v3: PostToolUse).
+# Kiro CLI v2 post-tool-use hook (postToolUse).
 # Forwards the event JSON to the ai-memory server, fire-and-forget.
 _lib_dir="$(dirname "$0")"
 [ -f "$_lib_dir/_lib.sh" ] || _lib_dir="$_lib_dir/.."

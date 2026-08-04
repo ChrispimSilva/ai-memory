@@ -18,8 +18,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::commands::serve::normalize_prefix;
 use crate::config::{Config, DEFAULT_SERVER_URL};
+use ai_memory_web::normalize_prefix;
 
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
@@ -158,6 +158,21 @@ impl ServerEndpoint {
     /// `format!("{origin}{path}")`.
     pub(crate) fn build_url(&self, path: &str) -> String {
         format!("{}{}{path}", self.url, self.base_path)
+    }
+
+    /// Stable, credential-free identity for client-local state tied to this
+    /// server. The normalized mount path is part of the identity; bearer
+    /// material deliberately is not.
+    pub(crate) fn identity(&self) -> String {
+        let raw = format!("{}{}", self.url.trim_end_matches('/'), self.base_path);
+        let Ok(mut parsed) = reqwest::Url::parse(&raw) else {
+            return "<invalid-server-url>".to_owned();
+        };
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        parsed.as_str().trim_end_matches('/').to_owned()
     }
 
     /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
@@ -448,6 +463,22 @@ mod tests {
         assert_eq!(ep.auth_token.as_deref(), Some("secret"));
     }
 
+    #[test]
+    fn client_state_identity_normalizes_mounts_and_never_contains_credentials() {
+        let first = ServerEndpoint::from_pair(
+            Some("http://alice:secret@MEMORY.example:49374/wiki/".to_owned()),
+            None,
+        );
+        let second = ServerEndpoint::from_pair(
+            Some("http://memory.example:49374/wiki".to_owned()),
+            Some("bearer-secret".to_owned()),
+        );
+
+        assert_eq!(first.identity(), second.identity());
+        assert!(!first.identity().contains("alice"));
+        assert!(!first.identity().contains("secret"));
+    }
+
     // ----------------------------------------------------------------
     // Base-path awareness — graduated from the Docker live exploration of
     // the CLI-client-under-AI_MEMORY_BASE_PATH bug. The server nests every
@@ -656,9 +687,11 @@ mod tests {
             access: secrecy::SecretString::from("oidc-access".to_string()),
             refresh: secrecy::SecretString::from("refresh-token".to_string()),
             expires_at_ms: u64::MAX,
-            issuer: "https://issuer.example.com/realms/team".to_string(),
-            client_id: "ai-memory-cli".to_string(),
-            token_endpoint: "https://issuer.example.com/token".to_string(),
+            extra: ai_memory_llm::OidcExtras {
+                issuer: "https://issuer.example.com/realms/team".to_string(),
+                client_id: "ai-memory-cli".to_string(),
+                token_endpoint: "https://issuer.example.com/token".to_string(),
+            },
         }
         .save(&config.oidc_device_token_path())
         .expect("save test OIDC token");

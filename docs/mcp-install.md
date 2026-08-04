@@ -38,8 +38,8 @@ ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
 not. Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
-long-term memory to their LLMs via ai-memory's MCP tools
+Claude Desktop, VS Code Copilot, and Zed are **MCP-only** here: they
+expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
 endpoint. The trade-off:
@@ -77,6 +77,15 @@ live ai-memory server. In particular, bearer tokens and endpoint settings
 should stay in environment or local config references rather than generated
 plugin source files.
 
+The hook router does recognize `agent=hermes` as a concrete session kind and
+accepts Hermes' documented shell-hook `tool_name` / `tool_input` envelope for
+tool-family metadata and capture-exclusion enforcement. A custom bridge should
+map `on_session_start`, `post_tool_call`, and `on_session_end` to ai-memory's
+canonical `session-start`, `post-tool-use`, and `session-end` event names while
+forwarding the original JSON object. This protocol recognition does not install
+or trust a third-party plugin. Hermes ignores session-start hook stdout, so it
+cannot consume an automatic handoff there; use MCP `memory_handoff_accept`.
+
 The same lifecycle guidance below applies to Hermes or any other external
 bridge: map known events onto ai-memory's canonical hook events where
 possible, and use extension metadata for source-specific events instead of
@@ -111,8 +120,54 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / devin / zero / vscode-copilot
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / devin / zero / vscode-copilot / zed
 > ```
+
+---
+
+## Claude Code
+
+**Status:** ✅ Native HTTP MCP supported. ✅ Optional session-aware stdio
+bridge supported for concurrent sessions.
+
+The default registration remains a static HTTP entry:
+
+```bash
+ai-memory install-mcp --client claude-code --apply
+```
+
+Static HTTP config cannot attach the current lifecycle-hook session id, so
+`[auto_scope] mode = "per_session"` cannot isolate two concurrent Claude Code
+sessions through that entry. Opt into ai-memory's local stdio bridge instead:
+
+```bash
+ai-memory install-mcp --client claude-code --session-aware --apply
+```
+
+The generated entry runs `ai-memory mcp-bridge`, connects to the same configured
+local or remote `/mcp` endpoint, preserves bearer authentication, and adds
+`X-Memory-Actor-Session-Id: <CLAUDE_CODE_SESSION_ID>` to every upstream request.
+It supports ai-memory's default stateless HTTP mode and opt-in stateful mode.
+The command fails closed if Claude did not supply a session id rather than
+silently falling back to the shared single slot.
+
+Pair the bridge with this server setting:
+
+```toml
+[auto_scope]
+mode = "per_session"
+```
+
+Claude Code sets `CLAUDE_CODE_SESSION_ID` on stdio MCP subprocesses, but the
+subprocess retains the id it was launched with across `/clear`. Also,
+`--continue` or `--resume` without an explicit id may expose the startup id
+instead of the resumed id. Restart Claude Code after `/clear` when exact
+session-key continuity matters, and prefer `--resume <session-id>` over an
+implicit resume. These are upstream lifecycle limits; the bridge does not guess
+or switch identities behind Claude Code.
+
+`--session-aware` is Claude-Code-only. Other clients keep their documented
+native HTTP or generated bridge paths.
 
 ---
 
@@ -232,13 +287,69 @@ Aliases: `copilot`, `github-copilot`.
 
 ---
 
+## Zed
+
+**Status:** MCP supported through Zed's native remote context-server
+configuration. No lifecycle hooks or managed-workstream adapter.
+
+**Config file:** Zed stores MCP servers in its user `settings.json`:
+
+- macOS: `~/.config/zed/settings.json`
+- Linux: `$XDG_CONFIG_HOME/zed/settings.json`, defaulting to
+  `~/.config/zed/settings.json`
+- Windows: `%APPDATA%\Zed\settings.json`
+
+The server map is the top-level `context_servers` key. Remote servers use a
+`url` and may include bearer authentication in `headers`:
+
+```json
+{
+  "context_servers": {
+    "ai-memory": {
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
+    }
+  }
+}
+```
+
+Print or apply the configuration with:
+
+```bash
+ai-memory install-mcp --client zed
+ai-memory install-mcp --client zed --apply \
+  --server-url "http://homelab:49374/mcp" \
+  --auth-token "$TOKEN"
+```
+
+`--apply` preserves JSONC comments, trailing commas, unrelated Zed settings,
+and other context servers. Zed can call ai-memory's MCP tools, but it does not
+expose compatible session or tool lifecycle hooks. Automatic capture,
+automatic handoff injection, and
+`ai-memory run` continuity are therefore not available; ask the agent to call
+`memory_handoff_begin` before leaving and `memory_handoff_accept` when
+resuming when you need manual continuity.
+
+Sources: <https://zed.dev/docs/ai/mcp>,
+<https://zed.dev/docs/configuring-zed>.
+
+---
+
 ## Claude Desktop
 
 **Status:** ✅ MCP supported (via stdio shim for HTTP). ❌ No lifecycle hooks.
 
 **Config file:**
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json` for an
+  unpackaged install, or
+  `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`
+  for a detected MSIX-packaged install. `install-mcp` checks for
+  `Claude_*` package directories automatically and prefers one that
+  already contains a config. If multiple candidates remain ambiguous,
+  it stops and asks for an explicit `--config-file` instead of guessing.
 - Linux: not officially distributed by Anthropic. Use Claude Code
   (terminal) instead.
 
@@ -269,10 +380,20 @@ stdio shim. Requires Node.js installed on the same machine.
   prompt/tool capture and session-boundary handoffs are not possible
   unless Anthropic adds a desktop hook/plugin surface.
 - If the MCP indicator doesn't appear after restart, check the logs:
-  `~/Library/Logs/Claude/mcp*.log` (macOS) or `%APPDATA%\Claude\logs\`
-  (Windows).
+  `~/Library/Logs/Claude/mcp*.log` (macOS). On Windows, check
+  `%APPDATA%\Claude\logs\` for an unpackaged install or the corresponding
+  `LocalCache\Roaming\Claude\logs\` directory under the detected
+  `%LOCALAPPDATA%\Packages\Claude_<id>\` package.
+- **Windows MSIX packaging:** a packaged Claude Desktop is an
+  AppContainer. Windows redirects its `%APPDATA%` writes into an isolated
+  `AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\` tree that an
+  unpackaged process such as this CLI must address directly.
+  `install-mcp --client claude-desktop --apply` detects this and writes
+  to the packaged location automatically. On an older ai-memory build,
+  pass `--config-file` pointed at the `LocalCache` path directly.
 - Sources: <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
-  <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>
+  <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>,
+  <https://learn.microsoft.com/en-us/windows/msix/msix-containerization-overview>
 
 ---
 
@@ -423,9 +544,19 @@ The rendered hooks config looks like:
   session start). ai-memory uses it as the closest equivalent to Gemini
   CLI's `SessionStart`; when a pending handoff exists, the hook injects
   it via Antigravity's `injectSteps[].ephemeralMessage` output.
-- Antigravity CLI does not expose a true session-end hook. `Stop` records
-  a stop observation only; call `memory_handoff_begin` before quitting when
-  you need the next agent to receive a handoff.
+- Antigravity CLI does not expose a true session-end hook. `Stop` records a
+  stop observation only because it marks the end of one execution loop, not
+  the conversation. After the final turn, run
+  `ai-memory finalize-session --agent antigravity-cli` to create the final
+  summary and automatic handoff and to queue opt-in SessionEnd consolidation.
+- `memory_handoff_begin` always creates an explicit manual handoff with no
+  `from_session_id` and `from_agent = other`; it is project-wide for cwd
+  matching but belongs to the creating operator by default. Pass `shared=true`
+  only to publish it to every operator in the project. That session-neutral
+  shape is the same for every MCP client. Handoffs carrying a
+  Codex or Claude session id came from canonical SessionEnd processing, not
+  from the manual tool. Use the explicit Antigravity finalizer when the
+  session itself must end and produce an attributed automatic handoff.
 - The built-in `/web` route displays compiled wiki pages, not raw session or
   observation rows. To verify hook capture, compare the `sessions` and
   `observations` counts from `ai-memory status` before and after a prompt.
@@ -662,6 +793,71 @@ same pattern as Gemini CLI.
   but are mutually exclusive event triggers, so successful and failed calls
   are both captured once.
 
+## Kiro CLI
+
+**Status:** MCP and v2 lifecycle hooks supported. Managed workstreams are
+tracked separately.
+
+**Config file:** `$KIRO_HOME/settings/mcp.json`, defaulting to
+`~/.kiro/settings/mcp.json`. Use `--config-file .kiro/settings/mcp.json` when
+you intentionally want Kiro's lower-scope project configuration instead.
+
+```bash
+ai-memory install-mcp --client kiro-cli --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+```
+
+The `kiro` alias is equivalent. The command preserves unrelated settings and
+servers, and merges this entry idempotently:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "https://memory.example/mcp?flavor=bedrock",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Kiro sends MCP tool schemas through Amazon Bedrock, which rejects root-level
+`anyOf`, `oneOf`, and `allOf`. The installer appends `?flavor=bedrock`; the
+server strips only those root combinators for that request while preserving
+nested schemas and the handlers' runtime validation. Kimi Code's existing
+`?flavor=moonshot` behavior remains supported independently.
+
+Kiro permits remote MCP URLs over HTTPS. Plain HTTP is accepted only for
+`localhost`, `127.0.0.1`, or another loopback address; `install-mcp` rejects a
+non-loopback HTTP URL before writing the config. See
+[HTTPS via reverse proxy](https-via-proxy.md) for a homelab deployment.
+
+ai-memory supports Kiro's documented v2 hook registration format:
+
+```bash
+# v2: update every existing global agent definition.
+ai-memory install-hooks --agent kiro-cli --apply
+
+# v2 project-local agent: target the active definition explicitly.
+ai-memory install-hooks --agent kiro-cli --apply \
+    --config-file .kiro/agents/<agent-name>.json
+```
+
+The v2 installer refuses to create a synthetic agent file and parses every
+target before changing any of them. Project-local Kiro agents override global
+agents, so `--config-file` is required when the active definition lives under
+`.kiro/agents/`. The integration remains fail-open, injects pending handoffs
+through `agentSpawn` stdout, and honors `$KIRO_HOME`. Kiro v3 hook capture is
+not installed because its registration migration guide does not document the
+command-input payload needed to validate capture and exclusion behavior. Follow
+[#356](https://github.com/akitaonrails/ai-memory/issues/356) for managed
+workstreams.
+
+Sources: <https://kiro.dev/docs/cli/mcp/configuration/>,
+<https://kiro.dev/docs/cli/reference/settings/>,
+<https://kiro.dev/docs/cli/hooks/>, and
+<https://kiro.dev/docs/cli/v3/hooks-migration/>.
+
 ## OpenClaw
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via a native
@@ -780,7 +976,8 @@ You: List the MCP tools you can call. Use one of them to check
 Model (any client): I can call: memory_query, memory_recent,
      memory_status, memory_briefing, memory_explore,
      memory_handoff_accept, memory_handoff_begin, memory_handoff_cancel,
-     memory_consolidate, memory_auto_improve, memory_write_page, memory_read_page, memory_delete_page,
+     memory_consolidate, memory_auto_improve, memory_write_page,
+     memory_read_page, memory_delete_page, memory_feedback,
      memory_lint, memory_forget_sweep, memory_install_self_routing.
      memory_status reports: 0 pages, 0 observations, 0 sessions.
 ```
@@ -823,7 +1020,7 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `ai-memory finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex and Antigravity CLI have no reliable true session-end event: run `ai-memory finalize-session` for Codex or `ai-memory finalize-session --agent antigravity-cli` for Antigravity after the final turn. |
 | **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
@@ -832,11 +1029,13 @@ still-active sessions from `dispose` during normal plugin teardown; abrupt
 process exits can still lose that fallback, so `session.deleted` remains the
 primary close path.
 
-Codex `Stop` is not a session end. The Codex hook install intentionally omits
-`SessionEnd`; `ai-memory finalize-session` finds the latest open Codex session
-for the current workspace/project and posts a synthetic `session-end` event
-through the same server path as real hook clients. Use `--all` only when you
-want to close every matching open Codex session in that scope.
+Codex and Antigravity `Stop` events are not session ends. Their hook installs
+intentionally omit `SessionEnd`; `ai-memory finalize-session` defaults to
+Codex, while `--agent antigravity-cli` selects Antigravity. The command finds
+the latest matching open session for the current workspace/project and posts a
+synthetic `session-end` event through the same server path as real hook clients.
+Use `--all` only when you want to close every matching open session for the
+selected agent in that scope.
 
 So a typical mixed workflow looks like:
 

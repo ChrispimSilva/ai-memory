@@ -17,6 +17,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use jsonc_parser::ParseOptions;
+use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient};
@@ -38,6 +40,8 @@ enum JsonMcpLocation {
     /// Code documents `servers`, not `mcpServers`, and writing the
     /// wrong key produces a silent no-op rather than an error.
     RootServers,
+    /// Top-level `context_servers` key used by Zed's settings.json.
+    RootContextServers,
 }
 
 /// Run the `install-mcp` subcommand.
@@ -52,6 +56,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         auth_token: args.auth_token.or_else(|| config.auth.bearer_token.clone()),
         ..args
     };
+    validate_args(&args)?;
     if args.apply {
         return apply_to_config_file(&args);
     }
@@ -70,7 +75,9 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Zero => render_zero(&args)?,
         McpClient::Devin => render_devin(&args)?,
         McpClient::KimiCode => render_kimi_code(&args)?,
+        McpClient::KiroCli => render_kiro_cli(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
+        McpClient::Zed => render_zed(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -92,13 +99,48 @@ fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
     DEFAULT_MCP_URL.to_string()
 }
 
-fn mcp_server_url_from_base(server_url: &str) -> String {
+pub(crate) fn mcp_server_url_from_base(server_url: &str) -> String {
     let trimmed = server_url.trim().trim_end_matches('/');
     if trimmed.ends_with("/mcp") {
         trimmed.to_string()
     } else {
         format!("{trimmed}/mcp")
     }
+}
+
+fn validate_args(args: &InstallMcpArgs) -> Result<()> {
+    if args.session_aware && !matches!(args.client, McpClient::ClaudeCode) {
+        bail!("--session-aware is supported only for --client claude-code");
+    }
+    if matches!(args.client, McpClient::KiroCli) {
+        validate_kiro_remote_url(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL))?;
+    }
+    Ok(())
+}
+
+/// Kiro accepts HTTPS remote MCP endpoints and plain HTTP only on loopback.
+/// Reject an unusable registration before `--apply` mutates user config.
+fn validate_kiro_remote_url(server_url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(server_url).context("Kiro MCP URL is not a valid URL")?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = parsed.host_str().is_some_and(|host| {
+        let normalized = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        normalized.eq_ignore_ascii_case("localhost")
+            || normalized
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if parsed.scheme() == "http" && loopback {
+        return Ok(());
+    }
+    bail!(
+        "Kiro CLI requires HTTPS for remote MCP servers (plain HTTP is accepted only on localhost); configure an HTTPS reverse proxy or pass a loopback URL"
+    )
 }
 
 /// Default MCP config-file path for a client (ignores any
@@ -132,12 +174,11 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             }
             #[cfg(target_os = "windows")]
             {
-                // %APPDATA% is roughly ~/AppData/Roaming.
-                home()?
-                    .join("AppData")
-                    .join("Roaming")
-                    .join("Claude")
-                    .join("claude_desktop_config.json")
+                let local_data_dir = dirs::data_local_dir()
+                    .context("could not locate %LOCALAPPDATA% for Claude Desktop config")?;
+                let roaming_config_dir = dirs::config_dir()
+                    .context("could not locate %APPDATA% for Claude Desktop config")?;
+                claude_desktop_config_path_in(&local_data_dir, &roaming_config_dir)?
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
@@ -166,6 +207,9 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // falling back to ~/.kimi-code; MCP servers live in mcp.json at
         // that root.
         McpClient::KimiCode => kimi_code_home(std::env::var_os("KIMI_CODE_HOME"))?.join("mcp.json"),
+        McpClient::KiroCli => kiro_home(std::env::var_os("KIRO_HOME"))?
+            .join("settings")
+            .join("mcp.json"),
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -175,7 +219,103 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .context("could not resolve current dir for .vscode/mcp.json default")?
             .join(".vscode")
             .join("mcp.json"),
+        McpClient::Zed => {
+            let config_dir = if cfg!(target_os = "macos") {
+                home()?.join(".config")
+            } else {
+                dirs::config_dir().context("could not locate user config directory for Zed")?
+            };
+            zed_config_path_in(&config_dir, std::env::consts::OS)
+        }
     })
+}
+
+/// Resolve Zed's user settings from the platform config root. The root is
+/// injected so path behavior can be tested without consulting the real home.
+fn zed_config_path_in(config_dir: &Path, target_os: &str) -> PathBuf {
+    let app_dir = if target_os == "windows" { "Zed" } else { "zed" };
+    config_dir.join(app_dir).join("settings.json")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn claude_desktop_config_path_in(
+    local_data_dir: &Path,
+    roaming_config_dir: &Path,
+) -> Result<PathBuf> {
+    let local_packages_dir = local_data_dir.join("Packages");
+    Ok(
+        packaged_claude_desktop_config_path(&local_packages_dir)?.unwrap_or_else(|| {
+            roaming_config_dir
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        }),
+    )
+}
+
+/// Detect an MSIX/AppX-packaged Claude Desktop under
+/// `%LOCALAPPDATA%\Packages`. Prefer the package that already contains a
+/// config file; otherwise a single package directory is enough because the
+/// atomic apply path creates its lazy `LocalCache` descendants.
+#[cfg(any(target_os = "windows", test))]
+fn packaged_claude_desktop_config_path(local_packages_dir: &Path) -> Result<Option<PathBuf>> {
+    let entries = match std::fs::read_dir(local_packages_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not inspect Claude Desktop packages under {}",
+                    local_packages_dir.display()
+                )
+            });
+        }
+    };
+    let mut candidates: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.get(.."Claude_".len()))
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Claude_"))
+        })
+        .collect();
+    candidates.sort();
+
+    let config_path = |package_dir: &Path| {
+        package_dir
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    };
+    let existing: Vec<PathBuf> = candidates
+        .iter()
+        .map(|package_dir| config_path(package_dir))
+        .filter(|path| path.is_file())
+        .collect();
+
+    match (existing.as_slice(), candidates.as_slice()) {
+        ([path], _) => Ok(Some(path.clone())),
+        ([], []) => Ok(None),
+        ([], [package_dir]) => Ok(Some(config_path(package_dir))),
+        _ => {
+            let package_names = candidates
+                .iter()
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "multiple Claude Desktop packages were found under {} ({package_names}); \
+                 pass --config-file with the active package's \
+                 LocalCache\\Roaming\\Claude\\claude_desktop_config.json path",
+                local_packages_dir.display()
+            )
+        }
+    }
 }
 
 /// Claude Code reads MCP-server registrations from `.claude.json`
@@ -207,6 +347,17 @@ fn kimi_code_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
     Ok(home_dir()
         .context("could not locate $HOME for config-file auto-detect")?
         .join(".kimi-code"))
+}
+
+/// Kiro CLI's global configuration root: `$KIRO_HOME` when set, otherwise
+/// `~/.kiro`. The override is injected to keep path tests process-local.
+fn kiro_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for Kiro configuration")?
+        .join(".kiro"))
 }
 
 /// Resolve Grok Build CLI's user configuration root. Grok honours
@@ -244,6 +395,7 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
         McpClient::Grok => apply_atomic(&path, |existing| {
             mutate_toml(existing, |doc| grok_upsert_mcp_server(doc, args))
         })?,
+        McpClient::Zed => apply_atomic(&path, |existing| zed_upsert_mcp_server(existing, args))?,
         _ => apply_atomic(&path, |existing| {
             mutate_json(existing, |root| upsert_json_mcp_entry(root, args))
         })?,
@@ -261,6 +413,44 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
     Ok(())
 }
 
+/// Merge ai-memory into Zed's JSONC settings without discarding comments,
+/// trailing commas, or unrelated formatting.
+fn zed_upsert_mcp_server(existing: &str, args: &InstallMcpArgs) -> Result<String> {
+    let root = CstRootNode::parse(existing, &ParseOptions::default())
+        .context("parsing Zed settings.json as JSONC")?;
+    let settings = root
+        .object_value_or_create()
+        .context("Zed settings.json root is present but not an object")?;
+    let servers = settings
+        .object_value_or_create("context_servers")
+        .context("`context_servers` is present but not an object")?;
+    let entry = serde_json_to_cst(build_json_mcp_entry(args)?);
+    if let Some(existing_entry) = servers.get(&args.name) {
+        existing_entry.set_value(entry);
+    } else {
+        servers.append(&args.name, entry);
+    }
+    Ok(root.to_string())
+}
+
+fn serde_json_to_cst(value: serde_json::Value) -> CstInputValue {
+    match value {
+        serde_json::Value::Null => CstInputValue::Null,
+        serde_json::Value::Bool(value) => CstInputValue::Bool(value),
+        serde_json::Value::Number(value) => CstInputValue::Number(value.to_string()),
+        serde_json::Value::String(value) => CstInputValue::String(value),
+        serde_json::Value::Array(values) => {
+            CstInputValue::Array(values.into_iter().map(serde_json_to_cst).collect())
+        }
+        serde_json::Value::Object(values) => CstInputValue::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, serde_json_to_cst(value)))
+                .collect(),
+        ),
+    }
+}
+
 fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
     match client {
         McpClient::ClaudeCode
@@ -270,17 +460,20 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::Devin
-        | McpClient::KimiCode => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::KimiCode
+        | McpClient::KiroCli => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses.
         McpClient::Openclaw | McpClient::Zero => Some(JsonMcpLocation::NestedMcpServers),
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
+        McpClient::Zed => Some(JsonMcpLocation::RootContextServers),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
     }
 }
 
 fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    validate_args(args)?;
     match args.client {
         McpClient::OpenCode => build_mcp_entry_opencode(args),
         McpClient::Openclaw => build_mcp_entry_openclaw(args),
@@ -335,6 +528,14 @@ fn upsert_json_mcp_entry(
                 .context("`servers` is present but not an object")?;
             servers.insert(args.name.clone(), entry);
         }
+        JsonMcpLocation::RootContextServers => {
+            let servers = root
+                .entry("context_servers")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`context_servers` is present but not an object")?;
+            servers.insert(args.name.clone(), entry);
+        }
     }
     Ok(())
 }
@@ -355,6 +556,9 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
             JsonMcpLocation::RootServers => json!({
                 "servers": { args.name.as_str(): entry }
             }),
+            JsonMcpLocation::RootContextServers => json!({
+                "context_servers": { args.name.as_str(): entry }
+            }),
         };
     Ok(serde_json::to_string_pretty(&fragment)?)
 }
@@ -364,17 +568,25 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
 /// in tool parameter schemas (issue #155's `anyOf` on `memory_read_page`),
 /// and the server answers flavored requests with flat schemas. Idempotent
 /// so re-runs never stack duplicate query pairs.
-pub(crate) fn moonshot_flavored_mcp_url(server_url: &str) -> String {
-    const FLAVOR: &str = "flavor=moonshot";
+fn flavored_mcp_url(server_url: &str, flavor: &str) -> String {
+    let marker = format!("flavor={flavor}");
     let url = server_url.trim();
     let already_marked = url
         .split_once('?')
-        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == FLAVOR));
+        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == marker));
     if already_marked {
         return url.to_string();
     }
     let separator = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{separator}{FLAVOR}")
+    format!("{url}{separator}{marker}")
+}
+
+pub(crate) fn moonshot_flavored_mcp_url(server_url: &str) -> String {
+    flavored_mcp_url(server_url, "moonshot")
+}
+
+pub(crate) fn bedrock_flavored_mcp_url(server_url: &str) -> String {
+    flavored_mcp_url(server_url, "bedrock")
 }
 
 /// JSON entry shape used by Claude Code, Claude Desktop, Cursor, and
@@ -388,10 +600,22 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let mut entry = serde_json::Map::new();
     match args.client {
         McpClient::ClaudeCode => {
-            entry.insert("type".into(), json!("http"));
-            entry.insert("url".into(), json!(server_url));
-            if let Some(b) = &bearer {
-                entry.insert("headers".into(), json!({"Authorization": b}));
+            if args.session_aware {
+                entry.insert("type".into(), json!("stdio"));
+                entry.insert("command".into(), json!("ai-memory"));
+                entry.insert(
+                    "args".into(),
+                    json!(["mcp-bridge", "--server-url", server_url]),
+                );
+                if let Some(token) = &args.auth_token {
+                    entry.insert("env".into(), json!({"AI_MEMORY_AUTH_TOKEN": token}));
+                }
+            } else {
+                entry.insert("type".into(), json!("http"));
+                entry.insert("url".into(), json!(server_url));
+                if let Some(b) = &bearer {
+                    entry.insert("headers".into(), json!({"Authorization": b}));
+                }
             }
         }
         McpClient::ClaudeDesktop => {
@@ -406,7 +630,7 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             entry.insert("command".into(), json!("npx"));
             entry.insert("args".into(), serde_json::Value::Array(cmd_args));
         }
-        McpClient::Cursor => {
+        McpClient::Cursor | McpClient::Zed => {
             entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
@@ -446,6 +670,12 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             // field as streamable-HTTP; `transport` is only for legacy
             // SSE endpoints.
             entry.insert("url".into(), json!(moonshot_flavored_mcp_url(server_url)));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::KiroCli => {
+            entry.insert("url".into(), json!(bedrock_flavored_mcp_url(server_url)));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -636,7 +866,18 @@ fn upsert_toml_mcp_server(doc: &mut toml_edit::DocumentMut, name: &str, server: 
 
 fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<String> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
-    let cli_line = if let Some(b) = &bearer {
+    let cli_line = if args.session_aware {
+        let env = args
+            .auth_token
+            .as_deref()
+            .map(|token| format!(" --env \"AI_MEMORY_AUTH_TOKEN={token}\""))
+            .unwrap_or_default();
+        format!(
+            "claude mcp add --transport stdio{env} {name} -- \\\n    ai-memory mcp-bridge --server-url {url}",
+            name = args.name,
+            url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        )
+    } else if let Some(b) = &bearer {
         format!(
             "claude mcp add --transport http {name} {url} \\\n    --header \"Authorization: {b}\"",
             name = args.name,
@@ -764,7 +1005,10 @@ fn render_claude_desktop(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# Claude Desktop — write to claude_desktop_config.json:\n\
          #   - macOS:    ~/Library/Application Support/Claude/claude_desktop_config.json\n\
-         #   - Windows:  %APPDATA%\\Claude\\claude_desktop_config.json\n\
+         #   - Windows (unpackaged): %APPDATA%\\Claude\\claude_desktop_config.json\n\
+         #   - Windows (MSIX):       %LOCALAPPDATA%\\Packages\\Claude_<id>\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json\n\
+         #     --apply detects the installed form; if multiple MSIX packages\n\
+         #     are present, select the active one with --config-file.\n\
          #   - Linux:    Claude Desktop is not officially distributed for Linux;\n\
          #               use Claude Code or another HTTP client instead.\n\
          #\n\
@@ -893,6 +1137,24 @@ fn render_kimi_code(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_kiro_cli(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Kiro CLI - merge into $KIRO_HOME/settings/mcp.json\n\
+         # (defaults to ~/.kiro/settings/mcp.json):\n\
+         #\n\
+         # Kiro accepts HTTPS remote endpoints and plain HTTP only on\n\
+         # localhost. `?flavor=bedrock` removes unsupported root-level\n\
+         # schema combinators while handler validation remains unchanged.\n\
+         # Lifecycle capture for the documented v2 engine is installed\n\
+         # separately with `install-hooks --agent kiro-cli`. Kiro v3 hook\n\
+         # capture remains unsupported until its command-input contract is\n\
+         # documented.\n\
+         # Managed workstreams are not installed by this command.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# VS Code GitHub Copilot (agent mode) — write to one of:\n\
@@ -917,6 +1179,23 @@ fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_zed(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Zed - merge into settings.json:\n\
+         #   - macOS:   ~/.config/zed/settings.json\n\
+         #   - Linux:   $XDG_CONFIG_HOME/zed/settings.json\n\
+         #              (defaults to ~/.config/zed/settings.json)\n\
+         #   - Windows: %APPDATA%\\Zed\\settings.json\n\
+         #\n\
+         # Zed reads remote MCP servers from the top-level\n\
+         # `context_servers` map. This is MCP-only: Zed does not expose\n\
+         # ai-memory-compatible lifecycle hooks, so automatic capture and\n\
+         # managed-workstream continuity are not active.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -932,6 +1211,7 @@ mod tests {
             auth_token: None,
             apply: false,
             config_file: None,
+            session_aware: false,
         }
     }
 
@@ -943,7 +1223,19 @@ mod tests {
             auth_token: Some("test-token-deadbeef".into()),
             apply: false,
             config_file: None,
+            session_aware: false,
         }
+    }
+
+    #[test]
+    fn claude_desktop_render_lists_packaged_and_unpacked_windows_paths() {
+        let rendered = render_claude_desktop(&args_for(McpClient::ClaudeDesktop)).unwrap();
+        assert!(rendered.contains(r"%APPDATA%\Claude\claude_desktop_config.json"));
+        assert!(rendered.contains(
+            r"%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json"
+        ));
+        assert!(rendered.contains("--apply detects the installed form"));
+        assert!(rendered.contains("--config-file"));
     }
 
     #[test]
@@ -968,6 +1260,208 @@ mod tests {
     }
 
     #[test]
+    fn zed_config_path_uses_platform_conventions() {
+        for (target_os, root, expected) in [
+            (
+                "linux",
+                "/home/alice/.config",
+                "/home/alice/.config/zed/settings.json",
+            ),
+            (
+                "macos",
+                "/Users/alice/.config",
+                "/Users/alice/.config/zed/settings.json",
+            ),
+            (
+                "windows",
+                "C:/Users/alice/AppData/Roaming",
+                "C:/Users/alice/AppData/Roaming/Zed/settings.json",
+            ),
+        ] {
+            assert_eq!(
+                zed_config_path_in(Path::new(root), target_os),
+                PathBuf::from(expected),
+                "target OS: {target_os}"
+            );
+        }
+    }
+
+    #[test]
+    fn zed_renderer_uses_context_servers_and_native_remote_http() {
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::Zed)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "context_servers": {
+                    "ai-memory": {
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "headers": {
+                            "Authorization": "Bearer test-token-deadbeef"
+                        }
+                    }
+                }
+            })
+        );
+        assert!(
+            render_zed(&args_for(McpClient::Zed))
+                .unwrap()
+                .contains("MCP-only")
+        );
+    }
+
+    #[test]
+    fn zed_apply_preserves_settings_and_siblings_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        fs::write(
+            &config_path,
+            r#"{
+  // Keep this user comment.
+  "theme": "One Dark",
+  "context_servers": {
+    // Keep this sibling comment.
+    "other": { "url": "https://other.example/mcp" },
+  },
+}
+"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::Zed);
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        assert!(second.contains("// Keep this user comment."));
+        assert!(second.contains("// Keep this sibling comment."));
+        let root = CstRootNode::parse(&second, &ParseOptions::default()).unwrap();
+        let value = root.to_serde_value().unwrap();
+        assert_eq!(value["theme"], "One Dark");
+        assert_eq!(
+            value["context_servers"]["other"]["url"],
+            "https://other.example/mcp"
+        );
+        assert_eq!(
+            value["context_servers"]["ai-memory"]["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+    }
+
+    #[test]
+    fn zed_apply_rejects_non_object_context_servers_without_writing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        let original = "{\n  // User-owned invalid shape.\n  \"context_servers\": false,\n}\n";
+        fs::write(&config_path, original).unwrap();
+        let mut args = args_for(McpClient::Zed);
+        args.config_file = Some(config_path.clone());
+
+        let error = apply_to_config_file(&args).unwrap_err();
+
+        assert!(error.to_string().contains("not an object"));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_prefers_localcache_when_package_dir_exists() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Claude_pzs8sxrjxfjjc")).unwrap();
+
+        let found = packaged_claude_desktop_config_path(packages.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found,
+            packages
+                .path()
+                .join("Claude_pzs8sxrjxfjjc")
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_ignores_unrelated_and_non_dir_entries() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Microsoft.WindowsTerminal_abc123")).unwrap();
+        fs::write(packages.path().join("Claude_notadir"), b"").unwrap();
+
+        assert!(
+            packaged_claude_desktop_config_path(packages.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_none_when_packages_dir_absent_or_empty() {
+        let missing = tempfile::TempDir::new().unwrap();
+        assert!(
+            packaged_claude_desktop_config_path(&missing.path().join("does-not-exist"))
+                .unwrap()
+                .is_none()
+        );
+
+        let empty = tempfile::TempDir::new().unwrap();
+        assert!(
+            packaged_claude_desktop_config_path(empty.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_desktop_path_uses_resolved_app_data_roots() {
+        let root = tempfile::TempDir::new().unwrap();
+        let local = root.path().join("redirected-local");
+        let roaming = root.path().join("redirected-roaming");
+
+        assert_eq!(
+            claude_desktop_config_path_in(&local, &roaming).unwrap(),
+            roaming.join("Claude").join("claude_desktop_config.json")
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_prefers_existing_config_among_packages() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Claude_old")).unwrap();
+        let active_config = packages
+            .path()
+            .join("Claude_current")
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Claude")
+            .join("claude_desktop_config.json");
+        fs::create_dir_all(active_config.parent().unwrap()).unwrap();
+        fs::write(&active_config, b"{}").unwrap();
+
+        assert_eq!(
+            packaged_claude_desktop_config_path(packages.path())
+                .unwrap()
+                .unwrap(),
+            active_config
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_rejects_ambiguous_packages() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Claude_first")).unwrap();
+        fs::create_dir_all(packages.path().join("Claude_second")).unwrap();
+
+        let error = packaged_claude_desktop_config_path(packages.path()).unwrap_err();
+        assert!(error.to_string().contains("--config-file"));
+    }
+
+    #[test]
     fn claude_code_render_shows_resolved_config_path() {
         let args = args_for(McpClient::ClaudeCode);
         let config_path = std::path::Path::new("/stores/claude/.claude.json");
@@ -979,6 +1473,71 @@ mod tests {
         assert!(
             !out.contains("~/.claude.json"),
             "render must not hardcode ~/.claude.json when the resolved path differs:\n{out}"
+        );
+    }
+
+    #[test]
+    fn claude_code_session_aware_entry_uses_owned_stdio_bridge() {
+        let mut args = args_with_token(McpClient::ClaudeCode);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.session_aware = true;
+
+        let entry = build_mcp_entry(&args).unwrap();
+
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(entry["command"], "ai-memory");
+        assert_eq!(
+            entry["args"],
+            json!(["mcp-bridge", "--server-url", "https://memory.example/mcp"])
+        );
+        assert_eq!(entry["env"]["AI_MEMORY_AUTH_TOKEN"], "test-token-deadbeef");
+        assert!(entry.get("url").is_none());
+        assert!(entry.get("headers").is_none());
+
+        let rendered = render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap();
+        assert!(rendered.contains("claude mcp add --transport stdio"));
+        assert!(rendered.contains("ai-memory mcp-bridge --server-url"));
+    }
+
+    #[test]
+    fn claude_code_session_aware_apply_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_file = tmp.path().join(".claude.json");
+        let mut args = args_with_token(McpClient::ClaudeCode);
+        args.server_url = Some("http://192.168.0.90:49374/mcp".into());
+        args.config_file = Some(config_file.clone());
+        args.session_aware = true;
+        args.apply = true;
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_file).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_file).unwrap();
+
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["args"],
+            json!([
+                "mcp-bridge",
+                "--server-url",
+                "http://192.168.0.90:49374/mcp"
+            ])
+        );
+    }
+
+    #[test]
+    fn session_aware_rejects_non_claude_clients() {
+        let mut args = args_for(McpClient::Codex);
+        args.session_aware = true;
+
+        let error = build_json_mcp_entry(&args).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("supported only for --client claude-code"),
+            "{error:#}"
         );
     }
 
@@ -1001,7 +1560,9 @@ mod tests {
             McpClient::Zero => render_zero(&args).unwrap(),
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
+            McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
+            McpClient::Zed => render_zed(&args).unwrap(),
         }
     }
 
@@ -1023,7 +1584,9 @@ mod tests {
             McpClient::Zero,
             McpClient::Devin,
             McpClient::KimiCode,
+            McpClient::KiroCli,
             McpClient::VsCodeCopilot,
+            McpClient::Zed,
         ] {
             let out = render_with_token(client);
             // Every client embeds the token as `Authorization:
@@ -1059,7 +1622,9 @@ mod tests {
             McpClient::Zero,
             McpClient::Devin,
             McpClient::KimiCode,
+            McpClient::KiroCli,
             McpClient::VsCodeCopilot,
+            McpClient::Zed,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -1088,7 +1653,9 @@ mod tests {
             McpClient::Zero => render_zero(&args).unwrap(),
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
+            McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
+            McpClient::Zed => render_zed(&args).unwrap(),
         }
     }
 
@@ -1241,6 +1808,14 @@ mod tests {
         let kimi_with_token = render_with_token(McpClient::KimiCode);
         assert!(kimi_with_token.contains("\"headers\""));
         assert!(kimi_with_token.contains("\"Authorization\": \"Bearer test-token-deadbeef\""));
+        let kiro = render_for_test(McpClient::KiroCli);
+        assert!(kiro.contains("\"mcpServers\""));
+        assert!(kiro.contains("http://127.0.0.1:49374/mcp?flavor=bedrock"));
+        assert!(!kiro.contains("\"transport\""));
+        assert!(kiro.contains("install-hooks --agent kiro-cli"));
+        assert!(kiro.contains("Kiro v3 hook"));
+        let kiro_with_token = render_with_token(McpClient::KiroCli);
+        assert!(kiro_with_token.contains("\"Authorization\": \"Bearer test-token-deadbeef\""));
         // VS Code Copilot must use the `servers` top-level key — the
         // `mcpServers` form is silently ignored by VS Code's MCP
         // framework. Regression guard against a future copy-paste
@@ -1249,6 +1824,10 @@ mod tests {
         assert!(vsc.contains("\"servers\""));
         assert!(!vsc.contains("\"mcpServers\""));
         assert!(vsc.contains("\"type\": \"http\""));
+        let zed = render_for_test(McpClient::Zed);
+        assert!(zed.contains("\"context_servers\""));
+        assert!(!zed.contains("\"mcpServers\""));
+        assert!(!zed.contains("\"type\": \"http\""));
     }
 
     /// Kimi Code resolves its mcp.json under $KIMI_CODE_HOME when the env
@@ -1265,6 +1844,17 @@ mod tests {
         // An empty override falls back to the default home-based dir.
         assert_eq!(kimi_code_home(Some("".into())).unwrap(), default);
         assert_eq!(kimi_code_home(None).unwrap(), default);
+    }
+
+    #[test]
+    fn kiro_home_honours_env_override() {
+        assert_eq!(
+            kiro_home(Some("/tmp/custom-kiro-home".into())).unwrap(),
+            PathBuf::from("/tmp/custom-kiro-home")
+        );
+        let default = home_dir().unwrap().join(".kiro");
+        assert_eq!(kiro_home(Some("".into())).unwrap(), default);
+        assert_eq!(kiro_home(None).unwrap(), default);
     }
 
     /// Pin the append rules: `?` on a bare endpoint, `&` with an existing
@@ -1296,6 +1886,72 @@ mod tests {
         ] {
             assert_eq!(moonshot_flavored_mcp_url(input), expected, "input: {input}");
         }
+    }
+
+    #[test]
+    fn bedrock_flavored_mcp_url_appends_marker_idempotently() {
+        assert_eq!(
+            bedrock_flavored_mcp_url("https://memory.example/mcp"),
+            "https://memory.example/mcp?flavor=bedrock"
+        );
+        assert_eq!(
+            bedrock_flavored_mcp_url("https://memory.example/mcp?token=x"),
+            "https://memory.example/mcp?token=x&flavor=bedrock"
+        );
+        assert_eq!(
+            bedrock_flavored_mcp_url("https://memory.example/mcp?flavor=bedrock"),
+            "https://memory.example/mcp?flavor=bedrock"
+        );
+    }
+
+    #[test]
+    fn kiro_rejects_plain_http_for_non_loopback_servers() {
+        for allowed in [
+            "http://localhost:49374/mcp",
+            "http://127.0.0.1:49374/mcp",
+            "http://[::1]:49374/mcp",
+            "https://memory.example/mcp",
+        ] {
+            let mut args = args_for(McpClient::KiroCli);
+            args.server_url = Some(allowed.into());
+            validate_args(&args).unwrap_or_else(|error| panic!("{allowed}: {error:#}"));
+        }
+
+        let mut args = args_for(McpClient::KiroCli);
+        args.server_url = Some("http://192.168.0.90:49374/mcp".into());
+        let error = validate_args(&args).unwrap_err();
+        assert!(error.to_string().contains("requires HTTPS"), "{error:#}");
+    }
+
+    #[test]
+    fn kiro_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("mcp.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other":{"url":"https://other.example/mcp"}},"userSetting":true}"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::KiroCli);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["userSetting"], true);
+        assert_eq!(
+            value["mcpServers"]["other"]["url"],
+            "https://other.example/mcp"
+        );
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["url"],
+            "https://memory.example/mcp?flavor=bedrock"
+        );
     }
 
     #[test]

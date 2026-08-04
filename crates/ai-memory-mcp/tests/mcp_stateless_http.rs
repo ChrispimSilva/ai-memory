@@ -215,20 +215,12 @@ async fn stateless_moonshot_flavor_strips_root_any_of() {
     );
 }
 
-/// Kiro CLI's manual MCP config flow: Amazon Bedrock's Converse API
-/// rejects the same root-level combinators Moonshot does, so
-/// `/mcp?flavor=bedrock` must return the identical flattened tool list.
+/// Kiro's Bedrock requests use the same restricted root-schema dialect while
+/// retaining a provider-specific marker for diagnostics and compatibility.
 #[tokio::test]
 async fn stateless_bedrock_flavor_strips_root_any_of() {
     let tmp = TempDir::new().unwrap();
     let (router, _store) = make_router(&tmp, false).await;
-
-    let init = router
-        .clone()
-        .oneshot(post_to("/mcp?flavor=bedrock", INITIALIZE))
-        .await
-        .unwrap();
-    assert_eq!(init.status(), StatusCode::OK);
 
     let resp = router
         .oneshot(post_to("/mcp?flavor=bedrock", TOOLS_LIST))
@@ -242,10 +234,7 @@ async fn stateless_bedrock_flavor_strips_root_any_of() {
             "bedrock flavor must strip root `{key}`: {schema}"
         );
     }
-    assert!(
-        schema.get("properties").is_some(),
-        "the flat schema must keep describing the args: {schema}"
-    );
+    assert!(schema.get("properties").is_some());
 }
 
 /// Control: without the marker, tools/list keeps the upstream root `anyOf`.

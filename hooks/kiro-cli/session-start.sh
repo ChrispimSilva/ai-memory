@@ -1,11 +1,10 @@
 #!/bin/sh
-# Kiro CLI session-start hook (v2 engine: agentSpawn; v3 engine: SessionStart).
+# Kiro CLI v2 session-start hook (agentSpawn).
 # 1. Forwards the event JSON to the ai-memory server (fire-and-forget).
 # 2. Synchronously fetches any pending cross-agent handoff and prints the
-#    raw body to stdout — both Kiro engines add this hook's exit-0 stdout
-#    to the agent context (v2 per kiro.dev/docs/cli/hooks, v3 per
-#    kiro.dev/docs/cli/v3/hooks), so the resuming agent sees prior context
-#    with no human in the loop. Kiro documents no JSON envelope for hook
+#    raw body to stdout. Kiro v2 adds this hook's exit-0 stdout to the agent
+#    context, so the resuming agent sees prior context with no human in the
+#    loop. Kiro documents no JSON envelope for hook
 #    stdout, so print the raw handoff body or nothing at all.
 # 3. Delivers the compiled project brief ([briefing]
 #    inject_on_session_start) once per session, gated by a marker file

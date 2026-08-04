@@ -40,6 +40,8 @@ fn command_with_home(home: &Path) -> Command {
         // A host-level KIMI_CODE_HOME would pull uninstall's kimi-code
         // config sweep out of the sandbox; tests opt back in explicitly.
         .env_remove("KIMI_CODE_HOME")
+        // The same isolation is required for Kiro's relocatable config root.
+        .env_remove("KIRO_HOME")
         // Keep Claude installer/removal tests inside their temp HOME unless a
         // test explicitly opts into a relocated config root.
         .env_remove("CLAUDE_CONFIG_DIR");
@@ -1086,8 +1088,9 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
 }
 
 #[test]
-fn uninstall_kiro_cli_hooks_preserves_user_entries_on_both_engines() {
+fn uninstall_kiro_cli_hooks_preserves_user_and_v3_entries() {
     let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let kiro = home.path().join(".kiro");
 
@@ -1103,7 +1106,8 @@ fn uninstall_kiro_cli_hooks_preserves_user_entries_on_both_engines() {
   "hooks": {
     "agentSpawn": [
       {"command": "git status"},
-      {"command": "AI_MEMORY_HOOK_URL=http://h /x/kiro-cli/session-start.sh", "max_output_size": 65536}
+      {"command": "echo ai-memory status"},
+      {"command": "AI_MEMORY_HOOK_URL=http://h /x/hooks/kiro-cli/session-start.sh", "max_output_size": 65536}
     ],
     "stop": [
       {"command": "'/usr/local/bin/ai-memory' hook --event stop --agent kiro-cli --server-url http://h:49374"}
@@ -1113,7 +1117,14 @@ fn uninstall_kiro_cli_hooks_preserves_user_entries_on_both_engines() {
     )
     .unwrap();
 
-    // v3 engine surface: our standalone hooks file with one user entry inside.
+    let local_agent = project.path().join(".kiro/agents/local.json");
+    write_file(
+        &local_agent,
+        r#"{"name":"local","hooks":{"stop":[{"command":"/x/hooks/kiro-cli/stop.sh"}]}}"#,
+    );
+
+    // v3 is unsupported because its command-input contract is undocumented.
+    // Uninstall must leave even an ai-memory-looking standalone file untouched.
     let hooks_dir = kiro.join("hooks");
     std::fs::create_dir_all(&hooks_dir).unwrap();
     let v3_file = hooks_dir.join("ai-memory.json");
@@ -1137,6 +1148,7 @@ fn uninstall_kiro_cli_hooks_preserves_user_entries_on_both_engines() {
 
     let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .current_dir(project.path())
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -1145,18 +1157,26 @@ fn uninstall_kiro_cli_hooks_preserves_user_entries_on_both_engines() {
         serde_json::from_str(&std::fs::read_to_string(&agent_config).unwrap()).unwrap();
     assert_eq!(agent_after["name"], "dev", "agent definition must survive");
     let spawn = agent_after["hooks"]["agentSpawn"].as_array().unwrap();
-    assert_eq!(spawn.len(), 1, "only ai-memory entries removed");
+    assert_eq!(spawn.len(), 2, "only exact ai-memory entries removed");
     assert_eq!(spawn[0]["command"], "git status");
+    assert_eq!(spawn[1]["command"], "echo ai-memory status");
     assert!(
         agent_after["hooks"].get("stop").is_none(),
         "an event array left empty is dropped"
     );
+    let local_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&local_agent).unwrap()).unwrap();
+    assert!(
+        local_after.get("hooks").is_none(),
+        "project-local ai-memory hooks must also be removed"
+    );
 
-    let v3_after: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&v3_file).unwrap()).unwrap();
-    let v3_hooks = v3_after["hooks"].as_array().unwrap();
-    assert_eq!(v3_hooks.len(), 1, "user entry in our file must survive");
-    assert_eq!(v3_hooks[0]["name"], "lint-on-save");
+    assert!(
+        std::fs::read_to_string(&v3_file)
+            .unwrap()
+            .contains("ai-memory-session-start"),
+        "unsupported v3 hook files must remain untouched"
+    );
 
     assert_eq!(
         std::fs::read_to_string(&third_party_file).unwrap(),

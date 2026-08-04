@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kiro CLI stop hook (v2: stop; v3: Stop).
+# Kiro CLI v2 stop hook (stop).
 # Forwards the event JSON to the ai-memory server, fire-and-forget.
 # Print nothing: on the v2 engine a stop hook's stdout can carry a
 # {"decision":"block"} verdict that would re-prompt the model, so a

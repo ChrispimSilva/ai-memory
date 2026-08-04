@@ -1,11 +1,23 @@
 //! Wire envelope received on `POST /hook`.
 
-use ai_memory_core::{AgentKind, ObservationKind};
+use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, truncate_utf8_bytes};
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
     ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
 };
+
+/// Durable excerpt ceiling for user prompts. Prompts retain more working
+/// context than tool/notification summaries while remaining bounded.
+pub const USER_PROMPT_EXCERPT_MAX_BYTES: usize = OBSERVATION_BODY_MAX_BYTES;
+
+/// Durable excerpt ceiling for post-compaction summaries.
+pub const POST_COMPACTION_EXCERPT_MAX_BYTES: usize = OBSERVATION_BODY_MAX_BYTES;
+
+/// Durable excerpt ceiling for notifications.
+pub const NOTIFICATION_EXCERPT_MAX_BYTES: usize = 2_000;
+
+const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
 
 /// Query-string parameters on `POST /hook`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -499,7 +511,11 @@ fn legacy_tool_body(event: HookEvent, agent: AgentKind, raw: &serde_json::Value)
 const fn closed_tool_agent(agent: AgentKind) -> bool {
     matches!(
         agent,
-        AgentKind::ClaudeCode | AgentKind::OpenCode | AgentKind::Pi | AgentKind::AntigravityCli
+        AgentKind::ClaudeCode
+            | AgentKind::OpenCode
+            | AgentKind::Pi
+            | AgentKind::AntigravityCli
+            | AgentKind::Hermes
     )
 }
 
@@ -540,6 +556,7 @@ fn safe_tool_body(
             let result =
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
+                    .or_else(|| antigravity_edit_content(agent, raw))
                     .unwrap_or_else(|| "(no output captured)".into());
             summary.push_str("\n---\n");
             summary.push_str(&result);
@@ -547,6 +564,25 @@ fn safe_tool_body(
         }
         _ => None,
     }
+}
+
+fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    if agent != AgentKind::AntigravityCli {
+        return None;
+    }
+    let tool_call = raw.get("toolCall")?;
+    let tool = tool_call.get("name")?.as_str()?;
+    if !matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "write_to_file" | "replace_file_content" | "multi_replace_file_content"
+    ) {
+        return None;
+    }
+    let args = tool_call.get("args")?;
+    extract_content(
+        args,
+        &["ReplacementContent", "CodeContent", "ReplacementChunks"],
+    )
 }
 
 fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -744,7 +780,8 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
 
 fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
-        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"]),
+        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"])
+            .map(|body| truncate_utf8_bytes(&body, USER_PROMPT_EXCERPT_MAX_BYTES)),
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
@@ -757,8 +794,10 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
                     .unwrap_or_else(|| "(no output captured)".into());
             Some(format!("tool: {tool}\n---\n{}", truncate_excerpt(&result)))
         }
-        HookEvent::Notification => extract_content(raw, &["message", "text"]),
-        HookEvent::PostCompaction => extract_content(raw, &["summary"]),
+        HookEvent::Notification => extract_content(raw, &["message", "text"])
+            .map(|body| truncate_utf8_bytes(&body, NOTIFICATION_EXCERPT_MAX_BYTES)),
+        HookEvent::PostCompaction => extract_content(raw, &["summary"])
+            .map(|body| truncate_utf8_bytes(&body, POST_COMPACTION_EXCERPT_MAX_BYTES)),
         _ => None,
     }
 }
@@ -776,31 +815,72 @@ fn truncate_for_title(s: &str) -> String {
 }
 
 fn truncate_excerpt(s: &str) -> String {
-    truncate_utf8_bytes(s, 2_000)
+    truncate_utf8_bytes(s, TOOL_EXCERPT_MAX_BYTES)
 }
 
-/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary, reserving the
-/// ellipsis within the cap (never beyond it). Shared by the tool-excerpt cap
-/// and the opt-in assistant excerpt cap (#196) so there is one UTF-8-safe
-/// truncation, two named caps.
-pub(crate) fn truncate_utf8_bytes(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    // Reserve the ellipsis within the byte cap, not beyond it.
-    let limit = max.saturating_sub('…'.len_utf8());
-    let mut buf = String::with_capacity(max);
-    let mut end = 0;
-    for (idx, ch) in s.char_indices() {
-        let next = idx + ch.len_utf8();
-        if next > limit {
-            break;
+/// Cap core lifecycle body fields before the native hook writes its local
+/// spool entry. The server independently reapplies the same per-event limits
+/// while constructing [`HookEnvelope`], and the typed persistence boundary has
+/// a universal backstop.
+pub fn cap_lifecycle_body_for_client(raw: &mut serde_json::Value, event: HookEvent) -> bool {
+    let Some((keys, max_bytes)) = core_body_cap(event) else {
+        return false;
+    };
+    let mut changed = cap_candidate_group(raw, keys, max_bytes);
+    for container in ["payload", "event"] {
+        if let Some(nested) = raw.get_mut(container) {
+            changed |= cap_candidate_group(nested, keys, max_bytes);
         }
-        end = next;
     }
-    buf.push_str(&s[..end]);
-    buf.push('…');
-    buf
+    changed
+}
+
+fn core_body_cap(event: HookEvent) -> Option<(&'static [&'static str], usize)> {
+    match event {
+        HookEvent::UserPrompt => Some((
+            &["prompt", "message", "text"],
+            USER_PROMPT_EXCERPT_MAX_BYTES,
+        )),
+        HookEvent::Notification => Some((&["message", "text"], NOTIFICATION_EXCERPT_MAX_BYTES)),
+        HookEvent::PostCompaction => Some((&["summary"], POST_COMPACTION_EXCERPT_MAX_BYTES)),
+        _ => None,
+    }
+}
+
+fn cap_candidate_group(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
+    let mut changed = cap_object_fields(value, keys, max_bytes);
+    if let Some(properties) = value.get_mut("properties") {
+        changed |= cap_object_fields(properties, keys, max_bytes);
+        if let Some(info) = properties.get_mut("info") {
+            changed |= cap_object_fields(info, keys, max_bytes);
+        }
+    }
+    for container in ["info", "path"] {
+        if let Some(nested) = value.get_mut(container) {
+            changed |= cap_object_fields(nested, keys, max_bytes);
+        }
+    }
+    changed
+}
+
+fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in keys {
+        let Some(field) = object.get_mut(*key) else {
+            continue;
+        };
+        let Some(text) = value_to_text(field) else {
+            continue;
+        };
+        if text.len() > max_bytes {
+            *field = serde_json::Value::String(truncate_utf8_bytes(&text, max_bytes));
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn normalize_extension_name(value: Option<&str>) -> Option<String> {
@@ -1335,6 +1415,8 @@ mod tests {
         assert_eq!(parse_agent("omp"), AgentKind::Omp);
         assert_eq!(parse_agent("pi"), AgentKind::Pi);
         assert_eq!(parse_agent("oh-my-pi"), AgentKind::Omp);
+        assert_eq!(parse_agent("hermes"), AgentKind::Hermes);
+        assert_eq!(parse_agent("hermes-agent"), AgentKind::Hermes);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -1359,6 +1441,41 @@ mod tests {
         assert!(env.cwd.is_none());
         assert!(env.title_hint.is_none());
         assert!(env.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn hermes_tool_title_uses_only_the_verified_shell_hook_shape() {
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "write_file",
+            "tool_input": {"path": "src/lib.rs", "content": "untrusted"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {"tool_call_id": "call-42", "status": "ok"}
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("hermes".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::Hermes);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("hermes-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("unverified-agent".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
     }
 
     /// Body is well-formed JSON but the expected `session_id` /
@@ -1441,6 +1558,76 @@ mod tests {
         let title = env.title_hint.unwrap();
         assert!(title.chars().count() <= 80);
         assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn core_lifecycle_bodies_use_named_utf8_safe_caps() {
+        for (event, field, cap) in [
+            ("user-prompt", "prompt", USER_PROMPT_EXCERPT_MAX_BYTES),
+            ("notification", "message", NOTIFICATION_EXCERPT_MAX_BYTES),
+            (
+                "post-compaction",
+                "summary",
+                POST_COMPACTION_EXCERPT_MAX_BYTES,
+            ),
+        ] {
+            let body = format!("{}éTAIL_SENTINEL", "x".repeat(cap - 1));
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({(field): body}),
+            );
+            let excerpt = env.body_excerpt.expect("bounded body excerpt");
+            assert!(excerpt.len() <= cap, "{event} exceeded {cap} bytes");
+            assert!(excerpt.ends_with('…'), "{event} omitted truncation marker");
+            assert!(
+                !excerpt.contains("TAIL_SENTINEL"),
+                "{event} retained content after the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn client_body_cap_covers_supported_nested_candidate_shapes() {
+        let mut raw = serde_json::json!({
+            "prompt": "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1),
+            "payload": {
+                "properties": {
+                    "info": {
+                        "message": [{"type": "text", "text": "y".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1)}]
+                    }
+                }
+            },
+            "event": {
+                "info": {
+                    "text": "z".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1)
+                }
+            }
+        });
+        assert!(cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        for value in [
+            &raw["prompt"],
+            &raw["payload"]["properties"]["info"]["message"],
+            &raw["event"]["info"]["text"],
+        ] {
+            let text = value.as_str().expect("oversized value flattened to text");
+            assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+            assert!(text.ends_with('…'));
+        }
+        assert!(!cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        assert!(!cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::SessionStart
+        ));
     }
 
     /// Kimi Code's content-block `prompt` must flatten into the title
@@ -1779,6 +1966,202 @@ mod tests {
             serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":id}),
         );
         assert!(!env.body_excerpt.unwrap().contains("tool_call_id"));
+    }
+
+    #[test]
+    fn antigravity_native_file_and_search_tools_render_captured_content() {
+        for (tool, args, family) in [
+            (
+                "view_file",
+                serde_json::json!({"TargetFile": "src/main.rs"}),
+                "file",
+            ),
+            (
+                "replace_file_content",
+                serde_json::json!({"TargetFile": "src/main.rs"}),
+                "file",
+            ),
+            (
+                "list_dir",
+                serde_json::json!({"DirectoryPath": "src"}),
+                "search-list",
+            ),
+            (
+                "grep_search",
+                serde_json::json!({"SearchPath": "src"}),
+                "search-list",
+            ),
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "toolCall": {"name": tool, "args": args},
+                    "tool_response": "SENTINEL_CONTENT",
+                }),
+            );
+            let body = env.body_excerpt.unwrap();
+            assert!(
+                body.contains(&format!("tool_family: {family}")),
+                "tool: {tool}, body: {body}"
+            );
+            assert!(
+                body.contains("SENTINEL_CONTENT"),
+                "tool: {tool}, body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_edit_tools_capture_real_written_content() {
+        // Fixture shapes captured from a live antigravity-cli session. The hook
+        // never sends a top-level result; the written content lives in args.
+        let write_to_file = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "write_to_file",
+                    "args": {
+                        "CodeContent": "# Scratch Test File 09\n\nLine 1: first line\n",
+                        "Description": "Temporary scratch file",
+                        "Overwrite": true,
+                        "TargetFile": "/repo/scratch-test-09.md"
+                    }
+                }
+            }),
+        );
+        let body = write_to_file.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("Scratch Test File 09"));
+
+        let replace_file_content = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/1-visao.md",
+                        "TargetContent": "old line",
+                        "ReplacementContent": "new line REPLACED_SENTINEL",
+                        "Instruction": "Add debug test comment"
+                    }
+                }
+            }),
+        );
+        let body = replace_file_content.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("REPLACED_SENTINEL"));
+
+        let multi_replace = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "multi_replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/scratch-test-09.md",
+                        "Instruction": "Edit Line 1 and Line 4",
+                        "ReplacementChunks": [
+                            {
+                                "TargetContent": "Line 1: first line",
+                                "ReplacementContent": "Line 1: first line edited",
+                                "StartLine": 3,
+                                "EndLine": 3,
+                                "AllowMultiple": false
+                            },
+                            {
+                                "TargetContent": "Line 4: fourth line",
+                                "ReplacementContent": "Line 4: fourth line edited",
+                                "StartLine": 6,
+                                "EndLine": 6,
+                                "AllowMultiple": false
+                            }
+                        ]
+                    }
+                }
+            }),
+        );
+        let body = multi_replace.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("Line 1: first line edited"));
+        assert!(body.contains("Line 4: fourth line edited"));
+    }
+
+    #[test]
+    fn antigravity_failed_edit_prefers_error_over_attempted_content() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "error": "EDIT_FAILED_SENTINEL",
+                "toolCall": {
+                    "name": "replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/src/main.rs",
+                        "ReplacementContent": "CONTENT_WAS_NOT_WRITTEN"
+                    }
+                }
+            }),
+        );
+        let body = env.body_excerpt.unwrap();
+        assert!(body.contains("outcome: error"));
+        assert!(body.contains("EDIT_FAILED_SENTINEL"));
+        assert!(!body.contains("CONTENT_WAS_NOT_WRITTEN"));
+    }
+
+    #[test]
+    fn antigravity_generic_tools_and_unrelated_events_fail_closed() {
+        for tool in ["read_url_content", "read_resource", "call_mcp_tool"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "toolCall": {
+                        "name": tool,
+                        "args": {"message": "NESTED_ARGUMENT_SENTINEL"}
+                    },
+                    "tool_response": "UNPROVEN_OUTPUT_SENTINEL"
+                }),
+            );
+            assert_eq!(
+                env.body_excerpt.as_deref(),
+                Some("tool_family: unknown\noutcome: unknown")
+            );
+        }
+
+        let notification = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "notification".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "args": {"message": "NESTED_ARGUMENT_SENTINEL"}
+                }
+            }),
+        );
+        assert!(notification.body_excerpt.is_none());
     }
 
     #[test]

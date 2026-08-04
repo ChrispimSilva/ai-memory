@@ -13,13 +13,13 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
-mod auth;
 mod auth_bearer;
 mod cli;
 mod commands;
 mod config;
 mod http_client;
 mod logging;
+mod marker;
 mod process_guard;
 
 use cli::{Cli, Command};
@@ -81,6 +81,20 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Show(args) => {
+            let exit_code = commands::show::run(&config, args).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
+        Command::Continue(args) => {
+            let exit_code = commands::continue_session::run(&config, args).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Command::WorkstreamSearch(args) => commands::workstream_search::run(&config, args).await,
         Command::AuditContamination(args) => {
             commands::audit_contamination::run(&config, args).await
@@ -100,6 +114,7 @@ async fn main() -> Result<()> {
         // `HookDrain` is handled in the fast-path above (before config/tracing).
         Command::HookDrain(_args) => commands::hook::run_drain(Some(config.data_dir.clone())).await,
         Command::InstallMcp(args) => commands::install_mcp::run(&config, args),
+        Command::McpBridge(args) => commands::mcp_bridge::run(&config, args).await,
         Command::Commit(args) => commands::commit::run(&config, args).await,
         Command::Checkpoints(args) => commands::checkpoints::run(&config, args).await,
         Command::RestorePage(args) => commands::restore_page::run(&config, args).await,

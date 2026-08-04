@@ -42,10 +42,8 @@ enum RewriteOp {
     ZeroHooksJson,
     /// Kimi Code `[[hooks]]` rules inside config.toml.
     KimiCodeHooksToml,
-    /// Kiro CLI v3 standalone hooks file — `hooks` array entries whose
-    /// `name` carries the `ai-memory-` prefix (or whose command action
-    /// references ai-memory).
-    KiroCliV3HooksJson,
+    /// Kiro CLI v2 agent-config hooks with exact generated command signatures.
+    KiroCliV2HooksJson,
     /// MCP JSON config for one client shape.
     McpJson(McpClient),
     /// Codex TOML MCP config.
@@ -185,15 +183,6 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 HookConfigShape::NestedHooksKey,
             ),
         ]);
-        // Kiro CLI v2-engine agent configs embed hooks under the standard
-        // `hooks` key (flat command entries), so the same strip pass
-        // removes ours from every config in the agents directory while
-        // preserving third-party entries.
-        hook_files.extend(
-            install_hooks::list_kiro_cli_agent_configs(&install_hooks::kiro_cli_agents_dir()?)?
-                .into_iter()
-                .map(|path| (path, HookConfigShape::NestedHooksKey)),
-        );
         for (path, shape) in hook_files {
             if !path.exists() {
                 continue;
@@ -209,6 +198,26 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 path,
                 removal.removed_events,
                 RewriteOp::HooksJson(shape),
+            );
+        }
+
+        let mut kiro_configs =
+            install_hooks::list_kiro_cli_agent_configs(&install_hooks::kiro_cli_agents_dir()?)?;
+        let cwd = std::env::current_dir().context("getting CWD for Kiro hook removal")?;
+        kiro_configs.extend(install_hooks::list_kiro_cli_agent_configs(
+            &cwd.join(".kiro/agents"),
+        )?);
+        kiro_configs.sort();
+        kiro_configs.dedup();
+        for path in kiro_configs {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let removal = strip_kiro_cli_v2_hooks(&content)?;
+            push_rewrite(
+                &mut plan,
+                path,
+                removal.removed_events,
+                RewriteOp::KiroCliV2HooksJson,
             );
         }
 
@@ -248,19 +257,6 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 kimi_code,
                 removal.removed_events,
                 RewriteOp::KimiCodeHooksToml,
-            );
-        }
-
-        let kiro_v3 = install_hooks::kiro_cli_v3_hooks_path()?;
-        if kiro_v3.exists() {
-            let content = std::fs::read_to_string(&kiro_v3)
-                .with_context(|| format!("reading {}", kiro_v3.display()))?;
-            let removal = strip_kiro_cli_v3_hooks(&content)?;
-            push_rewrite(
-                &mut plan,
-                kiro_v3,
-                removal.removed_events,
-                RewriteOp::KiroCliV3HooksJson,
             );
         }
 
@@ -307,8 +303,10 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             AntigravityCli,
             Zero,
             VsCodeCopilot,
+            Zed,
             Devin,
             KimiCode,
+            KiroCli,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -494,7 +492,7 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
                         }
                         RewriteOp::ZeroHooksJson => strip_zero_hooks(&out)?.new_content,
                         RewriteOp::KimiCodeHooksToml => strip_kimi_code_hooks(&out)?.new_content,
-                        RewriteOp::KiroCliV3HooksJson => strip_kiro_cli_v3_hooks(&out)?.new_content,
+                        RewriteOp::KiroCliV2HooksJson => strip_kiro_cli_v2_hooks(&out)?.new_content,
                         RewriteOp::McpJson(client) => {
                             strip_mcp_json_client(&out, client, name, url)?.0
                         }
@@ -801,35 +799,37 @@ fn strip_zero_hooks(content: &str) -> Result<HookRemoval> {
     })
 }
 
-/// Remove ai-memory's entries from the Kiro CLI v3 standalone hooks file
-/// (`~/.kiro/hooks/ai-memory.json`). Install writes every entry with the
-/// `ai-memory-` name prefix, so the prefix is the primary ownership
-/// signature; a command action referencing ai-memory covers hand-edited
-/// entries. Non-ai-memory entries a user added to the same file survive,
-/// and the pinned `version` key is left alone (an empty `hooks` array is
-/// a valid v3 file).
-fn strip_kiro_cli_v3_hooks(content: &str) -> Result<HookRemoval> {
+fn strip_kiro_cli_v2_hooks(content: &str) -> Result<HookRemoval> {
     let mut removed_events = Vec::new();
     let new_content = mutate_json(content, |root| {
-        let Some(hooks) = root.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+        let Some(hooks) = root
+            .get_mut("hooks")
+            .and_then(|value| value.as_object_mut())
+        else {
             return Ok(());
         };
-        hooks.retain(|hook| {
-            let name = hook.get("name").and_then(|v| v.as_str());
-            let ours = name.is_some_and(|name| name.starts_with("ai-memory-"))
-                || hook
-                    .get("action")
-                    .and_then(|action| action.get("command"))
-                    .and_then(|command| command.as_str())
-                    .is_some_and(|command| {
-                        let lower = command.to_ascii_lowercase();
-                        lower.contains("ai-memory") || lower.contains("ai_memory")
-                    });
-            if ours {
-                removed_events.push(format!("kiro-cli-v3.{}", name.unwrap_or("<unnamed>")));
+        let events: Vec<String> = hooks.keys().cloned().collect();
+        for event in events {
+            let Some(entries) = hooks.get_mut(&event).and_then(|value| value.as_array_mut()) else {
+                continue;
+            };
+            let original_len = entries.len();
+            entries.retain(|entry| {
+                !entry
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(install_hooks::is_ai_memory_kiro_hook_command)
+            });
+            if entries.len() != original_len {
+                removed_events.push(event.clone());
             }
-            !ours
-        });
+            if entries.is_empty() {
+                hooks.remove(&event);
+            }
+        }
+        if hooks.is_empty() {
+            root.remove("hooks");
+        }
         Ok(())
     })?;
     Ok(HookRemoval {
@@ -1001,19 +1001,21 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::KimiCode
+        | McpClient::KiroCli
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
+        McpClient::Zed => Some(&["context_servers"]),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
     }
 }
 
 /// True when an MCP server entry is ai-memory's: its url/httpUrl/serverUrl
-/// equals the endpoint, or it is a `mcp-remote` stdio shim whose args contain
-/// the endpoint. The key/name alone is intentionally not enough: users may
-/// have unrelated entries named `ai-memory`, and uninstall must not remove
-/// them unless the endpoint also matches.
+/// equals the endpoint, or it is an ai-memory-owned / `mcp-remote` stdio
+/// bridge whose args contain the endpoint. The key/name alone is intentionally
+/// not enough: users may have unrelated entries named `ai-memory`, and
+/// uninstall must not remove them unless the endpoint also matches.
 fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, url: &str) -> bool {
     if name.is_some_and(|name| key != name) {
         return false;
@@ -1025,8 +1027,10 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
     }
     if let Some(args) = entry.get("args").and_then(|a| a.as_array()) {
         let has_remote = args.iter().any(|a| a.as_str() == Some("mcp-remote"));
+        let has_session_bridge = entry.get("command").and_then(|v| v.as_str()) == Some("ai-memory")
+            && args.iter().any(|a| a.as_str() == Some("mcp-bridge"));
         let has_url = args.iter().any(|a| a.as_str() == Some(url));
-        if has_remote && has_url {
+        if (has_remote || has_session_bridge) && has_url {
             return true;
         }
     }
@@ -1034,13 +1038,19 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
 }
 
 /// URL forms uninstall matches for `client`: the endpoint as given, plus
-/// for KimiCode the `flavor=moonshot` form install-mcp actually writes
-/// (`--mcp-url` keeps the unflavored default). Every other client keeps
-/// exact-match semantics.
+/// for clients whose installer appends a schema flavor, the form
+/// `install-mcp` actually writes (`--mcp-url` keeps the unflavored default).
+/// Every other client keeps exact-match semantics.
 fn mcp_url_candidates(client: McpClient, url: &str) -> Vec<String> {
     let mut candidates = vec![url.to_string()];
     if matches!(client, McpClient::KimiCode) {
         let flavored = install_mcp::moonshot_flavored_mcp_url(url);
+        if !candidates.contains(&flavored) {
+            candidates.push(flavored);
+        }
+    }
+    if matches!(client, McpClient::KiroCli) {
+        let flavored = install_mcp::bedrock_flavored_mcp_url(url);
         if !candidates.contains(&flavored) {
             candidates.push(flavored);
         }
@@ -1058,11 +1068,55 @@ fn strip_mcp_json_client(
     let mut new_content = content.to_string();
     let mut removed = Vec::new();
     for candidate in mcp_url_candidates(client, url) {
-        let (next, mut hits) = strip_mcp_json(&new_content, client, name, &candidate)?;
+        let (next, mut hits) = if matches!(client, McpClient::Zed) {
+            strip_zed_mcp_jsonc(&new_content, name, &candidate)?
+        } else {
+            strip_mcp_json(&new_content, client, name, &candidate)?
+        };
         new_content = next;
         removed.append(&mut hits);
     }
     Ok((new_content, removed))
+}
+
+/// Remove matching entries from Zed's JSONC settings while preserving user
+/// comments, trailing commas, and unrelated formatting.
+fn strip_zed_mcp_jsonc(
+    content: &str,
+    name: Option<&str>,
+    url: &str,
+) -> Result<(String, Vec<String>)> {
+    use jsonc_parser::ParseOptions;
+    use jsonc_parser::cst::CstRootNode;
+
+    let root = CstRootNode::parse(content, &ParseOptions::default())
+        .context("parsing Zed settings.json as JSONC")?;
+    let Some(settings) = root.object_value() else {
+        return Ok((content.to_string(), Vec::new()));
+    };
+    let Some(servers) = settings.object_value("context_servers") else {
+        return Ok((content.to_string(), Vec::new()));
+    };
+
+    let mut removed = Vec::new();
+    for property in servers.properties() {
+        let Some(key) = property.name().and_then(|key| key.decoded_value().ok()) else {
+            continue;
+        };
+        let Some(entry) = property.to_serde_value() else {
+            continue;
+        };
+        if mcp_entry_is_ours(&key, &entry, name, url) {
+            property.remove();
+            removed.push(key);
+        }
+    }
+    if servers.properties().is_empty()
+        && let Some(context_servers) = settings.get("context_servers")
+    {
+        context_servers.remove();
+    }
+    Ok((root.to_string(), removed))
 }
 
 /// Remove ai-memory's MCP server from a JSON client config. Returns
@@ -1779,6 +1833,23 @@ mod tests {
     }
 
     #[test]
+    fn strip_mcp_claude_code_session_aware_bridge() {
+        let content = r#"{"mcpServers":{"ai-memory":{"type":"stdio","command":"ai-memory","args":["mcp-bridge","--server-url","http://127.0.0.1:49374/mcp"]},"other":{"command":"other","args":["mcp-bridge","--server-url","http://127.0.0.1:49374/mcp"]}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::ClaudeCode,
+            None,
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(value["mcpServers"].get("ai-memory").is_none());
+        assert!(value["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
     fn strip_mcp_openclaw_nested_servers() {
         let content = r#"{"mcp":{"servers":{"ai-memory":{"url":"http://127.0.0.1:49374/mcp"}}}}"#;
         let (out, removed) = strip_mcp_json(
@@ -1808,6 +1879,37 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["servers"].get("ai-memory").is_none());
         assert!(v["servers"].get("other").is_some());
+    }
+
+    #[test]
+    fn strip_mcp_zed_context_servers_preserves_other_settings() {
+        let content = r#"{
+  // Keep this user comment.
+  "theme": "One Dark",
+  "context_servers": {
+    "ai-memory": { "url": "http://127.0.0.1:49374/mcp" },
+    // Keep this sibling comment.
+    "other": { "url": "http://x" },
+  },
+}"#;
+        let (out, removed) = strip_mcp_json_client(
+            content,
+            McpClient::Zed,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        assert!(out.contains("// Keep this user comment."));
+        assert!(out.contains("// Keep this sibling comment."));
+        let root =
+            jsonc_parser::cst::CstRootNode::parse(&out, &jsonc_parser::ParseOptions::default())
+                .unwrap();
+        let value = root.to_serde_value().unwrap();
+        assert_eq!(value["theme"], "One Dark");
+        assert!(value["context_servers"].get("ai-memory").is_none());
+        assert!(value["context_servers"].get("other").is_some());
     }
 
     #[test]
@@ -1957,7 +2059,7 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
     }
 
     #[test]
-    fn mcp_url_candidates_adds_moonshot_flavor_for_kimi_code_only() {
+    fn mcp_url_candidates_adds_client_schema_flavors() {
         assert_eq!(
             mcp_url_candidates(McpClient::KimiCode, "http://127.0.0.1:49374/mcp"),
             vec![
@@ -1971,6 +2073,13 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
                 "http://127.0.0.1:49374/mcp?flavor=moonshot"
             ),
             vec!["http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()]
+        );
+        assert_eq!(
+            mcp_url_candidates(McpClient::KiroCli, "https://memory.example/mcp"),
+            vec![
+                "https://memory.example/mcp".to_string(),
+                "https://memory.example/mcp?flavor=bedrock".to_string()
+            ]
         );
         assert_eq!(
             mcp_url_candidates(McpClient::Cursor, "http://127.0.0.1:49374/mcp"),
@@ -1994,6 +2103,22 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["mcpServers"].get("ai-memory").is_none());
         assert!(v["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn strip_mcp_kiro_matches_bedrock_flavored_url() {
+        let content = r#"{"mcpServers":{"ai-memory":{"url":"https://memory.example/mcp?flavor=bedrock"},"other":{"url":"https://other.example/mcp"}}}"#;
+        let (out, removed) = strip_mcp_json_client(
+            content,
+            McpClient::KiroCli,
+            Some("ai-memory"),
+            "https://memory.example/mcp",
+        )
+        .unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(value["mcpServers"].get("ai-memory").is_none());
+        assert!(value["mcpServers"].get("other").is_some());
     }
 
     /// The plan matched the flavored Kimi Code entry but apply dispatched

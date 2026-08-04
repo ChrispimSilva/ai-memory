@@ -6,18 +6,22 @@ use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ai_memory_core::{AgentKind, NewWorkstreamEvent, WorkstreamEventKind};
+use ai_memory_core::{
+    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NewWorkstreamEvent, WorkstreamEventKind,
+};
 use anyhow::{Context as _, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 
 use crate::ManagedHarness;
 
 const MAX_SCAN_FILES: usize = 50_000;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_NATIVE_SESSION_ID_BYTES: usize = 512;
+const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed workstream:";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,11 +49,18 @@ pub struct ExportedTranscript {
 struct FileCursor {
     path: String,
     offset: u64,
-    /// Hash of every committed byte through `offset`. Kimi Code can rewrite
-    /// its journal in place, so its adapter validates this prefix before
-    /// trusting the byte offset. Other JSONL adapters remain offset-only.
+    /// Hash of every committed byte through `offset`. Kimi Code and Grok can
+    /// rewrite their journals in place (Kimi on fork/compaction/resume, Grok
+    /// on rewind), so those adapters validate this prefix before trusting the
+    /// byte offset. Other JSONL adapters remain offset-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefix_sha256: Option<String>,
+}
+
+/// Harnesses whose JSONL journal can be rewritten in place, requiring
+/// prefix-validated cursors and content-hash record ids.
+const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
+    matches!(harness, ManagedHarness::Kimi | ManagedHarness::Grok)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -72,6 +83,17 @@ pub async fn export_transcript(
     }
     if harness == ManagedHarness::Crush {
         return export_crush(cwd, session_dir, native_session_id, source_cursor);
+    }
+    if harness == ManagedHarness::Antigravity {
+        // The conversation store keeps every step as an undocumented protobuf
+        // blob whose step-type enum is unversioned, so message text cannot be
+        // decoded without guessing at a schema that changes between `agy`
+        // releases. Conversation identity and workspace are read (they are
+        // stable fields observed in current metadata); the visible-event
+        // ledger for this harness comes from lifecycle-hook capture instead.
+        return Err(anyhow!(
+            "antigravity conversations expose no decodable transcript; this session's events come from hook capture"
+        ));
     }
     let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
         .ok_or_else(|| anyhow!("native transcript for {native_session_id} was not found"))?;
@@ -160,6 +182,26 @@ pub async fn list_native_sessions(
     Ok(sessions)
 }
 
+/// Check whether one exact native session still exists in the harness's
+/// read-only transcript store. `Ok(false)` means the resume target is
+/// definitely absent; store access or schema failures remain errors so callers
+/// do not mistake an unreadable store for a deleted session.
+pub fn native_session_exists(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<bool> {
+    if harness == ManagedHarness::OpenCode {
+        return Ok(opencode_updated(home, session_dir, native_session_id)?.is_some());
+    }
+    if harness == ManagedHarness::Crush {
+        return Ok(crush_updated(cwd, session_dir, native_session_id)?.is_some());
+    }
+    Ok(locate_session_file(harness, home, cwd, session_dir, native_session_id)?.is_some())
+}
+
 /// Wait briefly for buffered transcript writers to settle before importing.
 pub async fn wait_for_transcript_flush(
     harness: ManagedHarness,
@@ -204,7 +246,7 @@ fn export_jsonl(
     let mut file = File::open(path)
         .with_context(|| format!("opening native transcript {}", path.display()))?;
     let len = file.metadata()?.len();
-    let (start, mut kimi_prefix_hasher) = if harness == ManagedHarness::Kimi {
+    let (start, mut prefix_hasher) = if journal_rewrites_in_place(harness) {
         let validated = if let Some(cursor) = cursor.as_ref().filter(|cursor| cursor.offset <= len)
             && let Some(expected) = cursor.prefix_sha256.as_deref()
             && let Some(hasher) = hash_file_prefix(&mut file, cursor.offset)?
@@ -238,8 +280,8 @@ fn export_jsonl(
         if !line.ends_with(b"\n") {
             break;
         }
-        if harness == ManagedHarness::Kimi {
-            kimi_prefix_hasher.update(&line);
+        if journal_rewrites_in_place(harness) {
+            prefix_hasher.update(&line);
         }
         committed_offset = offset;
         let value: Value = match serde_json::from_slice(&line) {
@@ -252,10 +294,11 @@ fn export_jsonl(
                 continue;
             }
         };
-        let record_id = if harness == ManagedHarness::Kimi {
-            // Kimi wire records carry no envelope id, and the journal is
-            // rewritten wholesale on fork/compaction/resume — a byte-offset
-            // id would silently change meaning. Hashing the raw line keeps
+        let record_id = if journal_rewrites_in_place(harness) {
+            // Kimi wire records and Grok chat-history records carry no
+            // envelope id, and both journals can be rewritten wholesale (Kimi
+            // on fork/compaction/resume, Grok on rewind) — a byte-offset id
+            // would silently change meaning. Hashing the raw line keeps
             // record ids (and therefore server-side event dedup) stable
             // across rewrites.
             let raw = line.strip_suffix(b"\n").unwrap_or(&line);
@@ -293,7 +336,14 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
-            ManagedHarness::OpenCode | ManagedHarness::Crush => {
+            ManagedHarness::Grok => parse_grok(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
+            ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Antigravity => {
                 return Err(anyhow!(
                     "{} transcripts must use their SQLite adapter",
                     harness.as_str()
@@ -309,8 +359,8 @@ fn export_jsonl(
         source_cursor: Some(serde_json::to_string(&FileCursor {
             path: path.to_string_lossy().into_owned(),
             offset: committed_offset,
-            prefix_sha256: (harness == ManagedHarness::Kimi)
-                .then(|| format!("{:x}", kimi_prefix_hasher.finalize())),
+            prefix_sha256: journal_rewrites_in_place(harness)
+                .then(|| format!("{:x}", prefix_hasher.finalize())),
         })?),
         events,
         losses: deduplicate_losses(losses),
@@ -911,6 +961,127 @@ fn annotate_kimi_subagents(path: &Path, losses: &mut Vec<String>) {
     }
 }
 
+/// Grok chat history (`<session-dir>/chat_history.jsonl`): flat records
+/// `{type, ...}`. `system` carries the private system prompt and `reasoning`
+/// carries encrypted hidden reasoning — neither may reach the ledger. Tool
+/// calls ride on the `assistant` record's `tool_calls` array and pair with
+/// separate `tool_result` records; `backend_tool_call` records server-side
+/// tools such as web search. Unknown record types are ignored so newer Grok
+/// versions stay forward-compatible.
+fn parse_grok(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let record_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match record_type {
+        "system" => {
+            losses.push("Grok system prompt records were intentionally excluded".into());
+        }
+        "reasoning" => {
+            losses.push("Grok hidden reasoning was intentionally excluded".into());
+        }
+        "user" => {
+            parse_content_blocks(
+                AgentKind::Grok,
+                session,
+                record_id,
+                "user",
+                value.get("content"),
+                timestamp(value),
+                events,
+                losses,
+            );
+        }
+        "assistant" => {
+            let block_count = if let Some(text) = value.get("content").and_then(Value::as_str) {
+                push_event(
+                    events,
+                    AgentKind::Grok,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    text,
+                    timestamp(value),
+                    json!({}),
+                );
+                1
+            } else {
+                0
+            };
+            let tool_calls = value
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for (index, call) in tool_calls.iter().enumerate() {
+                let name = first_string(call, &["name"]).unwrap_or("tool");
+                // `arguments` is a JSON string; re-serialize it compact when
+                // it parses, mirroring parse_codex's tool-call shape.
+                let arguments = call
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .map(|raw| match serde_json::from_str::<Value>(raw) {
+                        Ok(parsed) => compact_json(&parsed),
+                        Err(_) => raw.to_string(),
+                    })
+                    .unwrap_or_default();
+                push_event(
+                    events,
+                    AgentKind::Grok,
+                    session,
+                    record_id,
+                    block_count + index,
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    &format!("{name}: {arguments}"),
+                    timestamp(value),
+                    json!({"tool": name}),
+                );
+            }
+        }
+        "tool_result" => {
+            let body = value.get("content").map(value_text).unwrap_or_default();
+            push_event(
+                events,
+                AgentKind::Grok,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolResult,
+                Some("tool"),
+                &body,
+                timestamp(value),
+                json!({}),
+            );
+        }
+        "backend_tool_call" => {
+            let kind = value.get("kind").unwrap_or(&Value::Null);
+            let tool = first_string(kind, &["tool_type"]).unwrap_or("backend_tool");
+            let action = kind.get("action").map(compact_json).unwrap_or_default();
+            push_event(
+                events,
+                AgentKind::Grok,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolCall,
+                Some("assistant"),
+                &format!("{tool}: {action}"),
+                timestamp(value),
+                json!({"tool": tool}),
+            );
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_content_blocks(
     agent: AgentKind,
@@ -991,6 +1162,13 @@ fn parse_content_blocks(
             }
             "tool_result" | "toolResult" => {
                 let body = block.get("content").map(value_text).unwrap_or_default();
+                if claude_managed_packet_echo(agent, &body) {
+                    losses.push(
+                        "Claude managed workstream delivery packets were intentionally excluded"
+                            .into(),
+                    );
+                    continue;
+                }
                 push_event(
                     events,
                     agent,
@@ -1015,6 +1193,15 @@ fn parse_content_blocks(
     }
 }
 
+fn claude_managed_packet_echo(agent: AgentKind, body: &str) -> bool {
+    if agent != AgentKind::ClaudeCode {
+        return false;
+    }
+    let body = body.trim_start();
+    body.starts_with(MANAGED_WORKSTREAM_PACKET_MARKER)
+        || body.starts_with(LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX)
+}
+
 fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
     if role != "user" {
         return false;
@@ -1028,6 +1215,17 @@ fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
                 || trimmed.starts_with("<INSTRUCTIONS>")
         }
         AgentKind::ClaudeCode => trimmed.starts_with("<system-reminder>"),
+        // Grok stores harness scaffolding inside `user` records rather than a
+        // separate record type: an environment block, then Claude-style
+        // reminders carrying project instructions, the skills catalogue, and
+        // the connected MCP servers. A single session's reminders measured
+        // 42KB against 270 bytes of real input, so importing them both leaks
+        // harness internals into the portable ledger and evicts real
+        // conversation from the startup packet budget. Genuine input arrives
+        // wrapped in `<user_query>`.
+        AgentKind::Grok => {
+            trimmed.starts_with("<user_info>") || trimmed.starts_with("<system-reminder>")
+        }
         _ => false,
     }
 }
@@ -1376,6 +1574,14 @@ fn locate_session_file(
     id: &str,
 ) -> Result<Option<PathBuf>> {
     let root = session_root(harness, home, session_dir);
+    if harness == ManagedHarness::Antigravity {
+        // The conversation id is the file name, so no scan is ever needed.
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let exact = root.join(format!("{id}.db"));
+        return Ok(exact.is_file().then_some(exact));
+    }
     if harness == ManagedHarness::Claude {
         let encoded = cwd.to_string_lossy().replace('/', "-");
         let exact = root.join(encoded).join(format!("{id}.jsonl"));
@@ -1412,6 +1618,12 @@ fn locate_session_file(
 }
 
 fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
+    if harness == ManagedHarness::Grok {
+        // Only the conversation journal. `events.jsonl`, `updates.jsonl`, and
+        // `rewind_points.jsonl` in the same session directory carry harness
+        // internals and are excluded.
+        return path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl");
+    }
     if harness == ManagedHarness::Kimi {
         // Only the main agent's journal: `agents/main/wire.jsonl`. Subagent
         // wire journals and any other *.jsonl in the store are excluded.
@@ -1421,6 +1633,10 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .and_then(|dir| dir.file_name())
                 .and_then(|name| name.to_str())
                 == Some("main");
+    }
+    if harness == ManagedHarness::Antigravity {
+        // One SQLite database per conversation, named by its id.
+        return path.extension().is_some_and(|ext| ext == "db");
     }
     path.extension().is_some_and(|ext| ext == "jsonl")
         || matches!(harness, ManagedHarness::Pi | ManagedHarness::Omp) && temporary_transcript(path)
@@ -1437,6 +1653,12 @@ fn temporary_transcript(path: &Path) -> bool {
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::Kimi {
         return kimi_session_header(path);
+    }
+    if harness == ManagedHarness::Grok {
+        return grok_session_header(path);
+    }
+    if harness == ManagedHarness::Antigravity {
+        return antigravity_session_header(path);
     }
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = String::new();
@@ -1464,7 +1686,11 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
                 value.get("id").and_then(Value::as_str),
                 value.get("cwd").and_then(Value::as_str),
             ),
-            ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Kimi => (None, None),
+            ManagedHarness::OpenCode
+            | ManagedHarness::Crush
+            | ManagedHarness::Kimi
+            | ManagedHarness::Grok
+            | ManagedHarness::Antigravity => (None, None),
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
             return Ok(Some((id.to_string(), PathBuf::from(cwd))));
@@ -1496,6 +1722,154 @@ fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
+}
+
+/// Grok sessions are self-describing in `<session-dir>/summary.json`
+/// (`info.id` + `info.cwd`). The chat-history journal carries no session id or
+/// cwd, and the bucket directory name is a URL-encoded cwd that is never
+/// parsed — recorded metadata is the only accepted checkout identifier.
+/// Missing/invalid metadata means the session is unusable for checkout
+/// matching, not an error.
+fn grok_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(session_dir) = path.parent() else {
+        return Ok(None);
+    };
+    let Ok(raw) = fs::read_to_string(session_dir.join("summary.json")) else {
+        return Ok(None);
+    };
+    let Ok(summary) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(None);
+    };
+    let info = summary.get("info").unwrap_or(&Value::Null);
+    let (Some(id), Some(cwd)) = (
+        info.get("id").and_then(Value::as_str),
+        info.get("cwd").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((id.to_string(), PathBuf::from(cwd))))
+}
+
+/// Antigravity keeps one SQLite database per conversation, named
+/// `<conversation-id>.db`, so the id comes from the file name. The workspace it
+/// was opened on lives in `trajectory_metadata_blob`, a protobuf message whose
+/// first field holds a nested message whose first field is the workspace
+/// `file://` URI. Only those two fields are read: every other field is a step
+/// payload with an undocumented, unversioned schema.
+///
+/// A database that does not carry both is unusable for checkout matching, not
+/// an error — the conversations directory may hold databases from an `agy`
+/// version whose metadata is shaped differently.
+fn antigravity_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    if !valid_native_session_id(id) || Uuid::parse_str(id).is_err() {
+        return Ok(None);
+    }
+    let Ok(connection) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Ok(None);
+    };
+    let blob = connection.query_row(
+        "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    );
+    let Ok(blob) = blob else {
+        return Ok(None);
+    };
+    let Some(workspace) = protobuf_field(&blob, 1)
+        .and_then(|nested| protobuf_field(nested, 1))
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(path_from_file_uri)
+    else {
+        return Ok(None);
+    };
+    Ok(Some((id.to_string(), workspace)))
+}
+
+/// Bytes of the first length-delimited field numbered `field`, or `None` when
+/// the message does not contain one. Non-matching fields are skipped by wire
+/// type; an unknown wire type ends the walk rather than guessing a length.
+fn protobuf_field(message: &[u8], field: u64) -> Option<&[u8]> {
+    let mut cursor = 0usize;
+    while cursor < message.len() {
+        let (key, used) = protobuf_varint(&message[cursor..])?;
+        cursor += used;
+        match key & 0b111 {
+            0 => cursor += protobuf_varint(&message[cursor..])?.1,
+            1 => cursor = cursor.checked_add(8)?,
+            2 => {
+                let (length, used) = protobuf_varint(&message[cursor..])?;
+                cursor += used;
+                let end = cursor.checked_add(usize::try_from(length).ok()?)?;
+                let bytes = message.get(cursor..end)?;
+                if key >> 3 == field {
+                    return Some(bytes);
+                }
+                cursor = end;
+            }
+            5 => cursor = cursor.checked_add(4)?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Decode one base-128 varint, returning its value and the bytes consumed.
+fn protobuf_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for (index, byte) in bytes.iter().take(10).enumerate() {
+        if index == 9 && *byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Some((value, index + 1));
+        }
+    }
+    None
+}
+
+/// Local path behind a `file://` URI, or `None` for any other scheme.
+///
+/// Windows records `file:///C:/dir`, whose leading slash is part of the URI
+/// grammar and not of the path; POSIX records `file:///home/dir`, where it is.
+/// The drive-letter shape tells them apart without a `#[cfg]` split, so a
+/// database copied between platforms still parses.
+fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let rest = percent_decode(uri.strip_prefix("file://")?);
+    let bytes = rest.as_bytes();
+    let drive_prefixed = bytes.first() == Some(&b'/')
+        && bytes.get(2) == Some(&b':')
+        && bytes.get(1).is_some_and(u8::is_ascii_alphabetic);
+    let path = if drive_prefixed { &rest[1..] } else { &rest };
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Decode `%XX` escapes; invalid escapes are kept verbatim so a path that was
+/// never encoded survives unchanged.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(hex) = bytes.get(index + 1..index + 3)
+            && let Ok(hex) = std::str::from_utf8(hex)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn discover_opencode(
@@ -1685,6 +2059,8 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Crush => home.join(".crush"),
         ManagedHarness::Omp => home.join(".omp/agent/sessions"),
         ManagedHarness::Kimi => home.join(".kimi-code/sessions"),
+        ManagedHarness::Grok => home.join(".grok/sessions"),
+        ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
     }
 }
 
@@ -1842,9 +2218,14 @@ mod tests {
                         "{}\n",
                         json!({"type":"session","id":"other-id","cwd":other})
                     ),
-                    // Kimi's header lives in state.json, not the journal;
-                    // covered by kimi_discovery_matches_checkout_via_state_json.
-                    ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Kimi => {
+                    // Kimi's header lives in state.json and Grok's in
+                    // summary.json, not the journal; covered by their own
+                    // discovery tests.
+                    ManagedHarness::OpenCode
+                    | ManagedHarness::Crush
+                    | ManagedHarness::Kimi
+                    | ManagedHarness::Grok
+                    | ManagedHarness::Antigravity => {
                         unreachable!()
                     }
                 },
@@ -1854,10 +2235,19 @@ mod tests {
             let sessions = list_native_sessions(harness, temp.path(), &cwd, Some(&root), 8)
                 .await
                 .unwrap();
+            let expected_id = format!("{}-id", harness.as_str());
             assert_eq!(sessions.len(), 1, "{} candidates", harness.as_str());
-            assert_eq!(
-                sessions[0].native_session_id,
-                format!("{}-id", harness.as_str())
+            assert_eq!(sessions[0].native_session_id, expected_id);
+            assert!(
+                native_session_exists(harness, temp.path(), &cwd, Some(&root), &expected_id)
+                    .unwrap(),
+                "{} existing session",
+                harness.as_str()
+            );
+            assert!(
+                !native_session_exists(harness, temp.path(), &cwd, Some(&root), "missing").unwrap(),
+                "{} missing session",
+                harness.as_str()
             );
         }
     }
@@ -1907,6 +2297,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["newer", "older"]
         );
+        assert!(
+            native_session_exists(
+                ManagedHarness::OpenCode,
+                temp.path(),
+                &cwd,
+                Some(&db_root),
+                "newer"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::OpenCode,
+                temp.path(),
+                &cwd,
+                Some(&db_root),
+                "missing"
+            )
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1952,6 +2362,13 @@ mod tests {
                 .map(|candidate| candidate.native_session_id.as_str())
                 .collect::<Vec<_>>(),
             ["newer", "older"]
+        );
+        assert!(
+            native_session_exists(ManagedHarness::Crush, temp.path(), &cwd, None, "newer").unwrap()
+        );
+        assert!(
+            !native_session_exists(ManagedHarness::Crush, temp.path(), &cwd, None, "missing")
+                .unwrap()
         );
 
         let first = export_crush(&cwd, None, "newer", None).unwrap();
@@ -2022,6 +2439,46 @@ mod tests {
         assert_eq!(events[0].kind, WorkstreamEventKind::ToolCall);
         assert_eq!(events[1].content, "Done");
         assert_eq!(losses.len(), 1);
+    }
+
+    #[test]
+    fn claude_adapter_excludes_read_back_managed_packets_only_at_the_origin() {
+        let value = json!({
+            "type":"user",
+            "uuid":"record",
+            "message":{"role":"user","content":[
+                {
+                    "type":"tool_result",
+                    "content":format!(
+                        "\n  {MANAGED_WORKSTREAM_PACKET_MARKER}\n> **ai-memory managed workstream: default**\nprivate packet"
+                    )
+                },
+                {
+                    "type":"tool_result",
+                    "content":"  > **ai-memory managed workstream: default**\nlegacy packet"
+                },
+                {
+                    "type":"tool_result",
+                    "content":format!(
+                        "ordinary file output\nmentions {MANAGED_WORKSTREAM_PACKET_MARKER} later"
+                    )
+                }
+            ]}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&value, "session", "record", &mut events, &mut losses);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolResult);
+        assert!(events[0].content.starts_with("ordinary file output"));
+        assert_eq!(
+            losses,
+            [
+                "Claude managed workstream delivery packets were intentionally excluded",
+                "Claude managed workstream delivery packets were intentionally excluded"
+            ]
+        );
     }
 
     #[test]
@@ -2297,6 +2754,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.as_deref(), Some(wire_b.as_path()));
+        assert!(
+            native_session_exists(
+                ManagedHarness::Kimi,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "session_aaa"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Kimi,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "missing"
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -2534,5 +3011,435 @@ mod tests {
         parse_kimi(&value, "session", "record", &mut events, &mut losses);
         assert!(events.is_empty());
         assert_eq!(losses, ["Kimi system messages were intentionally excluded"]);
+    }
+
+    /// Build a two-bucket grok store: `session_a` checked out at `cwd`,
+    /// `session_b` at `other`. Returns `(root, chat_a)`.
+    fn grok_store_fixture(cwd: &Path, other: &Path) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        for (bucket, id, work_dir) in [
+            ("%2Fother%2Fencoded", "019f-session-aaa", cwd),
+            ("%2Frepo%2Fencoded", "019f-session-bbb", other),
+        ] {
+            let session_dir = root.path().join(bucket).join(id);
+            fs::create_dir_all(&session_dir).unwrap();
+            fs::write(
+                session_dir.join("summary.json"),
+                json!({"info": {"id": id, "cwd": work_dir}}).to_string(),
+            )
+            .unwrap();
+        }
+        let chat_a = root
+            .path()
+            .join("%2Fother%2Fencoded/019f-session-aaa/chat_history.jsonl");
+        (root, chat_a)
+    }
+
+    #[tokio::test]
+    async fn grok_discovery_matches_checkout_via_summary_json_not_bucket_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        // Bucket names deliberately contradict the recorded cwd, so only
+        // summary.json metadata can produce a correct match.
+        let (root, chat_a) = grok_store_fixture(&cwd, &other);
+        fs::write(&chat_a, "{\"type\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        let chat_b = root
+            .path()
+            .join("%2Frepo%2Fencoded/019f-session-bbb/chat_history.jsonl");
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&chat_b, "{\"type\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        // Sibling harness internals must never count as transcripts.
+        fs::write(chat_a.parent().unwrap().join("events.jsonl"), "{}\n").unwrap();
+
+        let sessions = list_native_sessions(
+            ManagedHarness::Grok,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, "019f-session-aaa");
+
+        let found = locate_session_file(
+            ManagedHarness::Grok,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            "019f-session-aaa",
+        )
+        .unwrap();
+        assert_eq!(found.as_deref(), Some(chat_a.as_path()));
+        assert!(
+            native_session_exists(
+                ManagedHarness::Grok,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "019f-session-aaa"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Grok,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "missing"
+            )
+            .unwrap()
+        );
+        assert!(!transcript_file(
+            ManagedHarness::Grok,
+            &chat_a.parent().unwrap().join("events.jsonl")
+        ));
+    }
+
+    #[test]
+    fn grok_adapter_excludes_private_records_and_keeps_visible_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("chat_history.jsonl");
+        let records = [
+            json!({"type":"system","content":"private system prompt"}),
+            json!({"type":"user","content":[{"type":"text","text":"<user_info>\nOS: linux\n</user_info>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"fix the bug"}]}),
+            json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque","status":"done"}),
+            json!({"type":"assistant","content":"reading the file","model_id":"grok-4.5",
+                   "tool_calls":[{"id":"call-1","name":"read_file","arguments":"{\"target_file\":\"a.rs\"}"}]}),
+            json!({"type":"tool_result","tool_call_id":"call-1","content":"fn main() {}"}),
+            json!({"type":"backend_tool_call","kind":{"tool_type":"web_search","action":{"type":"search","query":"rust"}}}),
+        ];
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+
+        let export = export_jsonl(ManagedHarness::Grok, &path, "019f-session", None).unwrap();
+        let contents: Vec<_> = export
+            .events
+            .iter()
+            .map(|event| (event.kind, event.content.as_str()))
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                (WorkstreamEventKind::Message, "fix the bug"),
+                (WorkstreamEventKind::Message, "reading the file"),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "read_file: {\"target_file\":\"a.rs\"}"
+                ),
+                (WorkstreamEventKind::ToolResult, "fn main() {}"),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "web_search: {\"type\":\"search\",\"query\":\"rust\"}"
+                ),
+            ]
+        );
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("system prompt records"))
+        );
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("hidden reasoning"))
+        );
+        let cursor: FileCursor = serde_json::from_str(&export.source_cursor.unwrap()).unwrap();
+        assert!(cursor.prefix_sha256.is_some());
+    }
+
+    /// Grok keeps harness scaffolding in `user` records, unlike Kimi, which
+    /// isolates it in `config.update` records the adapter never reads. A real
+    /// session measured 42KB of reminders (skills catalogue plus connected MCP
+    /// servers) against 270 bytes of genuine input, which both leaked harness
+    /// internals into the ledger and evicted real conversation from the
+    /// startup packet budget.
+    #[test]
+    fn grok_adapter_excludes_injected_system_reminders_from_user_records() {
+        let records = [
+            json!({"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: linux\n</user_info>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context\n</system-reminder>"}]}),
+            // Indented in real sessions, so the check must tolerate leading space.
+            json!({"type":"user","content":[{"type":"text","text":"  <system-reminder> The following skills are available for use: ego-browser…</system-reminder>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"<system-reminder>\nMCP servers connected: - ai-memory (16 tools)\n</system-reminder>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"<user_query>\nfix the bug\n</user_query>"}]}),
+        ];
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            parse_grok(
+                record,
+                "019f-session",
+                &format!("record-{index}"),
+                &mut events,
+                &mut losses,
+            );
+        }
+
+        let contents: Vec<_> = events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            ["<user_query>\nfix the bug\n</user_query>"],
+            "only genuine user input may reach the ledger"
+        );
+    }
+
+    #[test]
+    fn grok_export_resets_cursor_after_an_in_place_journal_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("chat_history.jsonl");
+        fs::write(&path, "{\"type\":\"user\",\"content\":\"one\"}\n").unwrap();
+        let first = export_jsonl(ManagedHarness::Grok, &path, "019f-session", None).unwrap();
+        assert_eq!(first.events.len(), 1);
+
+        // Appending keeps the validated prefix and resumes incrementally.
+        let mut appended = fs::read(&path).unwrap();
+        appended.extend(b"{\"type\":\"user\",\"content\":\"two\"}\n");
+        fs::write(&path, appended).unwrap();
+        let second = export_jsonl(
+            ManagedHarness::Grok,
+            &path,
+            "019f-session",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].content, "two");
+
+        // A rewind rewrites the journal in place: the stored prefix no longer
+        // matches, so the export replays from the start with stable event ids.
+        fs::write(
+            &path,
+            "{\"type\":\"user\",\"content\":\"one\"}\n{\"type\":\"assistant\",\"content\":\"rewound\"}\n",
+        )
+        .unwrap();
+        let third = export_jsonl(
+            ManagedHarness::Grok,
+            &path,
+            "019f-session",
+            second.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(third.events.len(), 2);
+        assert_eq!(
+            third.events[0].event_id, first.events[0].event_id,
+            "identical lines must keep identical event ids across rewrites"
+        );
+    }
+
+    fn push_protobuf_varint(output: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            output.push(if value == 0 { byte } else { byte | 0x80 });
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn push_protobuf_bytes(output: &mut Vec<u8>, field: u64, value: &[u8]) {
+        push_protobuf_varint(output, (field << 3) | 2);
+        push_protobuf_varint(output, u64::try_from(value.len()).unwrap());
+        output.extend_from_slice(value);
+    }
+
+    /// Build the two protobuf layers observed in `agy` v1.1.7 metadata. The
+    /// unrelated fields ensure discovery searches by field number instead of
+    /// assuming the workspace URI is the entire message.
+    fn antigravity_metadata(uri: &str) -> Vec<u8> {
+        let mut nested = Vec::new();
+        push_protobuf_varint(&mut nested, 2 << 3);
+        push_protobuf_varint(&mut nested, 7);
+        push_protobuf_bytes(&mut nested, 1, uri.as_bytes());
+        push_protobuf_bytes(&mut nested, 4, b"fixture-metadata");
+
+        let mut outer = Vec::new();
+        push_protobuf_bytes(&mut outer, 3, b"unrelated");
+        push_protobuf_bytes(&mut outer, 1, &nested);
+        push_protobuf_varint(&mut outer, 5 << 3);
+        push_protobuf_varint(&mut outer, 1);
+        outer
+    }
+
+    /// `file://` URI for a local path, the way `agy` records its workspace.
+    /// Windows paths carry a drive letter and need the extra leading slash.
+    fn file_uri(path: &Path) -> String {
+        let text = path.to_string_lossy().replace('\\', "/");
+        if text.starts_with('/') {
+            format!("file://{text}")
+        } else {
+            format!("file:///{text}")
+        }
+    }
+
+    fn write_antigravity_conversation(root: &Path, id: &str, uri: &str) -> PathBuf {
+        let path = root.join(format!("{id}.db"));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE trajectory_metadata_blob (id text DEFAULT \"main\", data blob, PRIMARY KEY (id))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+                params![antigravity_metadata(uri)],
+            )
+            .unwrap();
+        path
+    }
+
+    /// The conversation id is the file name and the workspace comes from the
+    /// metadata blob, so a checkout only sees its own conversations. The long
+    /// component forces both protobuf layers to use multi-byte varint lengths.
+    #[tokio::test]
+    async fn antigravity_lists_only_conversations_from_this_workspace() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.parent().unwrap().join("outside.db"), b"outside").unwrap();
+        let cwd = temp.path().join(format!("checkout-{}", "x".repeat(140)));
+        fs::create_dir_all(&cwd).unwrap();
+        let mine = "a0d5ac62-2501-4780-b783-76d159c56cb3";
+        let theirs = "9576275f-7c4e-4709-b372-22d1ad2a0af8";
+        write_antigravity_conversation(&root, mine, &file_uri(&cwd));
+        write_antigravity_conversation(&root, theirs, "file:///somewhere/else");
+
+        let sessions =
+            list_native_sessions(ManagedHarness::Antigravity, temp.path(), &cwd, None, 8)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|s| s.native_session_id.as_str())
+                .collect::<Vec<_>>(),
+            [mine]
+        );
+        assert!(
+            native_session_exists(ManagedHarness::Antigravity, temp.path(), &cwd, None, mine)
+                .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Antigravity,
+                temp.path(),
+                &cwd,
+                None,
+                "11111111-1111-1111-1111-111111111111"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Antigravity,
+                temp.path(),
+                &cwd,
+                None,
+                "../outside"
+            )
+            .unwrap()
+        );
+    }
+
+    /// A database whose metadata is shaped differently — an older or newer
+    /// `agy` — is skipped, never an error: it would otherwise take the whole
+    /// listing down with it.
+    #[tokio::test]
+    async fn antigravity_skips_conversations_without_readable_metadata() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&root).unwrap();
+        let cwd = temp.path().join("checkout");
+        fs::create_dir_all(&cwd).unwrap();
+        // Right name, no metadata table at all.
+        Connection::open(root.join("53fb8b64-76c5-4fd8-91d2-dfabe2be4188.db")).unwrap();
+        fs::write(root.join("not-a-database.db"), b"garbage").unwrap();
+
+        let sessions =
+            list_native_sessions(ManagedHarness::Antigravity, temp.path(), &cwd, None, 8)
+                .await
+                .unwrap();
+
+        assert!(sessions.is_empty());
+    }
+
+    /// Every step payload is an undocumented protobuf blob, so the ledger for
+    /// this harness comes from hook capture. The failure has to say so.
+    #[tokio::test]
+    async fn antigravity_transcript_export_explains_why_it_is_unavailable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let error = export_transcript(
+            ManagedHarness::Antigravity,
+            temp.path(),
+            temp.path(),
+            None,
+            "a0d5ac62-2501-4780-b783-76d159c56cb3",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("hook capture"), "{error}");
+    }
+
+    #[test]
+    fn file_uris_decode_on_both_platform_shapes() {
+        assert_eq!(
+            path_from_file_uri("file:///C:/Users/me/Projetos"),
+            Some(PathBuf::from("C:/Users/me/Projetos"))
+        );
+        assert_eq!(
+            path_from_file_uri("file:///home/me/projects"),
+            Some(PathBuf::from("/home/me/projects"))
+        );
+        assert_eq!(
+            path_from_file_uri("file:///C:/Users/me/My%20Projects"),
+            Some(PathBuf::from("C:/Users/me/My Projects"))
+        );
+        // A stray percent that is not an escape must not eat the next bytes.
+        assert_eq!(
+            path_from_file_uri("file:///tmp/100%done"),
+            Some(PathBuf::from("/tmp/100%done"))
+        );
+        assert_eq!(path_from_file_uri("https://example.com/x"), None);
+        assert_eq!(path_from_file_uri("file://"), None);
+    }
+
+    #[test]
+    fn protobuf_walk_skips_other_fields_and_wire_types() {
+        // field 1 varint, field 2 length-delimited, field 3 fixed64,
+        // then field 4 length-delimited — only field 4 must come back.
+        let mut message = vec![0x08, 0x96, 0x01];
+        message.extend_from_slice(&[0x12, 0x02, b'h', b'i']);
+        message.extend_from_slice(&[0x19, 0, 0, 0, 0, 0, 0, 0, 0]);
+        message.extend_from_slice(&[0x22, 0x03, b'y', b'e', b's']);
+
+        assert_eq!(protobuf_field(&message, 4), Some(&b"yes"[..]));
+        assert_eq!(protobuf_field(&message, 2), Some(&b"hi"[..]));
+        // A varint field is not length-delimited, so it is never returned.
+        assert_eq!(protobuf_field(&message, 1), None);
+        assert_eq!(protobuf_field(&message, 9), None);
+        // Truncated input ends the walk instead of panicking on a slice.
+        assert_eq!(protobuf_field(&[0x22, 0x10, b'x'], 4), None);
+        // A ten-byte varint may carry only one payload bit in its final byte.
+        assert_eq!(protobuf_varint(&[0xff; 10]), None);
     }
 }

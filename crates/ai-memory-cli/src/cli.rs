@@ -34,8 +34,15 @@ pub enum Command {
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
     /// Launch an agent in an opt-in, cross-harness managed workstream.
-    /// Every argument after the harness name is forwarded unchanged.
+    /// Native arguments are forwarded except exact wrapper flags such as
+    /// `--yolo` and `--fresh`.
     Run(RunArgs),
+    /// Pick a local project and installed harness, then launch from that
+    /// checkout. Removes the `cd` step `run` requires.
+    Show(ShowArgs),
+    /// Resume the most recently launched managed checkout from anywhere,
+    /// without `cd` and without picking from a list.
+    Continue(ContinueArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
     /// Audit the store for likely cross-project contamination (read-only,
@@ -81,6 +88,9 @@ pub enum Command {
     /// Current values are listed under `--client`; see docs/mcp-install.md
     /// for the full guide.
     InstallMcp(InstallMcpArgs),
+    /// Internal stdio-to-HTTP MCP bridge for session-aware Claude Code installs.
+    #[command(hide = true)]
+    McpBridge(McpBridgeArgs),
     /// Stage + commit the wiki tree under git.
     Commit(CommitArgs),
     /// List recent wiki git checkpoints for recovery.
@@ -99,7 +109,7 @@ pub enum Command {
     AutoImproveReport(AutoImproveReportArgs),
     /// Run auto-improvement for one completed session.
     AutoImprove(AutoImproveArgs),
-    /// Manually finalize the latest open Codex session for this project.
+    /// Manually finalize the latest open session for one agent in this project.
     FinalizeSession(FinalizeSessionArgs),
     /// Review, approve, or reject staged auto-improvement proposals.
     PendingWrites(PendingWritesArgs),
@@ -170,9 +180,10 @@ pub enum Command {
 #[derive(Debug, Args)]
 #[command(trailing_var_arg = true)]
 pub struct RunArgs {
-    /// Workspace containing the managed workstream.
-    #[arg(long, default_value = "default")]
-    pub workspace: String,
+    /// Workspace containing the managed workstream. Defaults to the nearest
+    /// `.ai-memory.toml` marker's `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project override. Defaults to the current repository project.
     #[arg(long)]
     pub project: Option<String>,
@@ -189,6 +200,10 @@ pub struct RunArgs {
     /// equivalent dangerous-mode option.
     #[arg(long)]
     pub yolo: bool,
+    /// Start a new native session in the selected workstream instead of
+    /// resuming or adopting an existing harness session.
+    #[arg(long)]
+    pub fresh: bool,
     /// Agent harness to launch. When omitted, continue the newest managed or
     /// checkout-local session among the auto-detected harnesses.
     #[arg(value_enum)]
@@ -219,6 +234,58 @@ pub enum RunHarnessChoice {
     /// Moonshot AI Kimi Code.
     #[value(name = "kimi", alias = "kimi-code", alias = "kimi-cli")]
     Kimi,
+    /// Grok Build CLI (xAI).
+    #[value(alias = "grok-build")]
+    Grok,
+    /// Google Antigravity CLI (`agy`).
+    #[value(name = "antigravity", alias = "antigravity-cli", alias = "agy")]
+    Antigravity,
+}
+
+/// Arguments for `show`.
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    /// Only list local projects resolving to this workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Use saved local checkout links only; skip the depth-1 directory scan.
+    #[arg(long)]
+    pub no_scan: bool,
+    /// Print structured project and harness choices instead of opening menus.
+    /// Required when stdin or stdout is not a terminal.
+    #[arg(long)]
+    pub json: bool,
+    /// Disable native permission prompts using the selected harness's
+    /// equivalent dangerous-mode option. Forwarded to `run`.
+    #[arg(long)]
+    pub yolo: bool,
+    /// Start a new native session instead of resuming or adopting an existing
+    /// harness session. Forwarded to `run`.
+    #[arg(long)]
+    pub fresh: bool,
+    /// Native harness arguments, forwarded byte-for-byte and in order.
+    #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+    pub native_args: Vec<OsString>,
+}
+
+/// Arguments for `continue`.
+///
+/// Deliberately smaller than [`ShowArgs`]: `continue` always delegates to
+/// `run`'s bare mode, which rejects native argv and `--executable` because
+/// their meaning depends on a harness the user did not name.
+#[derive(Debug, Args)]
+pub struct ContinueArgs {
+    /// Only consider checkouts resolving to this workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Disable native permission prompts using the resolved harness's
+    /// equivalent dangerous-mode option. Forwarded to `run`.
+    #[arg(long)]
+    pub yolo: bool,
+    /// Start a new native session instead of resuming the linked one.
+    /// Forwarded to `run`.
+    #[arg(long)]
+    pub fresh: bool,
 }
 
 /// Arguments for `workstream-search`.
@@ -458,9 +525,15 @@ pub struct ReorgArgs {
 /// Arguments for `purge-project`.
 #[derive(Debug, Args)]
 pub struct PurgeProjectArgs {
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Purge even when a managed workstream under this project still holds a
+    /// live run lease. Workstreams cascade out of the project row, so without
+    /// this the purge refuses rather than deleting a running session's lease.
+    #[arg(long)]
+    pub force: bool,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -474,9 +547,10 @@ pub struct PurgeProjectArgs {
 /// Arguments for `rename-project`.
 #[derive(Debug, Args)]
 pub struct RenameProjectArgs {
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Current project name. When omitted, auto-derives from the
     /// basename of the current git repo root (or CWD) — handy when
     /// running `ai-memory rename-project --to new-name` from a dir
@@ -492,9 +566,11 @@ pub struct RenameProjectArgs {
 /// Arguments for `move-project`.
 #[derive(Debug, Args)]
 pub struct MoveProjectArgs {
-    /// Source workspace. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub from_workspace: String,
+    /// Source workspace. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`. Only the source is marker-resolved;
+    /// `--to-workspace` names the destination and stays literal.
+    #[arg(long)]
+    pub from_workspace: Option<String>,
     /// Project name to move. When omitted, auto-derived from the basename
     /// of the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -506,10 +582,9 @@ pub struct MoveProjectArgs {
     /// source, both irreversible. Without this flag the CLI errors out.
     #[arg(long)]
     pub confirm: bool,
-    /// Override the live-session guard. By default the server refuses (409) to
-    /// move the project a hook session is actively writing to; `--force`
-    /// proceeds anyway (still safe — the move keeps the active pointer correct
-    /// and the schema rejects any stale write).
+    /// Override the active-project guard. In a copy-purge merge this never
+    /// overrides a live managed-workstream lease, because deleting that lease
+    /// would strand the running agent's transcript.
     #[arg(long)]
     pub force: bool,
     /// Merge conflict policy (copy-purge path only): what to do when a source
@@ -615,10 +690,11 @@ pub struct BootstrapArgs {
     /// any subdir of the project works).
     #[arg(long)]
     pub repo_path: Option<PathBuf>,
-    /// Workspace name. Defaults to `default` (the single workspace
-    /// all hook-captured sessions land in today).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default` — the same resolution the lifecycle hooks
+    /// use, so bootstrap pages land where the session captures do.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the resolved repo path — same heuristic the hook router uses
     /// to bucket per-cwd observations, so the bootstrap pages land
@@ -757,9 +833,10 @@ pub struct AuditContaminationArgs {
 pub struct SearchArgs {
     /// FTS5 query string (e.g. `"karpathy wiki"` or `quick OR slow`).
     pub query: String,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -780,9 +857,10 @@ pub struct ReadPageArgs {
     /// Exact wiki path (e.g. `notes/foo.md`). Takes precedence over `query`.
     #[arg(long)]
     pub path: Option<String>,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -797,11 +875,12 @@ pub struct DeletePageArgs {
     /// Exact wiki path to delete (e.g. `notes/foo.md`).
     #[arg(long)]
     pub path: String,
-    /// Workspace name. Defaults to `default`. Required (no auto-detect) so
-    /// a cross-workspace project-name collision can never silently route
-    /// the delete to the wrong slot.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`. Resolution is announced on stderr so a
+    /// cross-workspace project-name collision can never silently route the
+    /// delete to the wrong slot.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project
     /// (same heuristic write-page/read-page use).
     #[arg(long)]
@@ -855,9 +934,10 @@ pub struct RestorePageArgs {
     /// Git checkpoint/revision to restore from.
     #[arg(long)]
     pub from: String,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -931,18 +1011,11 @@ pub enum AgentChoice {
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
     KimiCode,
-    /// Kiro CLI (AWS), default v2 agent engine — camelCase lifecycle hooks
-    /// embedded in agent configs under `~/.kiro/agents/*.json`. The v2 and
-    /// v3 engines of the same binary use incompatible hook surfaces, so
-    /// each is selected explicitly; use `kiro-cli-v3` for the v3 engine.
+    /// Kiro CLI (AWS), v2 agent engine — camelCase lifecycle hooks embedded
+    /// in agent configs under `~/.kiro/agents/*.json`. Kiro v3's standalone
+    /// hooks do not yet document a command-input payload contract.
     #[value(alias = "kiro")]
     KiroCli,
-    /// Kiro CLI (AWS), early-access v3 agent engine (`kiro-cli --v3`) —
-    /// PascalCase triggers in a standalone versioned hooks file at
-    /// `~/.kiro/hooks/ai-memory.json`. Select explicitly; the v2 engine
-    /// ignores this surface and vice versa.
-    #[value(name = "kiro-cli-v3", alias = "kiro-v3")]
-    KiroCliV3,
 }
 
 impl AgentChoice {
@@ -968,9 +1041,7 @@ impl AgentChoice {
             Self::Zero => AgentKind::Zero,
             Self::Devin => AgentKind::Devin,
             Self::KimiCode => AgentKind::KimiCode,
-            // Both Kiro engine surfaces are the same product and session
-            // identity; only the installed hook surface differs.
-            Self::KiroCli | Self::KiroCliV3 => AgentKind::KiroCli,
+            Self::KiroCli => AgentKind::KiroCli,
         }
     }
 
@@ -991,16 +1062,24 @@ impl AgentChoice {
 /// Arguments for `finalize-session`.
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
-    /// Agent kind to finalize. Defaults to Codex because Codex has no reliable
-    /// true SessionEnd hook.
+    /// Agent kind to finalize. Defaults to Codex for backward compatibility;
+    /// Codex and Antigravity CLI have no reliable true SessionEnd hook.
     #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
     pub agent: AgentChoice,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
+    /// Finalize sessions belonging to OTHER operators too.
+    ///
+    /// By default only your own (and unattributed) sessions are considered, so
+    /// finalizing cannot end a colleague's live session. Use this to recover a
+    /// teammate's session that died without emitting SessionEnd.
+    #[arg(long, default_value_t = false)]
+    pub all_owners: bool,
     /// Finalize every matching open session instead of just the latest one.
     #[arg(long)]
     pub all: bool,
@@ -1057,6 +1136,11 @@ pub enum McpClient {
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
     KimiCode,
+    /// Kiro CLI - `$KIRO_HOME/settings/mcp.json` (default
+    /// `~/.kiro/settings/mcp.json`). Pair with
+    /// `install-hooks --agent kiro-cli` for verified v2 lifecycle capture.
+    #[value(alias = "kiro")]
+    KiroCli,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -1070,6 +1154,11 @@ pub enum McpClient {
     /// design. See `install-mcp --client vscode-copilot`.
     #[value(name = "vscode-copilot", alias = "copilot", alias = "github-copilot")]
     VsCodeCopilot,
+    /// Zed editor - user-level `settings.json` under the platform config
+    /// directory. Zed reads remote MCP servers from the top-level
+    /// `context_servers` map. This integration is MCP-only because Zed
+    /// does not expose ai-memory-compatible lifecycle hooks.
+    Zed,
 }
 
 /// Arguments for `commit`.
@@ -1112,8 +1201,8 @@ pub struct EmbedArgs {
     #[arg(long)]
     pub force: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo). Matches the
     /// hook router's per-cwd convention so this command targets the
@@ -1129,8 +1218,8 @@ pub struct ForgetSweepArgs {
     #[arg(long)]
     pub dry_run: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1149,8 +1238,8 @@ pub struct LintArgs {
     #[arg(long)]
     pub no_llm: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1166,9 +1255,10 @@ pub struct CuratorArgs {
     /// Stage one pending curator report page for approval.
     #[arg(long)]
     pub stage: bool,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1181,9 +1271,10 @@ pub struct CuratorArgs {
 /// Arguments for `auto-improve-report`.
 #[derive(Debug, Args)]
 pub struct AutoImproveReportArgs {
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1208,9 +1299,10 @@ pub struct AutoImproveArgs {
     /// Completed session UUID to review.
     #[arg(long)]
     pub session_id: String,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1255,8 +1347,8 @@ pub enum PendingWritesCommand {
 
 #[derive(Debug, Args)]
 pub struct PendingWritesListArgs {
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long)]
@@ -1270,8 +1362,8 @@ pub struct PendingWritesListArgs {
 #[derive(Debug, Args)]
 pub struct PendingWriteIdArgs {
     pub id: String,
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long)]
@@ -1281,8 +1373,8 @@ pub struct PendingWriteIdArgs {
 #[derive(Debug, Args)]
 pub struct PendingWriteRejectArgs {
     pub id: String,
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long, default_value = "rejected by reviewer")]
@@ -1318,7 +1410,7 @@ pub struct LlmTestArgs {
 /// resolves its project from the main git repo root (collapsing
 /// subdirectories and worktrees) without a per-repo `.ai-memory.toml`
 /// marker. A marker's own `project_strategy` still wins.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProjectStrategyArg {
     /// `project = basename(cwd)` — the default; bakes nothing.
     Basename,
@@ -1434,10 +1526,13 @@ pub struct InstallHooksArgs {
     /// `repo-root` makes every session resolve its project from the main
     /// git repo root (collapsing subdirectories and worktrees) without a
     /// per-repo `.ai-memory.toml` marker. A marker's own `project_strategy`
-    /// still wins. Defaults to `basename`, which bakes nothing and is
-    /// identical to prior behavior.
-    #[arg(long, value_enum, default_value_t = ProjectStrategyArg::Basename)]
-    pub project_strategy: ProjectStrategyArg,
+    /// still wins. `basename` bakes nothing and is identical to prior
+    /// behavior. Omitting the flag leaves it unset: an `--apply` re-run then
+    /// preserves whatever strategy an earlier `--apply` baked, so a bare
+    /// re-apply (e.g. the auto-refresh in `ai-memory upgrade`) does not
+    /// silently revert `repo-root` back to `basename`.
+    #[arg(long, value_enum)]
+    pub project_strategy: Option<ProjectStrategyArg>,
     /// Bake `--capture-assistant` onto the installed native `stop` command so a
     /// Claude Code `stop` event carries a sanitized excerpt of the assistant's
     /// final turn (#196). Only valid for `--agent claude-code` on a native
@@ -1482,6 +1577,19 @@ pub struct InstallMcpArgs {
     /// absent (e.g. `~/.claude.json` for Claude Code).
     #[arg(long)]
     pub config_file: Option<PathBuf>,
+    /// For Claude Code, register an ai-memory stdio bridge that forwards the
+    /// current lifecycle session id to the HTTP server. This enables
+    /// `[auto_scope] mode = "per_session"` for concurrent Claude Code sessions.
+    #[arg(long)]
+    pub session_aware: bool,
+}
+
+/// Arguments for the internal Claude Code session-aware MCP bridge.
+#[derive(Debug, Clone, Args)]
+pub struct McpBridgeArgs {
+    /// Remote ai-memory base URL or full `/mcp` endpoint.
+    #[arg(long)]
+    pub server_url: Option<String>,
 }
 
 /// Transport for the MCP server.
@@ -1506,6 +1614,10 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_watcher: bool,
     /// Workspace name (auto-created).
+    ///
+    /// Not marker-aware, unlike the client commands: the server has no
+    /// caller cwd to walk up from, and this is the baked fallback for hook
+    /// events that arrive without a usable one.
     #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
     pub workspace: String,
     /// Project name within the workspace (auto-created).
@@ -1586,8 +1698,8 @@ pub struct WritePageArgs {
     #[arg(long)]
     pub pinned: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name within the workspace. When omitted, auto-detect from the
     /// current project using the same resolver as read-page/search.
     #[arg(long)]
@@ -1597,7 +1709,114 @@ pub struct WritePageArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn architecture_lists_every_visible_cli_subcommand() {
+        let architecture = include_str!("../../../docs/ARCHITECTURE.md");
+        let cli_section = architecture
+            .split_once("## CLI subcommand surface")
+            .expect("architecture must have a CLI subcommand section")
+            .1;
+        let command_block = cli_section
+            .split_once("```")
+            .expect("CLI subcommand section must have a fenced block")
+            .1
+            .split_once("```")
+            .expect("CLI subcommand fence must be closed")
+            .0;
+        let documented = command_block.split_whitespace().collect::<BTreeSet<_>>();
+        let command = Cli::command();
+        let visible = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            documented, visible,
+            "docs/ARCHITECTURE.md CLI subcommands must match `ai-memory --help`"
+        );
+    }
+
+    /// `continue` always delegates to `run`'s bare mode, which refuses native
+    /// argv and `--executable`. Rejecting them at parse time keeps that
+    /// contract visible in `--help` instead of failing after the launch has
+    /// already started resolving a workstream.
+    #[test]
+    fn continue_takes_wrapper_flags_only() {
+        let parsed =
+            Cli::try_parse_from(["ai-memory", "continue", "--workspace", "work", "--yolo"])
+                .expect("continue parses wrapper flags");
+        let Command::Continue(args) = parsed.command else {
+            panic!("expected continue command");
+        };
+        assert_eq!(args.workspace.as_deref(), Some("work"));
+        assert!(args.yolo);
+        assert!(!args.fresh);
+
+        for rejected in [
+            vec!["ai-memory", "continue", "claude"],
+            vec!["ai-memory", "continue", "--model", "opus"],
+            vec!["ai-memory", "continue", "--executable", "/bin/claude"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&rejected).is_err(),
+                "{rejected:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn show_parses_listing_and_launch_flags_without_consuming_native_args() {
+        let listing = Cli::try_parse_from(["ai-memory", "show", "--json", "--no-scan"])
+            .expect("show listing parses");
+        let Command::Show(listing) = listing.command else {
+            panic!("expected show command");
+        };
+        assert!(listing.json);
+        assert!(listing.no_scan);
+
+        let launch = Cli::try_parse_from([
+            "ai-memory",
+            "show",
+            "--workspace",
+            "team",
+            "--yolo",
+            "--fresh",
+            "--model",
+            "fast",
+        ])
+        .expect("show launch parses");
+        let Command::Show(launch) = launch.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(launch.workspace.as_deref(), Some("team"));
+        assert!(launch.yolo);
+        assert!(launch.fresh);
+        assert_eq!(launch.native_args, ["--model", "fast"]);
+    }
+
+    #[test]
+    fn claude_session_aware_mcp_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "claude-code",
+            "--session-aware",
+            "--apply",
+        ])
+        .unwrap();
+
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp command");
+        };
+        assert!(args.session_aware);
+        assert!(args.apply);
+        assert!(matches!(args.client, McpClient::ClaudeCode));
+    }
 
     #[test]
     fn pi_and_omp_mcp_clients_parse_to_distinct_variants() {
@@ -1904,6 +2123,25 @@ mod tests {
     }
 
     #[test]
+    fn kiro_mcp_aliases_parse() {
+        for alias in ["kiro-cli", "kiro"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "https://memory.example/mcp",
+            ])
+            .unwrap_or_else(|e| panic!("failed to parse Kiro MCP alias {alias}: {e}"));
+            let Command::InstallMcp(args) = cli.command else {
+                panic!("expected install-mcp command for Kiro alias {alias}");
+            };
+            assert!(matches!(args.client, McpClient::KiroCli));
+        }
+    }
+
+    #[test]
     fn devin_hook_agent_parses() {
         let hook_cli = Cli::try_parse_from([
             "ai-memory",
@@ -1918,6 +2156,40 @@ mod tests {
             panic!("expected install-hooks command for devin");
         };
         assert!(matches!(hook_args.agent, AgentChoice::Devin));
+    }
+
+    #[test]
+    fn kiro_v2_hook_aliases_parse_and_v3_is_not_advertised() {
+        for alias in ["kiro-cli", "kiro"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse Kiro v2 alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for Kiro v2 alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::KiroCli);
+        }
+        for unsupported in ["kiro-cli-v3", "kiro-v3"] {
+            let error = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                unsupported,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("invalid value"),
+                "v3 must remain unsupported until its payload contract is verified: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1936,23 +2208,53 @@ mod tests {
         };
         assert!(matches!(
             args.project_strategy,
-            ProjectStrategyArg::RepoRoot
+            Some(ProjectStrategyArg::RepoRoot)
         ));
-        assert_eq!(args.project_strategy.baked(), Some("repo-root"));
+        assert_eq!(
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            Some("repo-root")
+        );
     }
 
     #[test]
-    fn install_hooks_project_strategy_defaults_to_basename() {
+    fn install_hooks_project_strategy_defaults_to_unset() {
         let cli = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", "claude-code"])
             .expect("install-hooks parses without --project-strategy");
         let Command::InstallHooks(args) = cli.command else {
             panic!("expected install-hooks command");
         };
+        // No flag → None, so a re-apply preserves whatever is already baked.
+        assert!(args.project_strategy.is_none());
+        assert_eq!(
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            None
+        );
+    }
+
+    #[test]
+    fn install_hooks_explicit_basename_still_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "claude-code",
+            "--project-strategy",
+            "basename",
+        ])
+        .expect("install-hooks parses --project-strategy basename");
+        let Command::InstallHooks(args) = cli.command else {
+            panic!("expected install-hooks command");
+        };
+        // Explicit basename is distinct from "unset": it forces basename and
+        // overrides an already-baked repo-root on re-apply.
         assert!(matches!(
             args.project_strategy,
-            ProjectStrategyArg::Basename
+            Some(ProjectStrategyArg::Basename)
         ));
-        assert_eq!(args.project_strategy.baked(), None);
+        assert_eq!(
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            None
+        );
     }
 
     #[test]
@@ -2006,6 +2308,24 @@ mod tests {
                 "alias {alias} must resolve to the VS Code Copilot MCP client"
             );
         }
+    }
+
+    #[test]
+    fn zed_mcp_client_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "zed",
+            "--server-url",
+            "http://example.test:49374/mcp",
+        ])
+        .unwrap();
+
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp command");
+        };
+        assert!(matches!(args.client, McpClient::Zed));
     }
 
     #[test]
