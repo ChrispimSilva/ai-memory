@@ -763,8 +763,10 @@ serves the same tools with flattened root schemas:
 
 Sessions launched with `--v3` cannot be resumed by the v2 engine (and
 vice versa) — the resume hint Kiro prints at session end needs `--v3`
-added manually. Managed `ai-memory run kiro` support is tracked
-separately (upstream issue #356).
+added manually. `ai-memory run kiro` adds managed workstream resume for
+the default v2 engine; non-v2 engine selections pass through unmanaged.
+See [managed workstreams](managed-workstreams.md) for the adapter's
+verified scope and limitations.
 
 ### OpenCode
 

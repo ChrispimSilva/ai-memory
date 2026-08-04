@@ -31,14 +31,14 @@
 | Oh My Pi / OMP | Supported | Use `--client omp` / `--agent omp` (or `oh-my-pi`) for native `.omp` MCP config + TypeScript extension; generated extension enforces capture exclusions. |
 | Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory.ts` extension provides lifecycle capture and an HTTP MCP bridge; generated extension enforces capture exclusions. |
 | Crush | Managed-only | `ai-memory run crush` resumes its project-local session database and supplies portable context through a temporary supported global-context file; no lifecycle-hook installer is provided. |
-| Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and OMP. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
+| Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI (v2 engine), and OMP. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks; generated plugin enforces capture exclusions. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
 | Grok Build CLI | Supported | MCP config (`install-mcp --client grok` → `$GROK_HOME/config.toml`, default `~/.grok/config.toml`) + lifecycle hooks (`install-hooks --agent grok` → `$GROK_HOME/hooks/ai-memory.json`, default `~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle). Capture works; no handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. Skills root: `.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`). |
 | Zero | Supported | `install-mcp --client zero` (native HTTP + bearer in `~/.config/zero/config.json`) + lifecycle hooks via `install-hooks --agent zero --apply` (exec-form native commands in `~/.config/zero/hooks.json`, JSON payload on stdin, no shell). Capture works incl. specialist (subagent) events; no handoff injection — Zero discards `sessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `UserPromptSubmit` stdout (Kimi Code discards `SessionStart` hook stdout); `ai-memory run kimi` adds managed workstream resume. |
-| Kiro CLI | Hooks (engine-aware) | Lifecycle hooks for both agent engines of the AWS Kiro CLI, selected explicitly because their hook surfaces are incompatible: `install-hooks --agent kiro-cli` merges camelCase hook entries into every existing v2 agent config (`~/.kiro/agents/*.json`; the v2 engine has no global hook surface), and `install-hooks --agent kiro-cli-v3` writes the standalone versioned hooks file `~/.kiro/hooks/ai-memory.json` for the early-access v3 engine. Both honor `$KIRO_HOME` and share one script bundle. Handoffs inject via session-start stdout on both engines (v2 `agentSpawn`, v3 `SessionStart`). MCP: configure `~/.kiro/settings/mcp.json` manually (see docs/install.md). |
+| Kiro CLI | Supported (engine-aware) | Lifecycle hooks for both agent engines of the AWS Kiro CLI, selected explicitly because their hook surfaces are incompatible: `install-hooks --agent kiro-cli` merges camelCase hook entries into every existing v2 agent config (`~/.kiro/agents/*.json`; the v2 engine has no global hook surface), and `install-hooks --agent kiro-cli-v3` writes the standalone versioned hooks file `~/.kiro/hooks/ai-memory.json` for the early-access v3 engine. Both honor `$KIRO_HOME` and share one script bundle. Handoffs inject via session-start stdout on both engines (v2 `agentSpawn`, v3 `SessionStart`). `ai-memory run kiro` adds managed workstream resume on the default v2 engine (`--v3`/non-v2 engine selections pass through unmanaged — separate session id spaces). MCP: configure `~/.kiro/settings/mcp.json` manually with `?flavor=bedrock` (see docs/install.md). |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | Hermes Agent | Community | A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available. It is not part of ai-memory's first-party install surface; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenCode Zen/Go, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
@@ -69,12 +69,14 @@ priors are at the [bottom](#influences-and-prior-art).
   workstream with native per-harness sessions, a portable visible-event ledger,
   and full-ledger search.
   `ai-memory run` with no harness continues the newest usable Claude Code,
-  Codex, OpenCode, Pi, Crush, or Kimi Code session for this checkout. On first
+  Codex, OpenCode, Pi, Crush, Kimi Code, or Kiro CLI session for this checkout.
+  On first
   explicit use, an interactive launcher can adopt a previous session from the
   same checkout; later switches cannot select unrelated native history. Native
   arguments pass through unchanged except the wrapper-owned `--yolo`; direct
   commands are unaffected. `kimi-code` and `kimi-cli` are accepted aliases for
-  the installed `kimi` command.
+  the installed `kimi` command, and `kiro-cli` for the installed `kiro-cli`
+  command (`ai-memory run kiro`, default v2 engine only).
 - **Per-repository capture exclusions.** A nearest-marker `[capture]`
   `ignore_paths` policy drops matching recognized file-tool events before they
   reach the local spool or server. See [the capture policy reference](docs/marker-file.md#capture-exclusions).
@@ -157,7 +159,8 @@ priors are at the [bottom](#influences-and-prior-art).
   newer cross-harness history. After a normal quit, the next launch waits
   briefly if the previous launcher is still finalizing; handled failures release
   the workstream immediately. Managed mode currently covers Claude Code, Codex,
-  OpenCode, Pi, Crush, Kimi Code, and OMP; direct harness launches remain
+  OpenCode, Pi, Crush, Kimi Code, Kiro CLI (v2 engine), and OMP; direct harness
+  launches remain
   unchanged. See [Managed cross-harness workstreams](docs/managed-workstreams.md).
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a

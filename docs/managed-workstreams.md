@@ -1,8 +1,8 @@
 # Managed cross-harness workstreams
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
-between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and OMP. Direct
-agent launches
+between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI, and OMP.
+Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
@@ -28,7 +28,7 @@ second copy of each harness's option schema. Other wrapper options come first:
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH] [--yolo]
-              [claude|codex|opencode|pi|crush|omp|kimi] [native arguments...]
+              [claude|codex|opencode|pi|crush|omp|kimi|kiro] [native arguments...]
 ```
 
 The default is the most recently selected workstream for the current repository
@@ -39,8 +39,8 @@ branching controls, not harness-switch controls.
 ## Automatic harness selection
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for
-Claude Code, Codex, OpenCode, Pi, Crush, and Kimi Code. For an empty workstream
-it resumes
+Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and Kiro CLI. For an empty
+workstream it resumes
 the newest session automatically. For an established workstream, server state
 takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
@@ -129,6 +129,7 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
 | Crush | native default creation | `--session <id>` | `<project>/.crush/crush.db` opened read-only |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
+| Kiro CLI | native default creation | `--resume-id <id>` | `$KIRO_HOME/sessions/cli/<uuid>.jsonl` (+ sibling `<uuid>.json` metadata) |
 | OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
 
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
@@ -138,7 +139,8 @@ Pi and OMP `--session-dir` values and Crush `--data-dir` values are passed
 through unchanged and used as the read-only import root. Native store
 environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
-`PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, and `KIMI_CODE_HOME`.
+`PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`, and
+`KIRO_HOME`.
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never
@@ -151,7 +153,11 @@ chooser.
 the harness's native dangerous mode. The translation is Claude Code
 `--dangerously-skip-permissions`, Codex
 `--dangerously-bypass-approvals-and-sandbox`, OpenCode `--auto`, Pi `--approve`,
-Crush `--yolo`, and Kimi Code `--yolo`. OMP currently needs no added flag.
+Crush `--yolo`, Kimi Code `--yolo`, and Kiro CLI `--trust-all-tools` (the
+official v2-engine flag; a `--trust-tools=<set>` the user passed is an
+explicit narrower choice and is never widened, and a non-v2 engine selection
+maps nothing because Kiro v3 replaced the flag with `permissions.yaml` — the
+wrapper says so on stderr). OMP currently needs no added flag.
 ai-memory does not add a duplicate when the translated native flag is already
 present.
 
@@ -175,6 +181,7 @@ ai-memory install-hooks --agent opencode --apply
 ai-memory install-hooks --agent pi --apply
 ai-memory install-hooks --agent omp --apply
 ai-memory install-hooks --agent kimi-code --apply
+ai-memory install-hooks --agent kiro-cli --apply
 ```
 
 Kimi Code hooks installed as native `ai-memory hook` commands automatically
@@ -202,6 +209,29 @@ stat fallback) are neither discovered nor imported in v1. The native
 contract was verified against Kimi Code v0.29.0. The managed launcher accepts
 `kimi`, `kimi-code`, and `kimi-cli`; all three resolve the installed `kimi`
 executable.
+
+Known Kiro CLI adapter limitations: managed continuity covers the **default
+v2 agent engine only**. Any `--v3`, `--mode`, or non-`v2` `--agent-engine`
+selection passes the whole invocation through unmanaged — v3 sessions live
+in a separate id space that the v2 engine cannot resume (the resume hint
+Kiro prints after a v3 session silently starts a fresh v2 session unless
+`--v3` is added), and the v3 persisted-session format is not publicly
+documented, so cross-engine resume is prevented by construction rather than
+detection. Headless `--no-interactive` runs persist to Kiro's v1 SQLite
+store (`~/.local/share/kiro-cli/data.sqlite3`) rather than the v2 session
+files, so they also pass through; only interactive chat sessions
+(`~/.kiro/sessions/cli/<uuid>.json` + `<uuid>.jsonl`) are discovered and
+imported. `/chat save`/`load` exports and Kiro's one-shot list/delete flags
+are passthrough utility invocations. The event stream is not verified
+append-only, so the adapter keeps a prefix-hash cursor like Kimi's: an
+in-place rewrite resets to the beginning and replays with stable line-hash
+event ids. The CLI argument surface (`--resume-id`, `--trust-all-tools`,
+`--agent-engine`, subcommand list) was verified against kiro-cli 2.16.0;
+the session-file shapes derive from the public references for kiro-cli
+1.29.x and MUST be revalidated against a logged-in current install before
+this adapter is relied on — the deterministic acceptance fixtures encode
+exactly that documented shape. The managed launcher accepts `kiro` and
+`kiro-cli`; both resolve the installed `kiro-cli` executable.
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
 its one-time context from the server, copies the existing global Crush JSON into

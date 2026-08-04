@@ -107,6 +107,37 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
     packet=$(jq -r '.options.global_context_paths[-1]' "$CRUSH_GLOBAL_CONFIG/crush.json")
     cp "$packet" "$AI_MEMORY_ACCEPTANCE_CRUSH_PACKET_LOG"
     ;;
+  kiro)
+    printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    # Honor `--resume-id <id>` (resume); a fresh launch mints its own id
+    # because Kiro CLI session ids are server-assigned UUIDs.
+    session_id=""
+    previous_arg=""
+    for arg in "$@"; do
+      if [ "$previous_arg" = --resume-id ]; then
+        session_id=$arg
+      fi
+      previous_arg=$arg
+    done
+    if [ -z "$session_id" ]; then
+      session_id=$(cat /proc/sys/kernel/random/uuid)
+    fi
+    # Real layout: flat store, one `<uuid>.json` metadata + `<uuid>.jsonl`
+    # event-stream pair per session; discovery must read the metadata cwd.
+    store="${KIRO_HOME:?kiro fake mode requires KIRO_HOME}/sessions/cli"
+    mkdir -p "$store"
+    stream="$store/$session_id.jsonl"
+    if [ ! -f "$store/$session_id.json" ]; then
+      printf '{"session_id":"%s","cwd":"%s","created_at":"2026-08-01T10:00:00Z","updated_at":"2026-08-01T10:00:00Z","title":"acceptance","session_state":{"version":"v1","conversation_metadata":{}}}\n' \
+        "$session_id" "$PWD" >"$store/$session_id.json"
+      : >"$stream"
+    fi
+    sentinel=${AI_MEMORY_ACCEPTANCE_SENTINEL:-AMWS-FAKE-KIRO}
+    printf '{"version":"v1","kind":"Prompt","data":{"message_id":"m-%s-u","content":[{"kind":"text","data":"%s"}],"meta":{"timestamp":%s}}}\n' \
+      "$(date +%s)" "$sentinel" "$(date +%s)000" >>"$stream"
+    printf '{"version":"v1","kind":"AssistantMessage","data":{"message_id":"m-%s-a","content":[{"kind":"text","data":"%s reply"}],"meta":{"timestamp":%s}}}\n' \
+      "$(date +%s)" "$sentinel" "$(date +%s)000" >>"$stream"
+    ;;
   kimi)
     printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
     # Honor `--session <id>` (resume); a fresh launch mints its own id
@@ -410,6 +441,86 @@ jq -e \
   exit 1
 }
 
+# Kiro fake-mode fixture: the fake kiro honors `--resume-id <id>`, writes the
+# native flat store ($KIRO_HOME/sessions/cli/<uuid>.json + <uuid>.jsonl), and
+# appends the round sentinel as versioned v1 Prompt/AssistantMessage records.
+# A fresh launch injects no selector because Kiro session ids are
+# server-assigned; the wrapper links the session post-exit by exact-checkout
+# discovery through the sibling metadata JSON.
+KIRO_FAKE_HOME="$CONFIG/kiro-fake"
+mkdir -p "$KIRO_FAKE_HOME"
+(
+  cd "$REPO"
+  KIRO_HOME="$KIRO_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=kiro \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/kiro-first-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-KIRO-ONE" \
+    "$BIN" --data-dir "$DATA" run --new edge-kiro --executable "$FAKE" \
+      kiro >"$LOGS/edge-kiro-first.log" 2>&1
+)
+if grep -q . "$TMP/kiro-first-argv.log"; then
+  printf 'fresh kiro launch unexpectedly received a session selector\n' >&2
+  cat "$TMP/kiro-first-argv.log" >&2
+  exit 1
+fi
+kiro_session_file=$(find "$KIRO_FAKE_HOME/sessions/cli" -maxdepth 1 -name '*.jsonl' -print -quit)
+[ -n "$kiro_session_file" ] || {
+  printf 'fake kiro did not create a native session store\n' >&2
+  exit 1
+}
+kiro_session_id=$(basename "$kiro_session_file" .jsonl)
+kiro_ws_hex=$(sqlite3 "$DATA/db/memory.sqlite" \
+  "SELECT lower(hex(id)) FROM workstreams WHERE name = 'edge-kiro' ORDER BY selected_at DESC LIMIT 1;")
+[ "${#kiro_ws_hex}" -eq 32 ] || {
+  printf 'could not resolve the edge-kiro workstream id\n' >&2
+  exit 1
+}
+kiro_ws_id="${kiro_ws_hex:0:8}-${kiro_ws_hex:8:4}-${kiro_ws_hex:12:4}-${kiro_ws_hex:16:4}-${kiro_ws_hex:20:12}"
+kiro_first_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$kiro_ws_id" --limit 100 --json "AMWS-FAKE-KIRO-ONE")
+jq -e --arg id "$kiro_session_id" \
+  '[.[] | select(.agent == "kiro-cli" and .role == "assistant" and (.content | contains("AMWS-FAKE-KIRO-ONE")) and .native_session_id == $id)] | length == 1' \
+  <<<"$kiro_first_hits" >/dev/null || {
+  printf 'kiro event-stream sentinel was not imported from the discovered session\n' >&2
+  tail -80 "$LOGS/edge-kiro-first.log" >&2
+  exit 1
+}
+(
+  cd "$REPO"
+  KIRO_HOME="$KIRO_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=kiro \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/kiro-second-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-KIRO-TWO" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-kiro --executable "$FAKE" \
+      kiro-cli >"$LOGS/edge-kiro-second.log" 2>&1
+)
+diff -u <(printf '%s\n' --resume-id "$kiro_session_id") "$TMP/kiro-second-argv.log"
+kiro_second_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$kiro_ws_id" --limit 100 --json "AMWS-FAKE-KIRO")
+jq -e \
+  '([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-KIRO-ONE")))] | length == 1)
+   and ([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-KIRO-TWO")))] | length == 1)' \
+  <<<"$kiro_second_hits" >/dev/null || {
+  printf 'kiro incremental import duplicated or missed a round sentinel\n' >&2
+  tail -80 "$LOGS/edge-kiro-second.log" >&2
+  exit 1
+}
+# An engine-selector invocation must pass through byte-identical: v3
+# sessions live in a separate id space the v2 engine cannot resume, so the
+# wrapper must never inject a selector next to `--v3`.
+(
+  cd "$REPO"
+  KIRO_HOME="$KIRO_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=argv \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/kiro-v3-argv.log" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-kiro --executable "$FAKE" \
+      kiro --v3 >"$LOGS/edge-kiro-v3.log" 2>&1
+)
+diff -u <(printf '%s\n' --v3) "$TMP/kiro-v3-argv.log" || {
+  printf 'kiro --v3 invocation was not passed through byte-identical\n' >&2
+  exit 1
+}
+
 # A blank first launch remains eligible for one-time native-session adoption.
 # Use a pseudo-terminal because redirected/scripted launches deliberately skip
 # the chooser.
@@ -484,6 +595,16 @@ harnesses=()
 for requested_harness in "${requested_harnesses[@]}"; do
   case "$requested_harness" in
     kimi-code | kimi-cli) harness=kimi ;;
+    # The real-harness round trip drives every harness through a scripted
+    # noninteractive turn, but headless Kiro (`--no-interactive`) persists
+    # to its v1 SQLite store rather than the v2 session files the managed
+    # adapter reads — so a scripted kiro turn is passthrough by design and
+    # cannot exchange sentinels. Kiro's wrapper mechanics are fully covered
+    # by the deterministic fake-harness phase above.
+    kiro | kiro-cli)
+      printf 'skipping kiro in the real-harness phase: headless runs use the v1 SQLite store (deterministic phase covers the adapter)\n' >&2
+      continue
+      ;;
     *) harness=$requested_harness ;;
   esac
   if command -v "$harness" >/dev/null 2>&1; then

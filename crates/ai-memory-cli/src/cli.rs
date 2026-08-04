@@ -219,6 +219,11 @@ pub enum RunHarnessChoice {
     /// Moonshot AI Kimi Code.
     #[value(name = "kimi", alias = "kimi-code", alias = "kimi-cli")]
     Kimi,
+    /// AWS Kiro CLI (default v2 agent engine; a `--v3`/`--agent-engine`
+    /// selection passes through unmanaged — v3 sessions live in a
+    /// separate id space the v2 engine cannot resume).
+    #[value(name = "kiro", alias = "kiro-cli")]
+    Kiro,
 }
 
 /// Arguments for `workstream-search`.

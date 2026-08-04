@@ -12,6 +12,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 
 use crate::ManagedHarness;
 
@@ -204,7 +205,7 @@ fn export_jsonl(
     let mut file = File::open(path)
         .with_context(|| format!("opening native transcript {}", path.display()))?;
     let len = file.metadata()?.len();
-    let (start, mut kimi_prefix_hasher) = if harness == ManagedHarness::Kimi {
+    let (start, mut prefix_hasher) = if rewrite_tolerant_journal(harness) {
         let validated = if let Some(cursor) = cursor.as_ref().filter(|cursor| cursor.offset <= len)
             && let Some(expected) = cursor.prefix_sha256.as_deref()
             && let Some(hasher) = hash_file_prefix(&mut file, cursor.offset)?
@@ -238,8 +239,8 @@ fn export_jsonl(
         if !line.ends_with(b"\n") {
             break;
         }
-        if harness == ManagedHarness::Kimi {
-            kimi_prefix_hasher.update(&line);
+        if rewrite_tolerant_journal(harness) {
+            prefix_hasher.update(&line);
         }
         committed_offset = offset;
         let value: Value = match serde_json::from_slice(&line) {
@@ -252,12 +253,14 @@ fn export_jsonl(
                 continue;
             }
         };
-        let record_id = if harness == ManagedHarness::Kimi {
+        let record_id = if rewrite_tolerant_journal(harness) {
             // Kimi wire records carry no envelope id, and the journal is
             // rewritten wholesale on fork/compaction/resume — a byte-offset
             // id would silently change meaning. Hashing the raw line keeps
             // record ids (and therefore server-side event dedup) stable
-            // across rewrites.
+            // across rewrites. Kiro records reuse one message_id across an
+            // exchange's Prompt/AssistantMessage/ToolResults records, so
+            // the line hash is its unique record id as well.
             let raw = line.strip_suffix(b"\n").unwrap_or(&line);
             format!("{:x}", Sha256::digest(raw))
         } else {
@@ -293,6 +296,13 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
+            ManagedHarness::Kiro => parse_kiro(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
             ManagedHarness::OpenCode | ManagedHarness::Crush => {
                 return Err(anyhow!(
                     "{} transcripts must use their SQLite adapter",
@@ -309,12 +319,23 @@ fn export_jsonl(
         source_cursor: Some(serde_json::to_string(&FileCursor {
             path: path.to_string_lossy().into_owned(),
             offset: committed_offset,
-            prefix_sha256: (harness == ManagedHarness::Kimi)
-                .then(|| format!("{:x}", kimi_prefix_hasher.finalize())),
+            prefix_sha256: rewrite_tolerant_journal(harness)
+                .then(|| format!("{:x}", prefix_hasher.finalize())),
         })?),
         events,
         losses: deduplicate_losses(losses),
     })
+}
+
+/// Journals the harness may rewrite in place (fork/compaction/resume),
+/// where a byte-offset cursor would silently change meaning: the adapter
+/// validates a prefix hash before trusting the offset and derives record
+/// ids from the raw line bytes. Kimi is a confirmed rewriter; Kiro's
+/// event stream is not verified append-only, so it gets the same
+/// tolerance defensively (a rewrite resets the cursor and the stable
+/// line-hash record ids dedupe the replay server-side).
+const fn rewrite_tolerant_journal(harness: ManagedHarness) -> bool {
+    matches!(harness, ManagedHarness::Kimi | ManagedHarness::Kiro)
 }
 
 fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
@@ -894,6 +915,185 @@ fn kimi_timestamp(value: &Value) -> Option<String> {
         .map(|timestamp| timestamp.to_string())
 }
 
+/// Import one Kiro v2-engine session event: a versioned envelope
+/// `{"version":"v1","kind":…,"data":{"message_id":…,"content":[…],"meta":…}}`
+/// whose `content` parts carry their own `kind`/`data`. Visible kinds:
+/// `Prompt` (user), `AssistantMessage` (assistant text + `toolUse` parts),
+/// `ToolResults` (`toolResult` parts). Unknown record kinds within the
+/// `v1` envelope are ignored so newer Kiro versions stay
+/// forward-compatible; a non-`v1` envelope version is annotated instead —
+/// that axis signals a schema break, not an additive record type.
+fn parse_kiro(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    match value.get("version").and_then(Value::as_str) {
+        Some("v1") => {}
+        Some(other) => {
+            losses.push(format!(
+                "Kiro records with unsupported envelope version {other} were skipped"
+            ));
+            return;
+        }
+        None => {
+            losses.push("Kiro records without an envelope version were skipped".into());
+            return;
+        }
+    }
+    let data = value.get("data").unwrap_or(&Value::Null);
+    let occurred_at = kiro_timestamp(data);
+    let parts = data
+        .get("content")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    match value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "Prompt" => {
+            for (index, part) in parts.iter().enumerate() {
+                match part.get("kind").and_then(Value::as_str).unwrap_or_default() {
+                    "text" => {
+                        if let Some(text) = part.get("data").and_then(Value::as_str) {
+                            push_event(
+                                events,
+                                AgentKind::KiroCli,
+                                session,
+                                record_id,
+                                index,
+                                WorkstreamEventKind::Message,
+                                Some("user"),
+                                text,
+                                occurred_at.clone(),
+                                json!({}),
+                            );
+                        }
+                    }
+                    _ => {
+                        losses
+                            .push("Kiro non-text content parts were intentionally excluded".into());
+                    }
+                }
+            }
+        }
+        "AssistantMessage" => {
+            for (index, part) in parts.iter().enumerate() {
+                match part.get("kind").and_then(Value::as_str).unwrap_or_default() {
+                    "text" => {
+                        if let Some(text) = part.get("data").and_then(Value::as_str) {
+                            push_event(
+                                events,
+                                AgentKind::KiroCli,
+                                session,
+                                record_id,
+                                index,
+                                WorkstreamEventKind::Message,
+                                Some("assistant"),
+                                text,
+                                occurred_at.clone(),
+                                json!({}),
+                            );
+                        }
+                    }
+                    "toolUse" => {
+                        let tool = part.get("data").unwrap_or(&Value::Null);
+                        let name = first_string(tool, &["name", "toolName", "tool_name"])
+                            .unwrap_or("tool");
+                        let arguments = tool
+                            .get("input")
+                            .or_else(|| tool.get("args"))
+                            .or_else(|| tool.get("arguments"))
+                            .map(compact_json)
+                            .unwrap_or_else(|| compact_json(tool));
+                        push_event(
+                            events,
+                            AgentKind::KiroCli,
+                            session,
+                            record_id,
+                            index,
+                            WorkstreamEventKind::ToolCall,
+                            Some("assistant"),
+                            &format!("{name}: {arguments}"),
+                            occurred_at.clone(),
+                            json!({
+                                "tool": name,
+                                "tool_call_id": first_string(tool, &["tool_use_id", "toolUseId", "id"])
+                            }),
+                        );
+                    }
+                    _ => {
+                        losses
+                            .push("Kiro non-text content parts were intentionally excluded".into());
+                    }
+                }
+            }
+        }
+        "ToolResults" => {
+            for (index, part) in parts.iter().enumerate() {
+                if part.get("kind").and_then(Value::as_str) != Some("toolResult") {
+                    continue;
+                }
+                let result = part.get("data").unwrap_or(&Value::Null);
+                let body = kiro_result_text(result)
+                    .filter(|text| !text.trim().is_empty())
+                    .unwrap_or_else(|| compact_json(result));
+                push_event(
+                    events,
+                    AgentKind::KiroCli,
+                    session,
+                    record_id,
+                    index,
+                    WorkstreamEventKind::ToolResult,
+                    Some("tool"),
+                    &body,
+                    occurred_at.clone(),
+                    json!({
+                        "tool_call_id": first_string(result, &["tool_use_id", "toolUseId", "id"]),
+                        "is_error": result
+                            .get("is_error")
+                            .or_else(|| result.get("isError"))
+                            .and_then(Value::as_bool)
+                    }),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Kiro event timestamps ride `data.meta.timestamp` as a unix epoch in
+/// milliseconds.
+fn kiro_timestamp(data: &Value) -> Option<String> {
+    let millis = data.get("meta")?.get("timestamp").and_then(Value::as_i64)?;
+    jiff::Timestamp::from_millisecond(millis)
+        .ok()
+        .map(|timestamp| timestamp.to_string())
+}
+
+/// Text of a Kiro tool result: its `content` is an array of the same
+/// `{kind, data}` parts the message records use (text parts join), with
+/// plain-string `content`/`output`/`text` fields tolerated as fallbacks.
+fn kiro_result_text(result: &Value) -> Option<String> {
+    if let Some(parts) = result.get("content").and_then(Value::as_array) {
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter(|part| part.get("kind").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("data").and_then(Value::as_str))
+            .collect();
+        if !texts.is_empty() {
+            return Some(texts.join("\n"));
+        }
+    }
+    ["content", "output", "text"]
+        .iter()
+        .find_map(|key| result.get(*key).and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
 /// Subagent journals (`agents/<id != main>/wire.jsonl`) are not imported in
 /// v1; annotate the gap once so the omission is visible in the ledger.
 fn annotate_kimi_subagents(path: &Path, losses: &mut Vec<String>) {
@@ -1396,6 +1596,13 @@ fn locate_session_file(
             }
         }
     }
+    if harness == ManagedHarness::Kiro {
+        // The store is flat: `<root>/<session-id>.jsonl`.
+        let exact = root.join(format!("{id}.jsonl"));
+        if exact.is_file() {
+            return Ok(Some(exact));
+        }
+    }
     let mut files = collect_files(&root, |path| transcript_file(harness, path))?;
     files.sort_by_key(|path| temporary_transcript(path));
     for path in &files {
@@ -1422,6 +1629,17 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .and_then(|name| name.to_str())
                 == Some("main");
     }
+    if harness == ManagedHarness::Kiro {
+        // Only `<uuid>.jsonl` event streams directly in the store; session
+        // ids are UUIDs, so the stem filter excludes stray JSONL files a
+        // session subdirectory (e.g. `<id>/tasks/`) might hold. The
+        // sibling `<uuid>.json` metadata is not a transcript.
+        return path.extension().is_some_and(|ext| ext == "jsonl")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| Uuid::parse_str(stem).is_ok());
+    }
     path.extension().is_some_and(|ext| ext == "jsonl")
         || matches!(harness, ManagedHarness::Pi | ManagedHarness::Omp) && temporary_transcript(path)
 }
@@ -1437,6 +1655,9 @@ fn temporary_transcript(path: &Path) -> bool {
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::Kimi {
         return kimi_session_header(path);
+    }
+    if harness == ManagedHarness::Kiro {
+        return kiro_session_header(path);
     }
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = String::new();
@@ -1464,7 +1685,10 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
                 value.get("id").and_then(Value::as_str),
                 value.get("cwd").and_then(Value::as_str),
             ),
-            ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Kimi => (None, None),
+            ManagedHarness::OpenCode
+            | ManagedHarness::Crush
+            | ManagedHarness::Kimi
+            | ManagedHarness::Kiro => (None, None),
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
             return Ok(Some((id.to_string(), PathBuf::from(cwd))));
@@ -1493,6 +1717,36 @@ fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     let Some(id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    Ok(Some((id.to_string(), PathBuf::from(cwd))))
+}
+
+/// Kiro v2-engine sessions are self-describing in the sibling metadata
+/// file: `<root>/<id>.jsonl` (event stream) pairs with `<root>/<id>.json`
+/// (`{"session_id": …, "cwd": …, …}`). The event stream itself carries no
+/// session id or cwd. A missing or invalid metadata file means the
+/// session is unusable for checkout matching, not an error; a metadata
+/// `session_id` that disagrees with the file stem is treated the same
+/// way rather than trusting either side.
+fn kiro_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    let metadata_path = path.with_extension("json");
+    let Ok(raw) = fs::read_to_string(&metadata_path) else {
+        return Ok(None);
+    };
+    let Ok(metadata) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(None);
+    };
+    let Some(id) = metadata.get("session_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if id != stem {
+        return Ok(None);
+    }
+    let Some(cwd) = metadata.get("cwd").and_then(Value::as_str) else {
         return Ok(None);
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
@@ -1685,6 +1939,7 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Crush => home.join(".crush"),
         ManagedHarness::Omp => home.join(".omp/agent/sessions"),
         ManagedHarness::Kimi => home.join(".kimi-code/sessions"),
+        ManagedHarness::Kiro => home.join(".kiro/sessions/cli"),
     }
 }
 
@@ -1842,9 +2097,13 @@ mod tests {
                         "{}\n",
                         json!({"type":"session","id":"other-id","cwd":other})
                     ),
-                    // Kimi's header lives in state.json, not the journal;
-                    // covered by kimi_discovery_matches_checkout_via_state_json.
-                    ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Kimi => {
+                    // Kimi's header lives in state.json and Kiro's in the
+                    // sibling metadata JSON, not the journal; covered by
+                    // their dedicated discovery tests.
+                    ManagedHarness::OpenCode
+                    | ManagedHarness::Crush
+                    | ManagedHarness::Kimi
+                    | ManagedHarness::Kiro => {
                         unreachable!()
                     }
                 },
@@ -2534,5 +2793,240 @@ mod tests {
         parse_kimi(&value, "session", "record", &mut events, &mut losses);
         assert!(events.is_empty());
         assert_eq!(losses, ["Kimi system messages were intentionally excluded"]);
+    }
+
+    const KIRO_ID_A: &str = "3f6d1c2a-0000-4000-8000-000000000aaa";
+    const KIRO_ID_B: &str = "3f6d1c2a-0000-4000-8000-000000000bbb";
+
+    /// The canonical Kiro v2-engine store shape: flat
+    /// `<root>/<uuid>.json` metadata + `<root>/<uuid>.jsonl` event stream,
+    /// one pair per session. Returns the root and the matching session's
+    /// stream path.
+    fn kiro_store_fixture(cwd: &Path, other: &Path) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        for (id, dir) in [(KIRO_ID_A, cwd), (KIRO_ID_B, other)] {
+            fs::write(
+                root.path().join(format!("{id}.json")),
+                json!({
+                    "session_id": id,
+                    "cwd": dir,
+                    "created_at": "2026-08-01T10:00:00Z",
+                    "updated_at": "2026-08-01T10:05:00Z",
+                    "title": "fixture session",
+                    "session_state": {"version": "v1", "conversation_metadata": {}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(root.path().join(format!("{id}.jsonl")), "").unwrap();
+        }
+        (root, PathBuf::from(format!("{KIRO_ID_A}.jsonl")))
+    }
+
+    #[tokio::test]
+    async fn kiro_discovery_matches_checkout_via_sibling_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let (root, stream_a) = kiro_store_fixture(&cwd, &other);
+        let stream_a = root.path().join(stream_a);
+        fs::write(
+            &stream_a,
+            format!(
+                "{}\n",
+                json!({"version":"v1","kind":"Prompt","data":{"message_id":"m1","content":[{"kind":"text","data":"hi"}]}})
+            ),
+        )
+        .unwrap();
+        // Distractors that must never surface: a non-UUID stream, a stray
+        // JSONL inside a session's tasks directory, and a metadata file
+        // whose session_id disagrees with its stem.
+        fs::write(root.path().join("notes.jsonl"), "{}\n").unwrap();
+        let tasks = root.path().join(KIRO_ID_A).join("tasks");
+        fs::create_dir_all(&tasks).unwrap();
+        fs::write(tasks.join("todo.jsonl"), "{}\n").unwrap();
+        let mismatched = "3f6d1c2a-0000-4000-8000-000000000ccc";
+        fs::write(
+            root.path().join(format!("{mismatched}.json")),
+            json!({"session_id": KIRO_ID_A, "cwd": cwd}).to_string(),
+        )
+        .unwrap();
+        fs::write(root.path().join(format!("{mismatched}.jsonl")), "{}\n").unwrap();
+
+        let sessions = list_native_sessions(
+            ManagedHarness::Kiro,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, KIRO_ID_A);
+
+        let other_sessions = list_native_sessions(
+            ManagedHarness::Kiro,
+            temp.path(),
+            &other,
+            Some(root.path()),
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(other_sessions.len(), 1);
+        assert_eq!(other_sessions[0].native_session_id, KIRO_ID_B);
+
+        let found = locate_session_file(
+            ManagedHarness::Kiro,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            KIRO_ID_B,
+        )
+        .unwrap();
+        assert_eq!(
+            found.as_deref(),
+            Some(root.path().join(format!("{KIRO_ID_B}.jsonl")).as_path())
+        );
+    }
+
+    #[test]
+    fn kiro_export_maps_visible_records_and_excludes_private_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let stream = temp.path().join(format!("{KIRO_ID_A}.jsonl"));
+        let lines = [
+            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m1","content":[{"kind":"text","data":"hello kiro"}],"meta":{"timestamp":1_700_000_000_000_i64}}}),
+            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m2","content":[{"kind":"image","data":{"format":"png"}}]}}),
+            json!({"version":"v1","kind":"AssistantMessage","data":{"message_id":"m3","content":[
+                {"kind":"text","data":"visible answer"},
+                {"kind":"toolUse","data":{"name":"fs_read","tool_use_id":"call_1","input":{"operations":[{"mode":"Line","path":"README.md"}]}}}
+            ]}}),
+            json!({"version":"v1","kind":"ToolResults","data":{"message_id":"m4","content":[
+                {"kind":"toolResult","data":{"tool_use_id":"call_1","content":[{"kind":"text","data":"result ok"}],"is_error":false}}
+            ]}}),
+            // Unknown record kinds inside the v1 envelope are additive and
+            // ignored; foreign envelope versions are annotated and skipped.
+            json!({"version":"v1","kind":"Checkpoint","data":{"message_id":"m5"}}),
+            json!({"version":"v2","kind":"Prompt","data":{"message_id":"m6","content":[{"kind":"text","data":"future schema"}]}}),
+            json!({"kind":"Prompt","data":{"message_id":"m7","content":[{"kind":"text","data":"unversioned"}]}}),
+        ];
+        let raw: String = lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        fs::write(&stream, &raw).unwrap();
+
+        let export = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_ID_A, None).unwrap();
+        let kinds: Vec<_> = export.events.iter().map(|event| event.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                WorkstreamEventKind::Message,
+                WorkstreamEventKind::Message,
+                WorkstreamEventKind::ToolCall,
+                WorkstreamEventKind::ToolResult,
+            ]
+        );
+        assert_eq!(export.events[0].content, "hello kiro");
+        assert_eq!(export.events[0].role.as_deref(), Some("user"));
+        assert_eq!(
+            export.events[0].occurred_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(export.events[1].content, "visible answer");
+        assert_eq!(export.events[1].role.as_deref(), Some("assistant"));
+        assert!(
+            export.events[2].content.starts_with("fs_read: "),
+            "{}",
+            export.events[2].content
+        );
+        assert_eq!(export.events[2].metadata["tool"], "fs_read");
+        assert_eq!(export.events[2].metadata["tool_call_id"], "call_1");
+        assert_eq!(export.events[3].content, "result ok");
+        assert_eq!(export.events[3].metadata["is_error"], false);
+        // Every event id is stable and the record ids are line hashes.
+        assert!(
+            export
+                .events
+                .iter()
+                .all(|event| event.event_id.starts_with("native:"))
+        );
+        assert_eq!(
+            export.losses,
+            [
+                "Kiro non-text content parts were intentionally excluded".to_string(),
+                "Kiro records with unsupported envelope version v2 were skipped".to_string(),
+                "Kiro records without an envelope version were skipped".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn kiro_export_is_incremental_and_tolerates_an_unfinished_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let stream = temp.path().join(format!("{KIRO_ID_A}.jsonl"));
+        let first = format!(
+            "{}\n",
+            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m1","content":[{"kind":"text","data":"first"}]}})
+        );
+        fs::write(&stream, &first).unwrap();
+        let export = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_ID_A, None).unwrap();
+        assert_eq!(export.events.len(), 1);
+        let cursor = export.source_cursor.clone().unwrap();
+
+        // Append one complete record plus an unfinished tail: only the
+        // complete record is imported and the cursor never advances past it.
+        let second = format!(
+            "{}\n",
+            json!({"version":"v1","kind":"AssistantMessage","data":{"message_id":"m2","content":[{"kind":"text","data":"second"}]}})
+        );
+        let mut appended = fs::read_to_string(&stream).unwrap();
+        appended.push_str(&second);
+        appended.push_str("{\"version\":\"v1\",\"kind\":\"Assist");
+        fs::write(&stream, &appended).unwrap();
+
+        let export = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_ID_A, Some(&cursor)).unwrap();
+        assert_eq!(export.events.len(), 1);
+        assert_eq!(export.events[0].content, "second");
+        let cursor: FileCursor =
+            serde_json::from_str(export.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(cursor.offset as usize, first.len() + second.len());
+    }
+
+    #[test]
+    fn kiro_export_resets_cursor_after_an_in_place_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let stream = temp.path().join(format!("{KIRO_ID_A}.jsonl"));
+        let original = format!(
+            "{}\n{}\n",
+            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m1","content":[{"kind":"text","data":"first"}]}}),
+            json!({"version":"v1","kind":"AssistantMessage","data":{"message_id":"m2","content":[{"kind":"text","data":"second"}]}}),
+        );
+        fs::write(&stream, &original).unwrap();
+        let export = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_ID_A, None).unwrap();
+        assert_eq!(export.events.len(), 2);
+        let cursor = export.source_cursor.clone().unwrap();
+
+        // Simulate a compaction-style rewrite: the file is replaced with
+        // different content of a similar length. The stale byte offset must
+        // not be trusted — the adapter replays from the start and the
+        // stable line-hash record ids dedupe server-side.
+        let rewritten = format!(
+            "{}\n",
+            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m9","content":[{"kind":"text","data":"rewritten history"}]}})
+        );
+        fs::write(&stream, &rewritten).unwrap();
+        let export = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_ID_A, Some(&cursor)).unwrap();
+        assert_eq!(export.events.len(), 1);
+        assert_eq!(export.events[0].content, "rewritten history");
+
+        // An untouched file with a valid cursor stays a no-op.
+        let cursor = export.source_cursor.clone().unwrap();
+        let export = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_ID_A, Some(&cursor)).unwrap();
+        assert!(export.events.is_empty());
     }
 }

@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Managed workstreams support the AWS Kiro CLI through `ai-memory run kiro`
+  (`kiro-cli` accepted as an alias), scoped deliberately to the default v2
+  agent engine (#356). Fresh launches inject nothing (Kiro session ids are
+  server-assigned); returning sessions resume with `--resume-id <id>`
+  appended after user arguments; discovery and import read the interactive
+  session store (`$KIRO_HOME/sessions/cli/<uuid>.json` metadata +
+  `<uuid>.jsonl` event stream) with exact-checkout matching on the metadata
+  `cwd`. Cross-engine resume is prevented by construction: any `--v3`,
+  `--mode`, or non-`v2` `--agent-engine` selection passes the invocation
+  through unmanaged, because v3 sessions occupy a separate id space the v2
+  engine cannot resume and the v3 store format is not publicly documented.
+  Headless `--no-interactive` runs (which persist to Kiro's v1 SQLite store
+  rather than the session files) and one-shot list/delete flags also pass
+  through. The wrapper `--yolo` maps to the official v2 flag
+  `--trust-all-tools`, never widens an explicit `--trust-tools=<set>`, and
+  maps nothing on non-v2 engines (v3 replaced the flag with
+  permissions.yaml) with a stderr notice. The event stream is treated as
+  rewrite-tolerant like Kimi's journal (prefix-hash cursor, stable
+  line-hash record ids). Kiro joins the automatic bare-`run` pool and the
+  deterministic phase of the acceptance script; the CLI argument surface
+  was verified against kiro-cli 2.16.0, while session-file shapes derive
+  from public 1.29.x references and are documented as pending revalidation
+  on a live logged-in install.
 - Version-aware lifecycle hooks for the AWS Kiro CLI (#355). The two agent
   engines of the same binary use incompatible hook surfaces, so each is
   selected explicitly and never guessed: `install-hooks --agent kiro-cli`

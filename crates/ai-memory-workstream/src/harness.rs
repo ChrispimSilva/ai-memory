@@ -24,6 +24,8 @@ pub enum ManagedHarness {
     Omp,
     /// Moonshot AI Kimi Code.
     Kimi,
+    /// AWS Kiro CLI (v2 agent engine only — see [`kiro_selects_non_default_engine`]).
+    Kiro,
 }
 
 impl ManagedHarness {
@@ -38,6 +40,7 @@ impl ManagedHarness {
             "crush" => Some(Self::Crush),
             "omp" | "oh-my-pi" => Some(Self::Omp),
             "kimi" | "kimi-code" | "kimi-cli" => Some(Self::Kimi),
+            "kiro" | "kiro-cli" => Some(Self::Kiro),
             _ => None,
         }
     }
@@ -53,6 +56,7 @@ impl ManagedHarness {
             Self::Crush => AgentKind::Crush,
             Self::Omp => AgentKind::Omp,
             Self::Kimi => AgentKind::KimiCode,
+            Self::Kiro => AgentKind::KiroCli,
         }
     }
 
@@ -67,6 +71,7 @@ impl ManagedHarness {
             Self::Crush => "crush",
             Self::Omp => "omp",
             Self::Kimi => "kimi",
+            Self::Kiro => "kiro-cli",
         }
     }
 
@@ -81,8 +86,31 @@ impl ManagedHarness {
             Self::Crush => "crush",
             Self::Omp => "omp",
             Self::Kimi => "kimi",
+            Self::Kiro => "kiro",
         }
     }
+}
+
+/// Whether a Kiro CLI invocation targets an agent engine other than the
+/// default v2 engine — `--v3`, `--mode` (a v3-only option), or an
+/// `--agent-engine` value that is not `v2` (the `chat` subcommand's
+/// engine selector, verified on kiro-cli 2.16.0).
+///
+/// Kiro v3 sessions live in a separate id space and cannot be resumed by
+/// the v2 engine (nor vice versa), and the v3 persisted-session format is
+/// not publicly documented, so managed continuity covers the v2 engine
+/// only. Any non-v2 engine selection makes the whole invocation pass
+/// through — no session injection, no adoption, no import — which keeps
+/// incompatible v2/v3 sessions from being cross-resumed by construction.
+#[must_use]
+pub fn kiro_selects_non_default_engine(args: &[OsString]) -> bool {
+    if has_flag(args, &["--v3", "--mode"]) {
+        return true;
+    }
+    if !has_flag(args, &["--agent-engine"]) {
+        return false;
+    }
+    flag_value(args, &["--agent-engine"]).as_deref() != Some("v2")
 }
 
 /// Whether the planned native invocation participates in session continuity.
@@ -209,6 +237,19 @@ pub fn build_launch_plan(
                     expected = Some(id.to_string());
                 }
             }
+            ManagedHarness::Kiro => {
+                // Kiro accepts no caller-chosen id for a fresh session
+                // (session ids are server-assigned UUIDs), so only a
+                // linked resume injects `--resume-id <id>` — a clap option
+                // accepted at the root and on the `chat` subcommand
+                // (verified on kiro-cli 2.16.0), appended at the end so
+                // user arguments are never reordered. The fresh session is
+                // linked by the session-start hook or discovered post-exit.
+                if let Some(id) = linked_session_id {
+                    args.extend([OsString::from("--resume-id"), OsString::from(id)]);
+                    expected = Some(id.to_string());
+                }
+            }
         }
     }
 
@@ -233,13 +274,28 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         ManagedHarness::Crush => Some("--yolo"),
         ManagedHarness::Omp => None,
         ManagedHarness::Kimi => Some("--yolo"),
+        // `--trust-all-tools` (alias `-a`) is the official v2-engine
+        // dangerous mode (verified on kiro-cli 2.16.0). The v3 engine
+        // replaced it with permissions.yaml and documents no CLI
+        // equivalent, so a non-v2 engine selection maps nothing — the
+        // caller surfaces that to the user.
+        ManagedHarness::Kiro => {
+            if kiro_selects_non_default_engine(args) {
+                None
+            } else {
+                Some("--trust-all-tools")
+            }
+        }
     };
     if let Some(flag) = flag {
         // Kimi's `--yolo` has hidden aliases (`--yes`, `--auto-approve`) and
         // conflicts with the distinct `--auto` mode, so any of those native
         // spellings already satisfies the wrapper's dangerous-mode request.
+        // Kiro's `--trust-tools=<set>` is an explicit narrower trust choice
+        // that the wrapper must not widen.
         let present: &[&str] = match harness {
             ManagedHarness::Kimi => &["--yolo", "-y", "--yes", "--auto-approve", "--auto"],
+            ManagedHarness::Kiro => &["--trust-all-tools", "-a", "--trust-tools"],
             _ => &[flag],
         };
         if !has_flag(args, present) {
@@ -265,14 +321,46 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
         ManagedHarness::Crush => first_arg_is(args, "run"),
         ManagedHarness::Pi | ManagedHarness::Omp => has_flag(args, &["--print", "-p"]),
         ManagedHarness::Kimi => has_flag(args, &["--prompt", "-p"]),
+        ManagedHarness::Kiro => has_flag(args, &["--no-interactive"]),
     }
 }
 
 fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
-    if has_flag(args, &["--help", "-h", "--version", "-v"])
+    // Kiro's `-v` is verbose (its version short flag is `-V`), so the
+    // generic version-flag check must not send `kiro-cli -v` through
+    // unmanaged.
+    let version_flags: &[&str] = if harness == ManagedHarness::Kiro {
+        &["--help", "-h", "--version", "-V", "--help-all"]
+    } else {
+        &["--help", "-h", "--version", "-v"]
+    };
+    if has_flag(args, version_flags)
         || has_flag(args, &["--no-session", "--no-session-persistence"])
     {
         return LaunchMode::Passthrough;
+    }
+    if harness == ManagedHarness::Kiro {
+        // Managed continuity is verified for the default v2 engine only;
+        // any other engine selection passes straight through (see
+        // `kiro_selects_non_default_engine`). Headless `--no-interactive`
+        // runs persist to the v1 SQLite store rather than the v2 session
+        // files this adapter reads, and the one-shot list/delete flags
+        // never open a session, so none of them is session-bearing.
+        if kiro_selects_non_default_engine(args)
+            || has_flag(
+                args,
+                &[
+                    "--no-interactive",
+                    "--list-sessions",
+                    "-l",
+                    "--list-models",
+                    "--delete-session",
+                    "-d",
+                ],
+            )
+        {
+            return LaunchMode::Passthrough;
+        }
     }
     if harness == ManagedHarness::Codex
         && first_arg_is(args, "exec")
@@ -401,6 +489,37 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "__plugin_run_node",
         ]
         .as_slice(),
+        // Every root subcommand except `chat` (kiro-cli 2.16.0
+        // --help-all). A bare `kiro-cli` and root chat flags both open
+        // the chat, so flags-only invocations stay session-bearing.
+        ManagedHarness::Kiro => [
+            "debug",
+            "settings",
+            "setup",
+            "update",
+            "diagnostic",
+            "init",
+            "theme",
+            "issue",
+            "login",
+            "logout",
+            "whoami",
+            "profile",
+            "user",
+            "doctor",
+            "launch",
+            "quit",
+            "restart",
+            "integrations",
+            "translate",
+            "dashboard",
+            "mcp",
+            "inline",
+            "agent",
+            "acp",
+            "help",
+        ]
+        .as_slice(),
     };
     let first = args.first().and_then(|arg| arg.to_str());
     if first.is_some_and(|value| utility.contains(&value)) {
@@ -454,6 +573,13 @@ fn has_explicit_session_selector(harness: ManagedHarness, args: &[OsString]) -> 
                 "-C",
             ],
         ),
+        // `-r/--resume` resumes the newest conversation of this directory,
+        // `--resume-id <id>` a specific one, and `--resume-picker` (alias
+        // `--list`) opens the native picker — each an explicit user choice.
+        ManagedHarness::Kiro => has_flag(
+            args,
+            &["--resume", "-r", "--resume-id", "--resume-picker", "--list"],
+        ),
     }
 }
 
@@ -479,6 +605,9 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         // A bare `--session`/`--resume` opens the picker: `flag_value`
         // returns `None` when no value follows, as intended.
         ManagedHarness::Kimi => flag_value(args, &["--session", "-S", "--resume", "-r"]),
+        // Only `--resume-id` names a session; bare `--resume` means
+        // "newest in this directory" and the picker flags carry no id.
+        ManagedHarness::Kiro => flag_value(args, &["--resume-id"]),
     }
 }
 
@@ -560,6 +689,10 @@ fn environment_session_dir_with(
         ManagedHarness::Omp => value("PI_CODING_AGENT_DIR").map(|dir| dir.join("sessions")),
         // Sessions live under `<KIMI_CODE_HOME>/sessions/<bucket>/<id>/`.
         ManagedHarness::Kimi => value("KIMI_CODE_HOME").map(|dir| dir.join("sessions")),
+        // Interactive v2-engine sessions live under
+        // `<KIRO_HOME>/sessions/cli/<uuid>.{json,jsonl}` (default ~/.kiro);
+        // KIRO_HOME relocation is honored by the binary.
+        ManagedHarness::Kiro => value("KIRO_HOME").map(|dir| dir.join("sessions").join("cli")),
     }
 }
 
@@ -794,6 +927,7 @@ mod tests {
             (ManagedHarness::Crush, Some("--yolo")),
             (ManagedHarness::Omp, None),
             (ManagedHarness::Kimi, Some("--yolo")),
+            (ManagedHarness::Kiro, Some("--trust-all-tools")),
         ] {
             let mut args = Vec::new();
             apply_yolo(harness, &mut args);
@@ -1016,6 +1150,222 @@ mod tests {
         assert_eq!(
             environment_session_dir_with(ManagedHarness::Kimi, get).as_deref(),
             Some(std::path::Path::new("/stores/kimi-code/sessions"))
+        );
+    }
+
+    #[test]
+    fn kiro_cli_name_is_an_alias_for_kiro() {
+        for name in ["kiro", "kiro-cli"] {
+            assert_eq!(ManagedHarness::from_name(name), Some(ManagedHarness::Kiro));
+        }
+        assert_eq!(ManagedHarness::Kiro.executable(), "kiro-cli");
+        assert_eq!(ManagedHarness::Kiro.agent_kind(), AgentKind::KiroCli);
+    }
+
+    #[test]
+    fn kiro_fresh_launch_injects_no_session_selector() {
+        // Kiro session ids are server-assigned; a fresh launch must leave
+        // argv untouched even though the harness is managed. Both the bare
+        // form and the explicit `chat` subcommand are session-bearing.
+        for native in [
+            vec![OsString::from("continue here")],
+            vec![OsString::from("chat"), OsString::from("continue here")],
+        ] {
+            let plan = build_launch_plan(ManagedHarness::Kiro, None, native.clone(), None).unwrap();
+            assert_eq!(plan.args, native);
+            assert_eq!(plan.expected_session_id, None);
+            assert_eq!(plan.mode, LaunchMode::Session, "{native:?}");
+        }
+    }
+
+    #[test]
+    fn kiro_resume_appends_resume_id_after_user_arguments() {
+        let plan = build_launch_plan(
+            ManagedHarness::Kiro,
+            None,
+            vec![OsString::from("--model"), OsString::from("sonnet")],
+            Some("3f6d1c2a-aaaa-bbbb-cccc-000000000001"),
+        )
+        .unwrap();
+        assert_eq!(
+            strings(&plan.args),
+            [
+                "--model",
+                "sonnet",
+                "--resume-id",
+                "3f6d1c2a-aaaa-bbbb-cccc-000000000001"
+            ]
+        );
+        assert_eq!(
+            plan.expected_session_id.as_deref(),
+            Some("3f6d1c2a-aaaa-bbbb-cccc-000000000001")
+        );
+    }
+
+    #[test]
+    fn kiro_explicit_selector_always_wins_including_pickers() {
+        for native in [
+            vec![OsString::from("--resume-id"), OsString::from("id_chosen")],
+            vec![OsString::from("--resume-id=id_chosen")],
+            // `-r/--resume` (newest in this directory) and the pickers
+            // (`--resume-picker`, alias `--list`) are explicit choices that
+            // carry no id up front.
+            vec![OsString::from("--resume")],
+            vec![OsString::from("-r")],
+            vec![OsString::from("--resume-picker")],
+            vec![OsString::from("--list")],
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Kiro,
+                None,
+                native.clone(),
+                Some("id_linked"),
+            )
+            .unwrap();
+            assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
+            assert_ne!(plan.expected_session_id.as_deref(), Some("id_linked"));
+        }
+        let chosen = build_launch_plan(
+            ManagedHarness::Kiro,
+            None,
+            vec![OsString::from("--resume-id"), OsString::from("id_chosen")],
+            Some("id_linked"),
+        )
+        .unwrap();
+        assert_eq!(chosen.expected_session_id.as_deref(), Some("id_chosen"));
+    }
+
+    #[test]
+    fn kiro_utility_subcommands_are_passed_through() {
+        for utility in [
+            "login",
+            "settings",
+            "agent",
+            "mcp",
+            "doctor",
+            "translate",
+            "update",
+            "dashboard",
+            "acp",
+            "help",
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Kiro,
+                None,
+                vec![OsString::from(utility)],
+                Some("id_linked"),
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{utility}");
+            assert_eq!(strings(&plan.args), [utility]);
+        }
+    }
+
+    #[test]
+    fn kiro_non_default_engine_always_passes_through() {
+        // v3 sessions live in a separate id space the v2 engine cannot
+        // resume, and the v3 store format is unverified — every non-v2
+        // engine selection must pass through with argv untouched so
+        // cross-engine resume cannot happen by construction.
+        for native in [
+            vec![OsString::from("--v3")],
+            vec![OsString::from("chat"), OsString::from("--v3")],
+            vec![OsString::from("--agent-engine"), OsString::from("v3")],
+            vec![OsString::from("--agent-engine=v1")],
+            vec![OsString::from("--mode"), OsString::from("spec")],
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Kiro,
+                None,
+                native.clone(),
+                Some("id_linked"),
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{native:?}");
+            assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
+            assert!(!allows_native_session_adoption(
+                ManagedHarness::Kiro,
+                &native
+            ));
+        }
+        // The explicit default engine stays managed.
+        let v2 = build_launch_plan(
+            ManagedHarness::Kiro,
+            None,
+            vec![OsString::from("--agent-engine"), OsString::from("v2")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(v2.mode, LaunchMode::Session);
+    }
+
+    #[test]
+    fn kiro_one_shot_and_headless_invocations_pass_through() {
+        // `--no-interactive` persists to the v1 SQLite store rather than
+        // the v2 session files this adapter reads, and the list/delete
+        // flags never open a session.
+        for native in [
+            vec![OsString::from("--no-interactive"), OsString::from("hi")],
+            vec![OsString::from("--list-sessions")],
+            vec![OsString::from("-l")],
+            vec![OsString::from("--list-models")],
+            vec![OsString::from("--delete-session"), OsString::from("id")],
+            vec![OsString::from("-d"), OsString::from("id")],
+        ] {
+            let plan = build_launch_plan(
+                ManagedHarness::Kiro,
+                None,
+                native.clone(),
+                Some("id_linked"),
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{native:?}");
+            assert_eq!(plan.args, native);
+        }
+    }
+
+    #[test]
+    fn kiro_verbose_short_flag_is_not_the_version_flag() {
+        // Kiro's `-v` increases verbosity (`-V` prints the version), so a
+        // verbose chat must stay managed while `-V` passes through.
+        let verbose =
+            build_launch_plan(ManagedHarness::Kiro, None, vec![OsString::from("-v")], None)
+                .unwrap();
+        assert_eq!(verbose.mode, LaunchMode::Session);
+        let version =
+            build_launch_plan(ManagedHarness::Kiro, None, vec![OsString::from("-V")], None)
+                .unwrap();
+        assert_eq!(version.mode, LaunchMode::Passthrough);
+    }
+
+    #[test]
+    fn kiro_yolo_maps_to_trust_all_tools_on_the_v2_engine_only() {
+        // Fresh args: the official v2 dangerous-mode flag is appended.
+        let mut args = Vec::new();
+        apply_yolo(ManagedHarness::Kiro, &mut args);
+        assert_eq!(strings(&args), ["--trust-all-tools"]);
+
+        // Native spellings that already grant (or explicitly narrow) trust
+        // are respected — `--trust-tools=<set>` must not be widened.
+        for already in ["--trust-all-tools", "-a", "--trust-tools=fs_read"] {
+            let mut args = vec![OsString::from(already)];
+            apply_yolo(ManagedHarness::Kiro, &mut args);
+            assert_eq!(strings(&args), [already], "{already} must not duplicate");
+        }
+
+        // The v3 engine has no verified CLI equivalent (permissions.yaml
+        // replaced --trust-all-tools), so nothing is mapped.
+        let mut v3 = vec![OsString::from("--v3")];
+        apply_yolo(ManagedHarness::Kiro, &mut v3);
+        assert_eq!(strings(&v3), ["--v3"]);
+    }
+
+    #[test]
+    fn kiro_home_environment_override_points_at_cli_sessions_root() {
+        let get = |name: &str| (name == "KIRO_HOME").then(|| OsString::from("/stores/kiro"));
+        assert_eq!(
+            environment_session_dir_with(ManagedHarness::Kiro, get).as_deref(),
+            Some(std::path::Path::new("/stores/kiro/sessions/cli"))
         );
     }
 }

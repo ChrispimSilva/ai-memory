@@ -136,19 +136,21 @@ async fn prepare_run(
             | AgentKind::Crush
             | AgentKind::Omp
             | AgentKind::KimiCode
+            | AgentKind::KiroCli
     ) {
         return error(
             StatusCode::BAD_REQUEST,
             "managed run requires a supported command-line harness",
         );
     }
-    const AUTO_AGENTS: [AgentKind; 6] = [
+    const AUTO_AGENTS: [AgentKind; 7] = [
         AgentKind::ClaudeCode,
         AgentKind::Codex,
         AgentKind::OpenCode,
         AgentKind::Pi,
         AgentKind::Crush,
         AgentKind::KimiCode,
+        AgentKind::KiroCli,
     ];
     if request.automatic_harness
         && (!AUTO_AGENTS.contains(&request.agent)
