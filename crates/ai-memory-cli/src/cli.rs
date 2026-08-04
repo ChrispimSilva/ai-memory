@@ -931,6 +931,18 @@ pub enum AgentChoice {
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
     KimiCode,
+    /// Kiro CLI (AWS), default v2 agent engine — camelCase lifecycle hooks
+    /// embedded in agent configs under `~/.kiro/agents/*.json`. The v2 and
+    /// v3 engines of the same binary use incompatible hook surfaces, so
+    /// each is selected explicitly; use `kiro-cli-v3` for the v3 engine.
+    #[value(alias = "kiro")]
+    KiroCli,
+    /// Kiro CLI (AWS), early-access v3 agent engine (`kiro-cli --v3`) —
+    /// PascalCase triggers in a standalone versioned hooks file at
+    /// `~/.kiro/hooks/ai-memory.json`. Select explicitly; the v2 engine
+    /// ignores this surface and vice versa.
+    #[value(name = "kiro-cli-v3", alias = "kiro-v3")]
+    KiroCliV3,
 }
 
 impl AgentChoice {
@@ -956,6 +968,9 @@ impl AgentChoice {
             Self::Zero => AgentKind::Zero,
             Self::Devin => AgentKind::Devin,
             Self::KimiCode => AgentKind::KimiCode,
+            // Both Kiro engine surfaces are the same product and session
+            // identity; only the installed hook surface differs.
+            Self::KiroCli | Self::KiroCliV3 => AgentKind::KiroCli,
         }
     }
 

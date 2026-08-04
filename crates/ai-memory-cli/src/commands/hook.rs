@@ -393,13 +393,24 @@ where
     W: std::io::Write,
     S: FnOnce(&Path) -> std::io::Result<()>,
 {
+    // Kiro CLI adds exit-0 stdout of its session-start and user-prompt
+    // hooks to the agent context verbatim (v2 agentSpawn / v3
+    // SessionStart + both engines' UserPromptSubmit, per the official
+    // hook contracts), and its v2 stop hook parses stdout for a
+    // {"decision":"block"} verdict. The Claude-style `{}` protocol
+    // output would therefore leak into the conversation as literal
+    // text, so for Kiro the hook prints nothing at all except an
+    // actually-fetched session-start handoff.
+    let inert_stdout = !matches!(AgentKind::from_wire(&args.agent), AgentKind::KiroCli);
     let (mut payload, mut json) = match parse_hook_payload(payload) {
         Ok(parsed) => parsed,
         Err(_) => {
             eprintln!(
                 "ai-memory hook warning: could not parse event payload as JSON; nothing was captured"
             );
-            writeln!(stdout, "{{}}")?;
+            if inert_stdout {
+                writeln!(stdout, "{{}}")?;
+            }
             return Ok(());
         }
     };
@@ -452,7 +463,9 @@ where
     if let Some(decision) = decision {
         match decision.protocol().disposition() {
             CaptureDisposition::Drop => {
-                writeln!(stdout, "{{}}")?;
+                if inert_stdout {
+                    writeln!(stdout, "{{}}")?;
+                }
                 return Ok(());
             }
             CaptureDisposition::MetadataOnly => {
@@ -582,13 +595,19 @@ where
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
-                let envelope = serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "SessionStart",
-                        "additionalContext": handoff,
-                    }
-                });
-                writeln!(stdout, "{envelope}")?;
+                if inert_stdout {
+                    let envelope = serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "SessionStart",
+                            "additionalContext": handoff,
+                        }
+                    });
+                    writeln!(stdout, "{envelope}")?;
+                } else {
+                    // Kiro adds this stdout to the agent context verbatim
+                    // and documents no envelope, so print the raw handoff.
+                    writeln!(stdout, "{handoff}")?;
+                }
                 return Ok(());
             }
         }
@@ -681,7 +700,9 @@ where
         );
     }
 
-    writeln!(stdout, "{{}}")?;
+    if inert_stdout {
+        writeln!(stdout, "{{}}")?;
+    }
     Ok(())
 }
 
@@ -1894,6 +1915,129 @@ mod tests {
         let second = first_request(&mut requests).await.unwrap();
         assert!(second.starts_with("GET /handoff?"), "{second}");
         assert!(!second.contains("briefing"), "{second}");
+    }
+
+    fn kiro_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "kiro-cli".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn kiro_session_start_prints_the_raw_handoff_without_an_envelope() {
+        // Both Kiro engines add session-start hook stdout to the agent
+        // context verbatim (v2 agentSpawn / v3 SessionStart) and document
+        // no envelope, so the handoff must be printed raw — a
+        // hookSpecificOutput wrapper would inject JSON noise as context.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-KIRO").await;
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            kiro_hook_args("session-start", &base),
+            serde_json::json!({
+                "hook_event_name": "agentSpawn",
+                "session_id": "3f6d1c2a-aaaa-bbbb-cccc-000000000001",
+                "cwd": cwd
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"AMWS-HANDOFF-KIRO\n");
+
+        let mut saw_handoff = false;
+        while let Some(request) = first_request(&mut requests).await {
+            if request.starts_with("GET /handoff") {
+                saw_handoff = true;
+                assert!(request.contains("agent=kiro-cli"), "{request}");
+                assert!(
+                    request.contains("session_id=3f6d1c2a-aaaa-bbbb-cccc-000000000001"),
+                    "{request}"
+                );
+            }
+        }
+        assert!(saw_handoff, "session-start must fetch the handoff for kiro");
+    }
+
+    #[tokio::test]
+    async fn kiro_hooks_never_print_the_empty_object() {
+        // Kiro injects exit-0 stdout of session-start and user-prompt
+        // hooks into the agent context verbatim, and its v2 stop hook
+        // parses stdout for a block verdict — so the Claude-style `{}`
+        // protocol line must never be emitted for kiro-cli.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let payload = serde_json::json!({
+            "session_id": "3f6d1c2a-aaaa-bbbb-cccc-000000000002",
+            "cwd": cwd,
+            "prompt": "hi"
+        })
+        .to_string();
+
+        // No pending handoff on session-start → nothing at all on stdout.
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            kiro_hook_args("session-start", &base),
+            payload.clone(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"", "empty handoff must print nothing");
+        // Drain the requests recorded so far — session-start legitimately
+        // fetched the handoff; the assertions below are about user-prompt.
+        while first_request(&mut requests).await.is_some() {}
+
+        // user-prompt: session-start owns the injection for kiro, so no
+        // handoff fetch happens here and stdout stays empty.
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            kiro_hook_args("user-prompt-submit", &base),
+            payload.clone(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+        }
+
+        // stop and an unparseable payload also stay silent (Claude would
+        // print `{}` in both cases).
+        for (event, body) in [("stop", payload.as_str()), ("stop", "not-json")] {
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()),
+                kiro_hook_args(event, &base),
+                body.to_string(),
+                &mut stdout,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stdout, b"", "{event} must print nothing");
+        }
     }
 
     #[tokio::test]

@@ -2465,6 +2465,7 @@ impl AiMemoryServer {
                 "zero": "AGENTS.md",
                 "devin": "AGENTS.md",
                 "kimi_code": "AGENTS.md",
+                "kiro_cli": "AGENTS.md",
                 "grok": "AGENTS.md",
                 "default": "AGENTS.md"
             },
@@ -2542,12 +2543,16 @@ impl ServerHandler for AiMemoryServer {
         // rmcp injects `http::request::Parts` into request extensions in
         // both stateless and stateful modes, so the flavor marker is
         // available even without peer clientInfo.
-        let moonshot = context
+        let flat_root_schema = context
             .extensions
             .get::<http::request::Parts>()
             .and_then(|parts| parts.uri.query())
-            .is_some_and(|query| query.split('&').any(|pair| pair == "flavor=moonshot"));
-        if moonshot {
+            .is_some_and(|query| {
+                query
+                    .split('&')
+                    .any(|pair| pair == "flavor=moonshot" || pair == "flavor=bedrock")
+            });
+        if flat_root_schema {
             Ok(ListToolsResult::with_all_items(moonshot_safe_tool_list(
                 tools,
             )))
@@ -2559,10 +2564,13 @@ impl ServerHandler for AiMemoryServer {
 
 /// Moonshot ("moonshot flavored json schema") rejects root-level
 /// `anyOf`/`oneOf`/`allOf` in tool parameter schemas with a 400 at
-/// `tools/list` time. Requests marked `?flavor=moonshot` (the URL
-/// `install-mcp --client kimi-code` writes) get the tool list with
-/// those root keys stripped; nested combinators stay, and the handlers'
-/// runtime validation still enforces the arg contracts.
+/// `tools/list` time, and Amazon Bedrock's Converse API (used by the
+/// AWS Kiro CLI) rejects the same root-level combinators. Requests
+/// marked `?flavor=moonshot` (the URL `install-mcp --client kimi-code`
+/// writes) or `?flavor=bedrock` (for Kiro CLI's manually configured
+/// `~/.kiro/settings/mcp.json`) get the tool list with those root keys
+/// stripped; nested combinators stay, and the handlers' runtime
+/// validation still enforces the arg contracts.
 fn moonshot_safe_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
     const ROOT_COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
     tools

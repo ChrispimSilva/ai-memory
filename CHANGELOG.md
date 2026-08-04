@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Version-aware lifecycle hooks for the AWS Kiro CLI (#355). The two agent
+  engines of the same binary use incompatible hook surfaces, so each is
+  selected explicitly and never guessed: `install-hooks --agent kiro-cli`
+  merges five flat camelCase entries (`agentSpawn`, `userPromptSubmit`,
+  `preToolUse`, `postToolUse`, `stop`) into every existing v2 agent config
+  under `~/.kiro/agents/` (the v2 engine has no global hook surface and the
+  built-in default agent has no file on disk), while
+  `install-hooks --agent kiro-cli-v3` writes the standalone versioned hooks
+  file `~/.kiro/hooks/ai-memory.json` with PascalCase triggers for the
+  early-access v3 engine. Both honor `$KIRO_HOME`, share one
+  `hooks/kiro-cli/` script bundle, preserve third-party hook entries on
+  re-apply and uninstall, and keep capture fail-open (always exit 0; no
+  stdout on capture paths, because exit code 2 blocks the tool call and
+  session-start/user-prompt stdout is injected into the agent context).
+  Handoffs inject through session-start stdout on both engines (v2
+  `agentSpawn`, v3 `SessionStart`), raw and unenveloped per the official
+  contracts; the native `ai-memory hook` command suppresses its `{}`
+  protocol line for `kiro-cli` for the same reason. Tool payloads
+  (`tool_name`/`tool_input`, `tool_response.success`) join the capture
+  policy with fixture vectors, including Kiro's `fs_read` batched
+  `operations` path extraction; the v3 stdin payload shape is not publicly
+  documented and stays conservative. Contracts verified against kiro-cli
+  2.16.0 and kiro.dev's v2/v3 hook references; docs cover both engines,
+  MCP setup, and the v2/v3 session id-space split.
+- `?flavor=bedrock` marker on the MCP URL, an alias of the existing
+  Moonshot root-schema flattening: Amazon Bedrock's Converse API (used by
+  the Kiro CLI) rejects root-level `anyOf`/`oneOf`/`allOf` in tool
+  schemas, so a Kiro `~/.kiro/settings/mcp.json` pointing at
+  `…/mcp?flavor=bedrock` gets the same tools with flattened root schemas
+  (#351).
+
 ## [1.18.0] - 2026-07-23
 
 ### Added

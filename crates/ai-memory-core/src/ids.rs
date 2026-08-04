@@ -208,6 +208,9 @@ pub enum AgentKind {
     Devin,
     /// Kimi Code CLI (Moonshot AI).
     KimiCode,
+    /// Kiro CLI (AWS), covering both the default v2 agent engine and the
+    /// early-access v3 engine of the same binary.
+    KiroCli,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -218,7 +221,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -234,6 +237,7 @@ impl AgentKind {
         Self::Zero,
         Self::Devin,
         Self::KimiCode,
+        Self::KiroCli,
         Self::Other,
     ];
 
@@ -256,6 +260,7 @@ impl AgentKind {
             Self::Zero => "zero",
             Self::Devin => "devin",
             Self::KimiCode => "kimi-code",
+            Self::KiroCli => "kiro-cli",
             Self::Other => "other",
         }
     }
@@ -281,6 +286,7 @@ impl AgentKind {
             "zero" => Self::Zero,
             "devin" => Self::Devin,
             "kimi-code" | "kimi" => Self::KimiCode,
+            "kiro-cli" | "kiro" | "kiro_cli" => Self::KiroCli,
             _ => Self::Other,
         }
     }
@@ -306,6 +312,13 @@ impl AgentKind {
     /// dispatch return, verified in the v0.28.1 source), so the handoff is
     /// delivered on `UserPromptSubmit` instead — see
     /// [`Self::user_prompt_injects_handoff`].
+    ///
+    /// Kiro CLI injects the session-start hook's stdout on both engines:
+    /// the v2 engine adds `agentSpawn` exit-0 stdout to the agent context
+    /// and the v3 engine does the same for `SessionStart` stdout (both per
+    /// the official hooks contracts at kiro.dev/docs/cli/hooks and
+    /// kiro.dev/docs/cli/v3/hooks, cross-checked against the shipping
+    /// `HookTrigger` implementation in aws/amazon-q-developer-cli).
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -414,6 +427,30 @@ mod tests {
         // source), so the handoff is delivered on UserPromptSubmit instead.
         assert!(!AgentKind::KimiCode.session_start_injects_handoff());
         assert!(AgentKind::KimiCode.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_kiro_cli_round_trips() {
+        assert_eq!(AgentKind::KiroCli.as_str(), "kiro-cli");
+        assert_eq!(AgentKind::from_wire("kiro-cli"), AgentKind::KiroCli);
+        assert_eq!(AgentKind::from_wire("kiro"), AgentKind::KiroCli);
+        assert_eq!(AgentKind::from_wire("kiro_cli"), AgentKind::KiroCli);
+        // serde uses rename_all = "kebab-case" → "kiro-cli".
+        assert_eq!(
+            serde_json::to_string(&AgentKind::KiroCli).unwrap(),
+            "\"kiro-cli\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"kiro-cli\"").unwrap(),
+            AgentKind::KiroCli
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("kiro-ide"), AgentKind::Other);
+        // Both Kiro engines add session-start hook stdout to the agent
+        // context (v2 agentSpawn, v3 SessionStart), so the handoff is
+        // fetched and injected there — not on UserPromptSubmit.
+        assert!(AgentKind::KiroCli.session_start_injects_handoff());
+        assert!(!AgentKind::KiroCli.user_prompt_injects_handoff());
     }
 
     #[test]

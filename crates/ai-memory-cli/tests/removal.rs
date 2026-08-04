@@ -1086,6 +1086,86 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
 }
 
 #[test]
+fn uninstall_kiro_cli_hooks_preserves_user_entries_on_both_engines() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let kiro = home.path().join(".kiro");
+
+    // v2 engine surface: an agent config with a third-party hook next to ours.
+    let agents = kiro.join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let agent_config = agents.join("dev.json");
+    std::fs::write(
+        &agent_config,
+        r#"{
+  "name": "dev",
+  "tools": ["*"],
+  "hooks": {
+    "agentSpawn": [
+      {"command": "git status"},
+      {"command": "AI_MEMORY_HOOK_URL=http://h /x/kiro-cli/session-start.sh", "max_output_size": 65536}
+    ],
+    "stop": [
+      {"command": "'/usr/local/bin/ai-memory' hook --event stop --agent kiro-cli --server-url http://h:49374"}
+    ]
+  }
+}"#,
+    )
+    .unwrap();
+
+    // v3 engine surface: our standalone hooks file with one user entry inside.
+    let hooks_dir = kiro.join("hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let v3_file = hooks_dir.join("ai-memory.json");
+    std::fs::write(
+        &v3_file,
+        r#"{
+  "version": "v1",
+  "hooks": [
+    {"name": "ai-memory-session-start", "trigger": "SessionStart",
+     "action": {"type": "command", "command": "/x/kiro-cli/session-start.sh"}, "timeout": 10},
+    {"name": "lint-on-save", "trigger": "PostFileSave", "matcher": "\\.rs$",
+     "action": {"type": "command", "command": "cargo fmt"}}
+  ]
+}"#,
+    )
+    .unwrap();
+    // A neighbouring third-party hooks file must never be touched.
+    let third_party_file = hooks_dir.join("team-hooks.json");
+    let third_party_body = r#"{"version":"v1","hooks":[{"name":"security-check","trigger":"PreToolUse","action":{"type":"command","command":"/usr/bin/audit"}}]}"#;
+    std::fs::write(&third_party_file, third_party_body).unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let agent_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&agent_config).unwrap()).unwrap();
+    assert_eq!(agent_after["name"], "dev", "agent definition must survive");
+    let spawn = agent_after["hooks"]["agentSpawn"].as_array().unwrap();
+    assert_eq!(spawn.len(), 1, "only ai-memory entries removed");
+    assert_eq!(spawn[0]["command"], "git status");
+    assert!(
+        agent_after["hooks"].get("stop").is_none(),
+        "an event array left empty is dropped"
+    );
+
+    let v3_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&v3_file).unwrap()).unwrap();
+    let v3_hooks = v3_after["hooks"].as_array().unwrap();
+    assert_eq!(v3_hooks.len(), 1, "user entry in our file must survive");
+    assert_eq!(v3_hooks[0]["name"], "lint-on-save");
+
+    assert_eq!(
+        std::fs::read_to_string(&third_party_file).unwrap(),
+        third_party_body,
+        "third-party hooks files must stay byte-identical"
+    );
+}
+
+#[test]
 fn uninstall_mcp_custom_url_removes_kimi_code_only_by_endpoint() {
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();

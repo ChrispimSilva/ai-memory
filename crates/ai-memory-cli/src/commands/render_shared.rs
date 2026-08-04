@@ -77,6 +77,47 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Kiro CLI v2-engine lifecycle events. Each pair is
+/// `(trigger-name-in-agent-config, POSIX hook-script-filename)`.
+///
+/// The v2 engine embeds hooks in agent configs (`~/.kiro/agents/*.json`)
+/// keyed by camelCase triggers, per kiro.dev/docs/cli/hooks and the
+/// shipping `HookTrigger` serde in aws/amazon-q-developer-cli
+/// (`crates/chat-cli/src/cli/agent/hook.rs`). The vocabulary is exactly
+/// these five events — there is no PreCompact/SessionEnd/subagent
+/// equivalent. Adding a hook event means updating this list AND adding
+/// the matching `.sh` and `.ps1` files under `hooks/kiro-cli/`; the
+/// install-hooks parity test fails if the bundle drifts.
+///
+/// The v3 engine of the same binary uses an incompatible standalone
+/// hooks file with PascalCase triggers — see [`KIRO_CLI_V3_EVENTS`].
+/// Do not mix the two vocabularies.
+pub(crate) const KIRO_CLI_V2_EVENTS: [(&str, &str); 5] = [
+    ("agentSpawn", "session-start.sh"),
+    ("userPromptSubmit", "user-prompt-submit.sh"),
+    ("preToolUse", "pre-tool-use.sh"),
+    ("postToolUse", "post-tool-use.sh"),
+    ("stop", "stop.sh"),
+];
+
+/// Kiro CLI v3-engine lifecycle triggers (early access, `kiro-cli --v3`).
+/// Each pair is `(PascalCase trigger, POSIX hook-script-filename)`.
+///
+/// The v3 engine reads standalone versioned hooks files
+/// (`.kiro/hooks/*.json` per workspace, `~/.kiro/hooks/*.json` global)
+/// per kiro.dev/docs/cli/v3/hooks. v3 also defines task/file/manual
+/// triggers (PreTaskExec, PostFileSave, …) that ai-memory does not
+/// subscribe to; capture sticks to the shared five-event vocabulary.
+/// The same `hooks/kiro-cli/` script bundle serves both engines — only
+/// the registration surface differs.
+pub(crate) const KIRO_CLI_V3_EVENTS: [(&str, &str); 5] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+];
+
 /// Devin lifecycle events ai-memory hooks. Each pair is
 /// `(event-name-in-Devin-settings, POSIX hook-script-filename)`.
 ///
@@ -736,6 +777,139 @@ fn kimi_code_hook_commands_for_platform(
             (*event, command)
         })
         .collect()
+}
+
+/// Build the `hooks` map for a Kiro CLI v2-engine agent config. Entry
+/// shape per the shipping `Hook` struct (aws/amazon-q-developer-cli
+/// `crates/chat-cli/src/cli/agent/hook.rs`): a flat
+/// `{ "command": … }` object per trigger. Two deliberate omissions:
+///
+/// - no `matcher` key: in Kiro v2 an *absent* matcher applies the hook
+///   to every tool, while an empty-string matcher is a tool-name
+///   pattern that matches nothing — the opposite of Claude Code's
+///   empty-matcher convention, so `HookShape::Flat` must not be reused;
+/// - no `type` key: the v2 `Hook` struct has no such field.
+///
+/// `agentSpawn` sets `max_output_size` above the 10 KiB default so a
+/// fetched handoff + compiled project brief is not truncated mid-JSON
+/// before Kiro adds it to the agent context.
+pub(crate) fn build_kiro_cli_v2_hooks_value(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    build_kiro_cli_v2_hooks_value_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        HookCommandPlatform::current(),
+        data_dir,
+        project_strategy,
+    )
+}
+
+/// Session-start context injection ceiling for Kiro v2 (`max_output_size`).
+/// Kiro truncates hook stdout beyond this; 64 KiB comfortably covers a
+/// handoff plus a `[briefing]`-budgeted brief.
+pub(crate) const KIRO_CLI_V2_SESSION_START_MAX_OUTPUT: usize = 64 * 1024;
+
+fn build_kiro_cli_v2_hooks_value_for_platform(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    platform: HookCommandPlatform,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut hooks = serde_json::Map::new();
+    for (event, script) in KIRO_CLI_V2_EVENTS {
+        let script = script_for_platform(script, platform);
+        let abs = emit_root.join(script.as_ref());
+        let command = hook_command(
+            &abs,
+            server_url,
+            auth_token,
+            HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
+        );
+        let mut entry = serde_json::Map::new();
+        entry.insert("command".to_string(), Value::String(command));
+        if event == "agentSpawn" {
+            entry.insert(
+                "max_output_size".to_string(),
+                Value::from(KIRO_CLI_V2_SESSION_START_MAX_OUTPUT),
+            );
+        }
+        hooks.insert(event.to_string(), json!([Value::Object(entry)]));
+    }
+    hooks
+}
+
+/// Build the standalone versioned hooks file for the Kiro CLI v3 engine
+/// (`~/.kiro/hooks/ai-memory.json`), per kiro.dev/docs/cli/v3/hooks:
+/// `{"version":"v1","hooks":[{name, description, trigger, action, timeout}]}`
+/// with PascalCase triggers and `{"type":"command","command":…}` actions.
+/// No `matcher` key — an omitted matcher always fires, and v3 matchers
+/// are regexes over tool names / prompt text, none of which a capture
+/// hook wants to filter. Every entry name carries the `ai-memory-`
+/// prefix; reapply and uninstall identify our entries by that prefix or
+/// by the command string, so third-party hooks that a user placed in
+/// the same file survive.
+///
+/// `timeout` is in SECONDS on v3 (not v2's `timeout_ms`). The scripts
+/// self-bound their network waits well under a second, so 10 s is a
+/// generous ceiling that still protects the session UX.
+pub(crate) fn build_kiro_cli_v3_hooks_file(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_kiro_cli_v3_hooks_file_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        HookCommandPlatform::current(),
+        data_dir,
+        project_strategy,
+    )
+}
+
+/// Timeout (seconds) for ai-memory's Kiro v3 hook entries.
+pub(crate) const KIRO_CLI_V3_HOOK_TIMEOUT_SECONDS: u64 = 10;
+
+fn build_kiro_cli_v3_hooks_file_for_platform(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    platform: HookCommandPlatform,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    let hooks: Vec<Value> = KIRO_CLI_V3_EVENTS
+        .iter()
+        .map(|(trigger, script)| {
+            let stem = script.trim_end_matches(".sh");
+            let script = script_for_platform(script, platform);
+            let abs = emit_root.join(script.as_ref());
+            let command = hook_command(
+                &abs,
+                server_url,
+                auth_token,
+                HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
+            );
+            json!({
+                "name": format!("ai-memory-{stem}"),
+                "description": "ai-memory lifecycle capture (fire-and-forget)",
+                "trigger": trigger,
+                "action": { "type": "command", "command": command },
+                "timeout": KIRO_CLI_V3_HOOK_TIMEOUT_SECONDS,
+            })
+        })
+        .collect();
+    json!({ "version": "v1", "hooks": hooks })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

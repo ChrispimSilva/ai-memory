@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, VS Code Copilot)
+  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -680,6 +680,91 @@ script-fallback installation so its staged scripts are refreshed.
 Kimi Code hook entries accept only `event`, `matcher`, `command`, and
 `timeout`; extra fields make the whole `config.toml` fail to load, so prefer
 `install-hooks --apply` over hand edits.
+
+### Kiro CLI
+
+The AWS Kiro CLI ships two agent engines in one binary — the default v2
+engine and the early-access v3 engine (`kiro-cli chat --agent-engine v3`,
+alias `--v3`) — and their hook surfaces are **not compatible**: v2 embeds
+camelCase hook entries inside agent configs, while v3 reads standalone
+versioned hooks files with PascalCase triggers. ai-memory never guesses
+which engine you use; each surface is installed by its own explicit agent
+selection, and installing both is safe (each engine ignores the other's
+surface). Both honor `$KIRO_HOME` (default `~/.kiro`) and stage the same
+`hooks/kiro-cli/` script bundle. Contracts verified against kiro-cli
+2.16.0 and the official hook references
+([v2](https://kiro.dev/docs/cli/hooks/), [v3](https://kiro.dev/docs/cli/v3/hooks/)).
+
+**v2 engine (default)** — hooks live inside each agent config
+(`~/.kiro/agents/*.json`); there is no global v2 hook surface, and the
+built-in default agent has no file on disk. Create an agent config first
+if you have none (`kiro-cli agent create`, then
+`kiro-cli agent set-default <name>`):
+
+```bash
+ai-memory install-hooks --agent kiro-cli --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+This merges five flat entries — `agentSpawn`, `userPromptSubmit`,
+`preToolUse`, `postToolUse`, `stop` — into **every** existing agent config
+(or only the one passed via `--config-file`), preserving third-party
+entries under the same triggers. Entries deliberately carry no `matcher`
+key: in Kiro v2 an absent matcher applies the hook to every tool, while an
+empty-string matcher matches nothing. The `agentSpawn` entry raises
+`max_output_size` to 64 KiB so an injected handoff + project brief is not
+truncated. A pending handoff is injected at `agentSpawn` through the
+hook's exit-0 stdout, which the v2 engine adds to the agent context.
+
+**v3 engine (early access)** — hooks are standalone files; global ones
+under `~/.kiro/hooks/` fire in every workspace:
+
+```bash
+ai-memory install-hooks --agent kiro-cli-v3 --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+This writes `~/.kiro/hooks/ai-memory.json` (`{"version":"v1","hooks":[…]}`)
+with five command actions — `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `Stop` — and a 10-second timeout each (v3
+timeouts are seconds; v2 uses `timeout_ms`). Other `*.json` files in the
+hooks directory are never touched, and non-ai-memory entries inside
+`ai-memory.json` survive re-applies and uninstall. A pending handoff is
+injected at `SessionStart` through the hook's exit-0 stdout, which the v3
+engine adds to the agent context. The v3 stdin payload field names are not
+publicly documented yet; capture forwards the raw event JSON, and
+tool-payload extraction (for `[capture] ignore_paths` enforcement) is
+verified on the v2 payload shape (`tool_name`/`tool_input`).
+
+On both engines the hooks are fail-open by contract: they always exit 0
+and print nothing on capture paths (exit code 2 would block the tool call
+on `preToolUse`/`PreToolUse`, and stray stdout would leak into the agent
+context on session-start/user-prompt events), so a stopped ai-memory
+server never breaks a Kiro session.
+
+**MCP** — the installer does not manage Kiro's MCP config yet. Add the
+server manually to `~/.kiro/settings/mcp.json`, using the `bedrock`
+schema flavor: Kiro talks to Amazon Bedrock's Converse API, which rejects
+root-level `anyOf`/`oneOf`/`allOf` in tool schemas, and the flavored URL
+serves the same tools with flattened root schemas:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "http://homelab:49374/mcp?flavor=bedrock",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+Sessions launched with `--v3` cannot be resumed by the v2 engine (and
+vice versa) — the resume hint Kiro prints at session end needs `--v3`
+added manually. Managed `ai-memory run kiro` support is tracked
+separately (upstream issue #356).
 
 ### OpenCode
 

@@ -42,6 +42,10 @@ enum RewriteOp {
     ZeroHooksJson,
     /// Kimi Code `[[hooks]]` rules inside config.toml.
     KimiCodeHooksToml,
+    /// Kiro CLI v3 standalone hooks file — `hooks` array entries whose
+    /// `name` carries the `ai-memory-` prefix (or whose command action
+    /// references ai-memory).
+    KiroCliV3HooksJson,
     /// MCP JSON config for one client shape.
     McpJson(McpClient),
     /// Codex TOML MCP config.
@@ -181,6 +185,15 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 HookConfigShape::NestedHooksKey,
             ),
         ]);
+        // Kiro CLI v2-engine agent configs embed hooks under the standard
+        // `hooks` key (flat command entries), so the same strip pass
+        // removes ours from every config in the agents directory while
+        // preserving third-party entries.
+        hook_files.extend(
+            install_hooks::list_kiro_cli_agent_configs(&install_hooks::kiro_cli_agents_dir()?)?
+                .into_iter()
+                .map(|path| (path, HookConfigShape::NestedHooksKey)),
+        );
         for (path, shape) in hook_files {
             if !path.exists() {
                 continue;
@@ -235,6 +248,19 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 kimi_code,
                 removal.removed_events,
                 RewriteOp::KimiCodeHooksToml,
+            );
+        }
+
+        let kiro_v3 = install_hooks::kiro_cli_v3_hooks_path()?;
+        if kiro_v3.exists() {
+            let content = std::fs::read_to_string(&kiro_v3)
+                .with_context(|| format!("reading {}", kiro_v3.display()))?;
+            let removal = strip_kiro_cli_v3_hooks(&content)?;
+            push_rewrite(
+                &mut plan,
+                kiro_v3,
+                removal.removed_events,
+                RewriteOp::KiroCliV3HooksJson,
             );
         }
 
@@ -468,6 +494,7 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
                         }
                         RewriteOp::ZeroHooksJson => strip_zero_hooks(&out)?.new_content,
                         RewriteOp::KimiCodeHooksToml => strip_kimi_code_hooks(&out)?.new_content,
+                        RewriteOp::KiroCliV3HooksJson => strip_kiro_cli_v3_hooks(&out)?.new_content,
                         RewriteOp::McpJson(client) => {
                             strip_mcp_json_client(&out, client, name, url)?.0
                         }
@@ -763,6 +790,43 @@ fn strip_zero_hooks(content: &str) -> Result<HookRemoval> {
                 .is_some_and(|id| id.starts_with("ai-memory-"));
             if ours && let Some(id) = hook.get("id").and_then(|v| v.as_str()) {
                 removed_events.push(id.to_string());
+            }
+            !ours
+        });
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
+
+/// Remove ai-memory's entries from the Kiro CLI v3 standalone hooks file
+/// (`~/.kiro/hooks/ai-memory.json`). Install writes every entry with the
+/// `ai-memory-` name prefix, so the prefix is the primary ownership
+/// signature; a command action referencing ai-memory covers hand-edited
+/// entries. Non-ai-memory entries a user added to the same file survive,
+/// and the pinned `version` key is left alone (an empty `hooks` array is
+/// a valid v3 file).
+fn strip_kiro_cli_v3_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(hooks) = root.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+            return Ok(());
+        };
+        hooks.retain(|hook| {
+            let name = hook.get("name").and_then(|v| v.as_str());
+            let ours = name.is_some_and(|name| name.starts_with("ai-memory-"))
+                || hook
+                    .get("action")
+                    .and_then(|action| action.get("command"))
+                    .and_then(|command| command.as_str())
+                    .is_some_and(|command| {
+                        let lower = command.to_ascii_lowercase();
+                        lower.contains("ai-memory") || lower.contains("ai_memory")
+                    });
+            if ours {
+                removed_events.push(format!("kiro-cli-v3.{}", name.unwrap_or("<unnamed>")));
             }
             !ours
         });

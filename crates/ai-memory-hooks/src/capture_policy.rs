@@ -130,6 +130,9 @@ pub(crate) fn tool_observation_metadata(
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
+        // Kiro CLI (fixture-backed, kiro.dev/docs/cli/hooks): tool hooks
+        // carry `tool_name` + `tool_input`; no call-id field is documented.
+        AgentKind::KiroCli => (object.get("tool_name")?.as_str()?, None),
         AgentKind::OpenCode => (
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
@@ -147,11 +150,13 @@ pub(crate) fn tool_observation_metadata(
         || match agent {
             AgentKind::AntigravityCli => object.get("toolCall")?.get("args").is_some(),
             _ => object
-                .get(if agent == AgentKind::ClaudeCode {
-                    "tool_input"
-                } else {
-                    "args"
-                })
+                .get(
+                    if matches!(agent, AgentKind::ClaudeCode | AgentKind::KiroCli) {
+                        "tool_input"
+                    } else {
+                        "args"
+                    },
+                )
                 .is_some(),
         };
     has_args.then(|| ToolObservationMetadata {
@@ -166,6 +171,17 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         AgentKind::Pi => match raw.get("isError").and_then(Value::as_bool) {
             Some(true) => ToolOutcome::Error,
             Some(false) => ToolOutcome::Success,
+            None => ToolOutcome::Unknown,
+        },
+        // Kiro CLI postToolUse documents `tool_response.success`
+        // (kiro.dev/docs/cli/hooks).
+        AgentKind::KiroCli => match raw
+            .get("tool_response")
+            .and_then(|response| response.get("success"))
+            .and_then(Value::as_bool)
+        {
+            Some(true) => ToolOutcome::Success,
+            Some(false) => ToolOutcome::Error,
             None => ToolOutcome::Unknown,
         },
         AgentKind::AntigravityCli
@@ -507,7 +523,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         | AgentKind::Codex
         | AgentKind::Cursor
         | AgentKind::GeminiCli
-        | AgentKind::Devin => object
+        | AgentKind::Devin
+        | AgentKind::KiroCli => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -556,13 +573,17 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
 
 fn family(name: &str) -> ToolFamily {
     match name.to_ascii_lowercase().as_str() {
+        // `fs_read`/`fs_write` are Kiro CLI's built-in file tools
+        // (kiro.dev/docs/cli/reference/built-in-tools).
         "read" | "write" | "edit" | "apply_patch" | "notebookedit" | "notebook_edit"
         | "create_file" | "delete_file" | "rename_file" | "move_file" | "multi_edit"
-        | "multiedit" | "replace" | "replace_all" => ToolFamily::File,
+        | "multiedit" | "replace" | "replace_all" | "fs_read" | "fs_write" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir" => {
             ToolFamily::SearchList
         }
-        "bash" | "shell" | "execute" | "run_command" | "web_search" => ToolFamily::NonFile,
+        // `execute_bash`/`execute_cmd` are Kiro CLI's shell tools.
+        "bash" | "shell" | "execute" | "run_command" | "web_search" | "execute_bash"
+        | "execute_cmd" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
 }
@@ -593,6 +614,28 @@ fn extract_paths(name: &str, args: &Value) -> Option<Vec<String>> {
             .get("edits")
             .or_else(|| object.get("replacements"))?
             .as_array()?;
+        if entries.is_empty() {
+            return None;
+        }
+        if entries.len() > MAX_CAPTURE_CANDIDATES {
+            return None;
+        }
+        for entry in entries {
+            let paths_in_entry = direct_paths(entry.as_object()?)?;
+            if paths.len().checked_add(paths_in_entry.len())? > MAX_CAPTURE_CANDIDATES {
+                return None;
+            }
+            paths.extend(paths_in_entry);
+        }
+    }
+    // Kiro CLI's `fs_read` batches its targets as
+    // `{"operations":[{"mode":…,"path":…},…]}`; every operation must
+    // yield a path or the extraction is treated as malformed (which
+    // fails safe under an active policy).
+    if name.eq_ignore_ascii_case("fs_read")
+        && let Some(operations) = object.get("operations")
+    {
+        let entries = operations.as_array()?;
         if entries.is_empty() {
             return None;
         }
