@@ -173,6 +173,25 @@ proxied caller on the single-operator escape hatch that waves admin through.
 One question, every gate: the MCP admin tools, the `/admin/*` route layer, and
 the ownership stamped on handoffs and sessions all ask it.
 
+## MCP client activity
+
+`GET /admin/activity/by-client` reports server-wide MCP tool calls rather than
+lifecycle sessions or project-owned data. Stateful HTTP and stdio use the
+sanitized MCP `clientInfo.name`; stateless requests fall back to an
+authenticated proxy's actor-agent label and then `unknown`. Results have the
+stable shape
+`{"by_client":[{"client":"claude-code","reads":12,"writes":3}]}` and are
+ordered by total calls, then client name.
+
+`since_days=N` includes every UTC day bucket intersecting that lookback; zero
+or omission means all history. Calls flush on a one-minute background interval
+even if no later request arrives, and retry failed batches once per interval;
+process exit can lose the current interval. Each UTC day stores at most 128
+distinct labels and folds additional labels into `other`. The endpoint takes
+no workspace or project because many MCP-only clients do not provide reliable
+per-call scope. Like every `/admin/*` route, it is root-only when the deployment
+distinguishes operators.
+
 ## Per-operator memory slots
 
 The "absent means shared" rule extends to memory slots, so a single-operator
