@@ -81,7 +81,7 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
 /// `(trigger-name-in-agent-config, POSIX hook-script-filename)`.
 ///
 /// The v2 engine embeds hooks in agent configs (`~/.kiro/agents/*.json`)
-/// keyed by camelCase triggers, per kiro.dev/docs/cli/hooks and the
+/// keyed by camelCase triggers, per kiro.dev/docs/hooks and the
 /// shipping `HookTrigger` serde in aws/amazon-q-developer-cli
 /// (`crates/chat-cli/src/cli/agent/hook.rs`). The vocabulary is exactly
 /// these five events — there is no PreCompact/SessionEnd/subagent
@@ -89,9 +89,10 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
 /// the matching `.sh` and `.ps1` files under `hooks/kiro-cli/`; the
 /// install-hooks parity test fails if the bundle drifts.
 ///
-/// Kiro's v3 engine uses a different standalone registration format, but
-/// its command-input payload is not documented. Do not advertise or install
-/// v3 hooks until that input contract can be captured in fixtures and tested.
+/// Kiro's v3 engine uses a documented standalone registration format, but its
+/// live lifecycle and built-in tool payloads have not been accepted as
+/// fixtures. Do not advertise or install v3 hooks until those exact contracts
+/// are captured and tested.
 pub(crate) const KIRO_CLI_V2_EVENTS: [(&str, &str); 5] = [
     ("agentSpawn", "session-start.sh"),
     ("userPromptSubmit", "user-prompt-submit.sh"),

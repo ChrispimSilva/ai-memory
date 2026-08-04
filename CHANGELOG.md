@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalid, infer remote connectivity from the managed Kiro MCP entry, inject
   handoffs through `agentSpawn` stdout, enforce capture exclusions for known
   v2 tool payloads, and uninstall only exact ai-memory entries. Kiro v3 hook
-  capture remains unsupported until its command-input payload is documented
-  and can be fixture-tested (#355).
+  capture remains unsupported pending sanitized live lifecycle and built-in
+  tool payload fixtures, despite its now-documented standalone schema (#355).
 
 ### Fixed
 - Mixed-case and trailing-period usernames now use deterministic hashed

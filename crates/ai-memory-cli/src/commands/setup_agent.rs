@@ -150,7 +150,8 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         // `[[hooks]]` TOML merge into the user's config.toml.
         AgentChoice::KimiCode => emit_other(&emit_root, agent_sub, &args, &[&KIMI_CODE_EVENTS]),
         // Kiro v2 embeds its lifecycle hooks in agent configs. Kiro v3 is
-        // withheld until its command-input payload contract is documented.
+        // withheld until its live lifecycle and built-in tool payloads are
+        // captured in fixtures.
         AgentChoice::KiroCli => {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V2_EVENTS]);
         }

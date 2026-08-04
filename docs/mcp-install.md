@@ -850,17 +850,19 @@ target before changing any of them. Project-local Kiro agents override global
 agents, so `--config-file` is required when the active definition lives under
 `.kiro/agents/`. The integration remains fail-open, injects pending handoffs
 through `agentSpawn` stdout, and honors `$KIRO_HOME`. Kiro v3 hook capture is
-not installed because its registration migration guide does not document the
-command-input payload needed to validate capture and exclusion behavior. Follow
+not installed: its standalone schema and generic command context are now
+documented, but sanitized live lifecycle and built-in tool payload fixtures are
+still needed to validate capture, exclusions, and fail-open behavior. Follow
 [#355](https://github.com/akitaonrails/ai-memory/issues/355) for v3 hook support
 and [#356](https://github.com/akitaonrails/ai-memory/issues/356) for automatic
 selection and broader version-aware managed support. Explicit
 `ai-memory run kiro` (alias `kiro-cli`) manages the default v2 engine;
 non-v2 engine selections pass through without session injection or import.
 
-Sources: <https://kiro.dev/docs/cli/mcp/configuration/>,
-<https://kiro.dev/docs/cli/reference/settings/>,
-<https://kiro.dev/docs/cli/hooks/>, and
+Sources: <https://kiro.dev/docs/mcp/configuration/>,
+<https://kiro.dev/docs/reference/settings/>,
+<https://kiro.dev/docs/hooks/>,
+<https://kiro.dev/docs/hooks/types/>, and
 <https://kiro.dev/docs/cli/v3/hooks-migration/>.
 
 ## OpenClaw

@@ -1147,8 +1147,8 @@ fn render_kiro_cli(args: &InstallMcpArgs) -> Result<String> {
          # schema combinators while handler validation remains unchanged.\n\
          # Lifecycle capture for the documented v2 engine is installed\n\
          # separately with `install-hooks --agent kiro-cli`. Kiro v3 hook\n\
-         # capture remains unsupported until its command-input contract is\n\
-         # documented.\n\
+         # capture remains unsupported pending fixture-verified lifecycle\n\
+         # and built-in tool payloads for its standalone schema.\n\
          # Managed workstreams are not installed by this command.\n\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
