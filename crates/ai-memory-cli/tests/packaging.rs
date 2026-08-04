@@ -39,6 +39,15 @@ fn shell_script_command(script: &Path) -> Command {
 }
 
 #[cfg(unix)]
+// Preserve the script path as `$0` without directly execing a just-written file,
+// which can transiently return ETXTBSY under parallel Linux test load.
+fn freshly_written_shell_script_command(script: &Path) -> Command {
+    let mut command = Command::new("bash");
+    command.arg(script);
+    command
+}
+
+#[cfg(unix)]
 fn shell_path(path: &Path) -> String {
     path.display().to_string()
 }
@@ -513,7 +522,7 @@ fn wrapper_self_upgrade_rejects_a_checksum_mismatch() {
         shell_path(&bin_dir),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = shell_script_command(&wrapper)
+    let output = freshly_written_shell_script_command(&wrapper)
         .arg("upgrade")
         .env("PATH", path)
         .env("HOME", tmp.path())
@@ -581,7 +590,7 @@ fn wrapper_self_upgrade_installs_and_runs_a_verified_payload() {
         shell_path(&bin_dir),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = shell_script_command(&wrapper)
+    let output = freshly_written_shell_script_command(&wrapper)
         .arg("upgrade")
         .env("PATH", path)
         .env("HOME", tmp.path())
