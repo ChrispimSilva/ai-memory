@@ -795,8 +795,10 @@ same pattern as Gemini CLI.
 
 ## Kiro CLI
 
-**Status:** MCP and v2 lifecycle hooks supported. Managed workstreams are
-tracked separately.
+**Status:** MCP, v2 lifecycle hooks, and explicit v2 managed workstreams are
+supported. Bare automatic workstream selection remains unsupported pending a
+logged-in current-format v2 acceptance run. V3 hooks and managed sessions need
+their own documented, fixture-tested payload and store contracts.
 
 **Config file:** `$KIRO_HOME/settings/mcp.json`, defaulting to
 `~/.kiro/settings/mcp.json`. Use `--config-file .kiro/settings/mcp.json` when
@@ -850,8 +852,11 @@ agents, so `--config-file` is required when the active definition lives under
 through `agentSpawn` stdout, and honors `$KIRO_HOME`. Kiro v3 hook capture is
 not installed because its registration migration guide does not document the
 command-input payload needed to validate capture and exclusion behavior. Follow
-[#356](https://github.com/akitaonrails/ai-memory/issues/356) for managed
-workstreams.
+[#355](https://github.com/akitaonrails/ai-memory/issues/355) for v3 hook support
+and [#356](https://github.com/akitaonrails/ai-memory/issues/356) for automatic
+selection and broader version-aware managed support. Explicit
+`ai-memory run kiro` (alias `kiro-cli`) manages the default v2 engine;
+non-v2 engine selections pass through without session injection or import.
 
 Sources: <https://kiro.dev/docs/cli/mcp/configuration/>,
 <https://kiro.dev/docs/cli/reference/settings/>,

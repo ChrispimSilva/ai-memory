@@ -2418,7 +2418,10 @@ fn valid_native_session_id(value: &str) -> bool {
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
-    left.canonicalize().ok() == right.canonicalize().ok()
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn deduplicate_losses(losses: Vec<String>) -> Vec<String> {
@@ -2434,6 +2437,20 @@ fn deduplicate_losses(losses: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkout_path_comparison_fails_closed_when_canonicalization_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+
+        assert!(same_path(&existing, &existing));
+        assert!(!same_path(&existing, &temp.path().join("missing")));
+        assert!(!same_path(
+            &temp.path().join("missing-left"),
+            &temp.path().join("missing-right")
+        ));
+    }
 
     #[tokio::test]
     async fn jsonl_candidate_discovery_covers_every_file_adapter_and_checkout_scope() {
@@ -2664,20 +2681,22 @@ mod tests {
     #[test]
     fn omp_adapter_reads_complete_atomic_write_temp_transcript() {
         let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir(&cwd).unwrap();
         let session = "019f80c5-0148-7000-82d5-9a3c4c9b9be3";
         let path = temp
             .path()
             .join(format!(".session_{session}.jsonl.nonce.tmp"));
         std::fs::write(
             &path,
-            format!("{{\"type\":\"session\",\"id\":\"{session}\",\"cwd\":\"/repo\"}}\n"),
+            format!("{}\n", json!({"type":"session","id":session,"cwd":cwd})),
         )
         .unwrap();
 
         let found = locate_session_file(
             ManagedHarness::Omp,
             temp.path(),
-            Path::new("/repo"),
+            &cwd,
             Some(temp.path()),
             session,
         )

@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture remains unsupported until its command-input payload is documented
   and can be fixture-tested (#355).
 
+### Fixed
+- Native-session checkout matching now fails closed when either path cannot be
+  canonicalized, instead of treating two missing or inaccessible paths as the
+  same checkout during managed resume or adoption (#356).
+
 ## [1.23.0] - 2026-08-03
 
 ### Changed
