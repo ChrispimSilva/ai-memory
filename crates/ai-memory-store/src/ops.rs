@@ -1111,17 +1111,95 @@ pub(crate) fn bump_client_activity(
     if entries.is_empty() {
         return Ok(());
     }
+    for (client, _, _, _) in entries {
+        if !is_normalized_client_activity_label(client) {
+            return Err(StoreError::InvalidState(
+                "client activity label is not normalized".into(),
+            ));
+        }
+    }
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO client_activity (client, day, reads, writes)              VALUES (?1, ?2, ?3, ?4)              ON CONFLICT(client, day) DO UPDATE SET                  reads = reads + excluded.reads,                  writes = writes + excluded.writes",
+            "INSERT INTO client_activity (client, day, reads, writes) \
+             VALUES ( \
+                 CASE \
+                     WHEN ?1 = ?5 \
+                       OR EXISTS ( \
+                           SELECT 1 FROM client_activity \
+                           WHERE client = ?1 AND day = ?2 \
+                       ) \
+                       OR ( \
+                           SELECT COUNT(*) FROM client_activity \
+                           WHERE day = ?2 AND client <> ?5 \
+                       ) < ?6 \
+                     THEN ?1 \
+                     ELSE ?5 \
+                 END, \
+                 ?2, ?3, ?4 \
+             ) \
+             ON CONFLICT(client, day) DO UPDATE SET \
+                 reads = CASE \
+                     WHEN reads > 9223372036854775807 - excluded.reads \
+                     THEN 9223372036854775807 \
+                     ELSE reads + excluded.reads \
+                 END, \
+                 writes = CASE \
+                     WHEN writes > 9223372036854775807 - excluded.writes \
+                     THEN 9223372036854775807 \
+                     ELSE writes + excluded.writes \
+                 END",
         )?;
         for (client, day, reads, writes) in entries {
-            stmt.execute(params![client, day, reads, writes])?;
+            if *reads == 0 && *writes == 0 {
+                continue;
+            }
+            stmt.execute(params![
+                client,
+                day,
+                reads,
+                writes,
+                crate::CLIENT_ACTIVITY_OVERFLOW_CLIENT,
+                crate::CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY,
+            ])?;
         }
     }
     tx.commit()?;
     Ok(())
+}
+
+fn is_normalized_client_activity_label(client: &str) -> bool {
+    if client.is_empty()
+        || client != client.trim()
+        || client.chars().count() > crate::CLIENT_ACTIVITY_MAX_NAME_CHARS
+        || client.chars().any(|c| c.is_control() || is_bidi_control(c))
+    {
+        return false;
+    }
+
+    let mut previous_space = false;
+    for c in client.chars() {
+        if c.is_whitespace() {
+            if c != ' ' || previous_space {
+                return false;
+            }
+            previous_space = true;
+        } else {
+            previous_space = false;
+        }
+    }
+    true
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Bump `access_count` + `last_accessed_at` for the pages whose ids

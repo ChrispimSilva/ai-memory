@@ -901,10 +901,13 @@ impl WriterHandle {
     }
 
     /// Fold buffered per-client MCP tool-call counts into their
-    /// `(client, day)` buckets. Entries are deltas, not totals.
+    /// `(client, day)` buckets. Entries are deltas, not totals. Labels must
+    /// already be normalized; each UTC day retains a bounded number of named
+    /// clients and folds later names into the stable overflow bucket.
     ///
     /// # Errors
-    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    /// Returns [`StoreError::WriterClosed`], rejects malformed labels with
+    /// [`StoreError::InvalidState`], or propagates SQL errors.
     pub async fn bump_client_activity(
         &self,
         entries: Vec<(String, i64, u32, u32)>,

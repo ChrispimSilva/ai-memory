@@ -511,6 +511,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `GET  /admin/projects`
 /// - `GET  /admin/open-sessions`
 /// - `GET  /admin/sessions/by-agent`
+/// - `GET  /admin/activity/by-client`
 /// - `GET  /admin/audit-contamination`
 /// - `GET  /admin/search`
 /// - `GET  /admin/read-page`
@@ -8384,6 +8385,11 @@ mod tests {
                 "/admin/sessions/by-agent?workspace=default&project=scratch",
                 serde_json::Value::Null,
             ),
+            (
+                "GET",
+                "/admin/activity/by-client?since_days=7",
+                serde_json::Value::Null,
+            ),
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
             (
@@ -8590,6 +8596,19 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/status")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/activity/by-client?since_days=7")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),

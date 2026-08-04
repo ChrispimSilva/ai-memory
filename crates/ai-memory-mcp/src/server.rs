@@ -14,7 +14,11 @@ use ai_memory_core::{
     ProjectId, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider};
-use ai_memory_store::{AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun};
+use ai_memory_store::{
+    AutoImproveProposalOperation, CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY,
+    CLIENT_ACTIVITY_MAX_NAME_CHARS, CLIENT_ACTIVITY_OVERFLOW_CLIENT, NewAutoImproveProposal,
+    StageAutoImproveRun,
+};
 use ai_memory_store::{DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WriterHandle};
 use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -598,28 +602,117 @@ const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Microseconds in one UTC day, for `client_activity` bucketing.
 const US_PER_DAY: i64 = 86_400_000_000;
-/// How long buffered client-activity counts may age before the next
-/// tool call flushes them to the store. Counts inside the window are
-/// lost on process exit — acceptable for telemetry, and the price of
-/// not putting a write on every read's hot path.
+/// How long buffered client-activity counts may age before a background
+/// task flushes them to the store. Counts inside the window are lost on
+/// process exit; failed writes stay bounded in memory and retry.
 const CLIENT_ACTIVITY_FLUSH: std::time::Duration = std::time::Duration::from_secs(60);
-/// Cap on a sanitized client name. MCP `clientInfo.name` is untrusted
-/// free text; anything longer is truncated on a char boundary.
-const MAX_CLIENT_NAME_CHARS: usize = 64;
+
+type ClientActivityEntry = (String, i64, u32, u32);
 
 /// In-memory accumulation of per-client tool-call counts between
 /// flushes. Keyed by `(client, utc_day)` so a flush that straddles
 /// midnight books each call to the day it actually happened.
 struct ClientActivityBuffer {
-    last_flush: std::time::Instant,
     pending: HashMap<(String, i64), (u32, u32)>,
+    flush_scheduled: bool,
 }
 
 impl ClientActivityBuffer {
     fn new() -> Self {
         Self {
-            last_flush: std::time::Instant::now(),
             pending: HashMap::new(),
+            flush_scheduled: false,
+        }
+    }
+
+    /// Record a delta and return whether the caller must start the sole
+    /// background flusher for this shared buffer.
+    fn record(&mut self, client: String, day: i64, is_write: bool) -> bool {
+        self.record_delta(client, day, u32::from(!is_write), u32::from(is_write));
+        if self.flush_scheduled {
+            false
+        } else {
+            self.flush_scheduled = true;
+            true
+        }
+    }
+
+    fn record_delta(&mut self, client: String, day: i64, reads: u32, writes: u32) {
+        let client = if client == CLIENT_ACTIVITY_OVERFLOW_CLIENT
+            || self.pending.contains_key(&(client.clone(), day))
+        {
+            client
+        } else {
+            let named_clients = self
+                .pending
+                .keys()
+                .filter(|(name, bucket_day)| {
+                    *bucket_day == day && name.as_str() != CLIENT_ACTIVITY_OVERFLOW_CLIENT
+                })
+                .count();
+            if named_clients < CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY {
+                client
+            } else {
+                CLIENT_ACTIVITY_OVERFLOW_CLIENT.to_string()
+            }
+        };
+        let slot = self.pending.entry((client, day)).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(reads);
+        slot.1 = slot.1.saturating_add(writes);
+    }
+
+    fn take_entries(&mut self) -> Vec<ClientActivityEntry> {
+        std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|((client, day), (reads, writes))| (client, day, reads, writes))
+            .collect()
+    }
+
+    fn restore_entries(&mut self, entries: Vec<ClientActivityEntry>) {
+        for (client, day, reads, writes) in entries {
+            self.record_delta(client, day, reads, writes);
+        }
+    }
+}
+
+async fn flush_client_activity_loop(
+    buffer: Arc<Mutex<ClientActivityBuffer>>,
+    writer: WriterHandle,
+    interval: Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let entries = {
+            let mut buffer = buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if buffer.pending.is_empty() {
+                buffer.flush_scheduled = false;
+                None
+            } else {
+                Some(buffer.take_entries())
+            }
+        };
+        let Some(entries) = entries else {
+            return;
+        };
+
+        if let Err(error) = writer.bump_client_activity(entries.clone()).await {
+            let mut buffer = buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            buffer.restore_entries(entries);
+            drop(buffer);
+            tracing::warn!(%error, "client activity flush failed; retrying");
+            continue;
+        }
+
+        let mut buffer = buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if buffer.pending.is_empty() {
+            buffer.flush_scheduled = false;
+            return;
         }
     }
 }
@@ -638,20 +731,37 @@ fn tool_call_is_write(tool: &str) -> bool {
             | "memory_briefing"
             | "memory_explore"
             | "memory_status"
+            | "memory_install_self_routing"
     )
 }
 
 /// Trim, drop control characters, and cap an untrusted client name.
 /// `None` when nothing printable remains.
 fn sanitize_client_name(raw: &str) -> Option<String> {
-    let cleaned: String = raw
+    let printable: String = raw
         .trim()
         .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_CLIENT_NAME_CHARS)
+        .filter(|c| !c.is_control() && !is_bidi_control(*c))
         .collect();
-    let cleaned = cleaned.trim().to_string();
+    let cleaned: String = printable
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(CLIENT_ACTIVITY_MAX_NAME_CHARS)
+        .collect();
     (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Cap on the free-text `reason` stored with a feedback signal.
@@ -3612,16 +3722,8 @@ impl AiMemoryServer {
             .and_then(ai_memory_core::ActorContext::identity_key)
     }
 
-    /// Fire-and-forget access-counter bump for the M8 reinforcement term,
-    /// throttled to at most one bump per page PER OPERATOR per
-    /// [`ACCESS_BUMP_COOLDOWN`] (see [`select_bumpable`]). Keyed per operator
-    /// on purpose: a throttle keyed on the page alone would let whoever read
-    /// it first swallow everybody else's reinforcement inside the window, so
-    /// breadth — the signal `[decay] breadth_weight` exists to read — would
-    /// under-count exactly on the busy pages it matters for. Failures are
-    /// logged at warn but never surfaced to the caller.
-    /// Record one MCP tool call against its client and flush the buffer
-    /// when it is older than [`CLIENT_ACTIVITY_FLUSH`]. Client identity
+    /// Record one MCP tool call against its client and start the shared
+    /// background flusher when needed. Client identity
     /// prefers the MCP `clientInfo.name` from the initialize handshake
     /// (present in stateful HTTP / stdio); a stateless transport carries
     /// no handshake, so the `X-Memory-Actor-Agent` overlay is the
@@ -3648,38 +3750,30 @@ impl AiMemoryServer {
             .as_microsecond()
             .div_euclid(US_PER_DAY);
         let is_write = tool_call_is_write(tool);
-        let due = {
+        let schedule_flush = {
             let mut buffer = self
                 .client_activity
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let slot = buffer.pending.entry((client, day)).or_insert((0, 0));
-            if is_write {
-                slot.1 = slot.1.saturating_add(1);
-            } else {
-                slot.0 = slot.0.saturating_add(1);
-            }
-            if buffer.last_flush.elapsed() >= CLIENT_ACTIVITY_FLUSH {
-                buffer.last_flush = std::time::Instant::now();
-                Some(std::mem::take(&mut buffer.pending))
-            } else {
-                None
-            }
+            buffer.record(client, day, is_write)
         };
-        if let Some(pending) = due {
-            let entries: Vec<(String, i64, u32, u32)> = pending
-                .into_iter()
-                .map(|((client, day), (reads, writes))| (client, day, reads, writes))
-                .collect();
-            let writer = self.writer.clone();
-            tokio::spawn(async move {
-                if let Err(e) = writer.bump_client_activity(entries).await {
-                    tracing::warn!(error = %e, "client activity flush failed");
-                }
-            });
+        if schedule_flush {
+            tokio::spawn(flush_client_activity_loop(
+                self.client_activity.clone(),
+                self.writer.clone(),
+                CLIENT_ACTIVITY_FLUSH,
+            ));
         }
     }
 
+    /// Fire-and-forget access-counter bump for the M8 reinforcement term,
+    /// throttled to at most one bump per page PER OPERATOR per
+    /// [`ACCESS_BUMP_COOLDOWN`] (see [`select_bumpable`]). Keyed per operator
+    /// on purpose: a throttle keyed on the page alone would let whoever read
+    /// it first swallow everybody else's reinforcement inside the window, so
+    /// breadth — the signal `[decay] breadth_weight` exists to read — would
+    /// under-count exactly on the busy pages it matters for. Failures are
+    /// logged at warn but never surfaced to the caller.
     fn spawn_access_bump(&self, ids: Vec<PageId>, actor: Option<&ai_memory_core::IdentityKey>) {
         if ids.is_empty() {
             return;
@@ -9722,6 +9816,7 @@ mod tests {
             "memory_briefing",
             "memory_explore",
             "memory_status",
+            "memory_install_self_routing",
         ] {
             assert!(!tool_call_is_write(read), "{read}");
         }
@@ -9743,15 +9838,99 @@ mod tests {
     #[test]
     fn client_names_are_sanitized_and_bounded() {
         assert_eq!(
-            sanitize_client_name("  Visual Studio Code  ").as_deref(),
+            sanitize_client_name("  Visual  \t Studio\nCode  ").as_deref(),
             Some("Visual Studio Code"),
         );
         assert_eq!(
             sanitize_client_name("evil\u{7}name").as_deref(),
             Some("evilname")
         );
+        assert_eq!(
+            sanitize_client_name("left\u{202e}right").as_deref(),
+            Some("leftright"),
+            "bidirectional display controls must not reach operator output"
+        );
         assert_eq!(sanitize_client_name("   \u{0}\u{1} "), None);
         let long = "x".repeat(500);
-        assert_eq!(sanitize_client_name(&long).unwrap().chars().count(), 64);
+        assert_eq!(
+            sanitize_client_name(&long).unwrap().chars().count(),
+            CLIENT_ACTIVITY_MAX_NAME_CHARS
+        );
+    }
+
+    #[test]
+    fn client_activity_buffer_schedules_once_and_bounds_each_day() {
+        let mut buffer = ClientActivityBuffer::new();
+        assert!(buffer.record("client-000".into(), 7, false));
+        assert!(!buffer.record("client-000".into(), 7, true));
+        for idx in 1..CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY {
+            assert!(!buffer.record(format!("client-{idx:03}"), 7, false));
+        }
+        assert!(!buffer.record("overflow-a".into(), 7, false));
+        assert!(!buffer.record("overflow-b".into(), 7, true));
+
+        assert_eq!(
+            buffer.pending.len(),
+            CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY + 1
+        );
+        assert_eq!(
+            buffer
+                .pending
+                .get(&(CLIENT_ACTIVITY_OVERFLOW_CLIENT.to_string(), 7)),
+            Some(&(1, 1))
+        );
+        assert_eq!(buffer.pending.get(&("client-000".into(), 7)), Some(&(1, 1)));
+    }
+
+    #[test]
+    fn failed_client_activity_batch_restores_without_breaking_the_bound() {
+        let mut buffer = ClientActivityBuffer::new();
+        for idx in 0..CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY {
+            buffer.record_delta(format!("old-{idx:03}"), 7, 1, 0);
+        }
+        let failed = buffer.take_entries();
+
+        for idx in 0..CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY {
+            buffer.record_delta(format!("new-{idx:03}"), 7, 0, 1);
+        }
+        buffer.restore_entries(failed);
+
+        assert_eq!(
+            buffer.pending.len(),
+            CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY + 1,
+            "restoring a failed batch must not double the cardinality budget"
+        );
+        let totals = buffer.pending.values().fold((0_u64, 0_u64), |sum, delta| {
+            (sum.0 + u64::from(delta.0), sum.1 + u64::from(delta.1))
+        });
+        assert_eq!(
+            totals,
+            (
+                CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY as u64,
+                CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY as u64
+            ),
+            "retry coalescing must preserve every delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_activity_flushes_without_a_later_tool_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let buffer = Arc::new(Mutex::new(ClientActivityBuffer::new()));
+        {
+            let mut locked = buffer.lock().unwrap();
+            assert!(locked.record("quiet-client".into(), 99, false));
+        }
+
+        flush_client_activity_loop(buffer.clone(), store.writer.clone(), Duration::ZERO).await;
+
+        let rows = store.reader.client_activity_since(Some(99)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].client, "quiet-client");
+        assert_eq!((rows[0].reads, rows[0].writes), (1, 0));
+        let locked = buffer.lock().unwrap();
+        assert!(locked.pending.is_empty());
+        assert!(!locked.flush_scheduled);
     }
 }
