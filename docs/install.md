@@ -780,10 +780,15 @@ ai-memory finalize-session --agent command-code --session-id <uuid>
 ai-memory does not install Command Code Mods. Mods are currently documented
 as experimental, run unsandboxed, and do not provide the same stable native
 session identity at every callback. Managed `ai-memory run command-code`
-support is also withheld until a logged-in acceptance run proves the current
-session-store layout, exact resume selector, checkout ownership, read-only
-transcript import, `--yolo` translation, and Windows executable behavior.
-Direct `cmd`, `cmdc`, or `command-code` launches remain unchanged.
+support is also withheld. Command Code documents append-only JSONL transcripts
+under `~/.commandcode/projects/<project-slug>/`, native `--continue`,
+`--resume`, and `--session` selectors, `--yolo`, and the Windows `cmdc` alias.
+It does not document the JSONL record schema needed for bounded visible-event
+import. A logged-in acceptance run must still supply sanitized structural
+fixtures and validate checkout matching, incremental import, resume identity,
+normal-exit finalization, and native Windows behavior before ai-memory manages
+those sessions. Direct `cmd`, `cmdc`, or `command-code` launches remain
+unchanged.
 
 ### Kiro CLI
 

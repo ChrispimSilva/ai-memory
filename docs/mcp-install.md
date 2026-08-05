@@ -834,14 +834,18 @@ envelope, and inject pending handoffs with
 `Stop` is only a turn boundary. Run `ai-memory finalize-session --agent
 command-code` after the final turn (or add `--session-id <uuid>` when several
 sessions share the project). ai-memory does not generate a Mod: that API is
-experimental and unsandboxed. A managed adapter remains deferred until a real
-logged-in client acceptance test supplies safe fixtures for exact resume,
-checkout ownership, transcript import, dangerous mode, and native Windows.
+experimental and unsandboxed. Command Code officially documents its
+project-scoped append-only JSONL location, native resume selectors, `--yolo`,
+and Windows aliases, but not the JSONL record schema. A managed adapter remains
+deferred until a real logged-in client acceptance test supplies sanitized
+structural fixtures and validates checkout ownership, incremental visible-event
+import, resume identity, normal-exit finalization, and native Windows execution.
 
 Sources: <https://commandcode.ai/docs/mcp>,
 <https://commandcode.ai/docs/hooks>,
 <https://commandcode.ai/docs/mods>, and
-<https://commandcode.ai/docs/reference/cli>.
+<https://commandcode.ai/docs/reference/cli>, plus the native-session contract at
+<https://commandcode.ai/docs/sessions>.
 
 ## Kiro CLI
 
