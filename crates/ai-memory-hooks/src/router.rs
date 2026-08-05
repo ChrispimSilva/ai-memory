@@ -6005,6 +6005,7 @@ mod tests {
                     other,
                     AgentKind::Codex,
                     ai_memory_core::OwnerFilter::Any,
+                    None,
                     None
                 )
                 .await
@@ -6021,6 +6022,7 @@ mod tests {
                     target,
                     AgentKind::ClaudeCode,
                     ai_memory_core::OwnerFilter::Any,
+                    None,
                     None
                 )
                 .await

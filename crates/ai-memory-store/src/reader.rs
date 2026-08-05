@@ -1843,6 +1843,14 @@ impl ReaderPool {
     /// Results are newest-first so callers can default to finalizing only the
     /// latest open session while offering an explicit all-sessions mode.
     ///
+    /// `exact_session_id`, when set, narrows to that one session id in
+    /// addition to (not instead of) the owner filter — this is what lets a
+    /// caller that already knows its own session id (e.g. a wrapper script
+    /// that captured it at spawn time) finalize precisely that session when
+    /// other sessions for the same agent are open concurrently in the same
+    /// project, without bypassing the "don't touch a colleague's session"
+    /// invariant `owner_filter` exists for.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn open_sessions_for_scope_agent(
@@ -1852,6 +1860,7 @@ impl ReaderPool {
         agent_kind: AgentKind,
         owner_filter: OwnerFilter,
         limit: Option<usize>,
+        exact_session_id: Option<SessionId>,
     ) -> StoreResult<Vec<OpenSession>> {
         let agent = agent_kind.as_str().to_string();
         self.with_conn(move |conn| {
@@ -1864,10 +1873,20 @@ impl ReaderPool {
                 OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = ?4)",
                 OwnerFilter::Unattributed => " AND actor_user IS NULL",
             };
+            let session_id_placeholder = if matches!(owner_filter, OwnerFilter::User(_)) {
+                "?5"
+            } else {
+                "?4"
+            };
+            let session_id_clause = if exact_session_id.is_some() {
+                format!(" AND id = {session_id_placeholder}")
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "SELECT id, cwd FROM sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
-                   AND agent_kind = ?3 AND ended_at IS NULL{owner_clause} \
+                   AND agent_kind = ?3 AND ended_at IS NULL{owner_clause}{session_id_clause} \
                  ORDER BY started_at DESC, id DESC{limit_clause}"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -1876,12 +1895,31 @@ impl ReaderPool {
                 let cwd: Option<String> = row.get(1)?;
                 Ok((id_bytes, cwd))
             };
-            let rows = match &owner_filter {
-                OwnerFilter::User(user) => stmt.query_map(
+            let rows = match (&owner_filter, exact_session_id) {
+                (OwnerFilter::User(user), Some(sid)) => stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        agent,
+                        user,
+                        sid.as_bytes()
+                    ],
+                    row_map,
+                )?,
+                (OwnerFilter::User(user), None) => stmt.query_map(
                     params![workspace_id.as_bytes(), project_id.as_bytes(), agent, user],
                     row_map,
                 )?,
-                _ => stmt.query_map(
+                (_, Some(sid)) => stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        agent,
+                        sid.as_bytes()
+                    ],
+                    row_map,
+                )?,
+                (_, None) => stmt.query_map(
                     params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
                     row_map,
                 )?,
