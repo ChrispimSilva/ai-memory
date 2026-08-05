@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `session_id` filter on `GET /admin/open-sessions`, composed with (not
   bypassing) the existing owner filter: a session id belonging to another
   operator is still unreachable without `--all-owners`, same as the default
-  query.
+  query ([#374]).
 
 ## [1.24.0] - 2026-08-04
 
