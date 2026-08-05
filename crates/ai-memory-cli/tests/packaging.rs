@@ -671,22 +671,11 @@ fn hook_installer_rejects_a_checksum_mismatch_before_writing_scripts() {
 }
 
 #[cfg(unix)]
-#[test]
-fn hook_installer_writes_only_expected_files_from_a_verified_archive() {
-    const HOOKS: &[&str] = &[
-        "post-tool-use",
-        "pre-compact",
-        "pre-tool-use",
-        "session-end",
-        "session-start",
-        "stop",
-        "user-prompt-submit",
-    ];
-
+fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) -> Vec<String> {
     let tmp = tempfile::tempdir().unwrap();
-    let bundle = tmp.path().join("bundle/hooks/claude-code");
+    let bundle = tmp.path().join("bundle/hooks").join(canonical_agent);
     std::fs::create_dir_all(&bundle).unwrap();
-    for hook in HOOKS {
+    for hook in hooks {
         std::fs::write(
             bundle.join(format!("{hook}.sh")),
             format!("#!/usr/bin/env bash\nprintf '{hook}\\n'\n"),
@@ -737,7 +726,7 @@ fn hook_installer_writes_only_expected_files_from_a_verified_archive() {
     );
     let destination = tmp.path().join("installed-hooks");
     let output = shell_script_command(&repo_root().join("scripts/install-hooks.sh"))
-        .args(["--agent", "claude-code", "--to"])
+        .args(["--agent", agent_arg, "--to"])
         .arg(&destination)
         .env("PATH", path)
         .env("HOME", tmp.path())
@@ -751,20 +740,14 @@ fn hook_installer_writes_only_expected_files_from_a_verified_archive() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let installed = destination.join("claude-code");
+    let installed = destination.join(canonical_agent);
     let mut names = std::fs::read_dir(&installed)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     names.sort();
-    let mut expected = HOOKS
-        .iter()
-        .map(|hook| format!("{hook}.sh"))
-        .collect::<Vec<_>>();
-    expected.sort();
-    assert_eq!(names, expected);
     use std::os::unix::fs::PermissionsExt as _;
-    for name in names {
+    for name in &names {
         assert_ne!(
             std::fs::metadata(installed.join(name))
                 .unwrap()
@@ -774,6 +757,41 @@ fn hook_installer_writes_only_expected_files_from_a_verified_archive() {
             0
         );
     }
+    names
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_installer_writes_only_expected_files_from_a_verified_archive() {
+    const HOOKS: &[&str] = &[
+        "post-tool-use",
+        "pre-compact",
+        "pre-tool-use",
+        "session-end",
+        "session-start",
+        "stop",
+        "user-prompt-submit",
+    ];
+
+    let names = installed_hook_names("claude-code", "claude-code", HOOKS);
+    let expected = HOOKS
+        .iter()
+        .map(|hook| format!("{hook}.sh"))
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_installer_writes_only_command_code_stable_events() {
+    const HOOKS: &[&str] = &["post-tool-use", "pre-tool-use", "session-start", "stop"];
+
+    let names = installed_hook_names("cmdc", "command-code", HOOKS);
+    let expected = HOOKS
+        .iter()
+        .map(|hook| format!("{hook}.sh"))
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected);
 }
 
 #[cfg(unix)]

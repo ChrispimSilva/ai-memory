@@ -234,6 +234,14 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
 
+Command Code is intentionally absent from this table. Its first-party MCP and
+stable lifecycle-hook integration does not imply managed resume support.
+Before adding a managed adapter, a logged-in current release must prove the
+session-store layout, exact resume selector, checkout validation, read-only
+visible-event extraction, dangerous-mode translation, normal-exit finalization,
+and the `cmdc` executable path on native Windows. Experimental Mod APIs are not
+a substitute for those native-session acceptance artifacts.
+
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter

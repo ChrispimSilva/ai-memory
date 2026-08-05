@@ -165,6 +165,10 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                 install_hooks::gemini_settings_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
+            (
+                install_hooks::command_code_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
             // Grok's ~/.grok/hooks/ai-memory.json shares Claude Code's
             // JSON shape, so the same strip pass removes our entries.
             (
@@ -307,6 +311,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             Devin,
             KimiCode,
             KiroCli,
+            CommandCode,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -1002,6 +1007,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::AntigravityCli
         | McpClient::KimiCode
         | McpClient::KiroCli
+        | McpClient::CommandCode
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),

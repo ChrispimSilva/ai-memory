@@ -120,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / devin / zero / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / devin / zero / vscode-copilot / zed
 > ```
 
 ---
@@ -774,9 +774,9 @@ script bundle /
 native `ai-memory hook --event … --agent kimi-code` commands (native is the
 default for local installs; the staged scripts under
 `~/.local/share/ai-memory/hooks/kimi-code/` are the compatibility fallback).
-Capture is fire-and-forget; a pending handoff is injected at `SessionStart`
-via the hook's stdout (Kimi Code appends stdout to context on exit 0), the
-same pattern as Gemini CLI.
+Capture is fire-and-forget; a pending handoff is injected at
+`UserPromptSubmit` via the hook's stdout (Kimi Code discards `SessionStart`
+stdout but prepends successful user-prompt hook output to the turn).
 
 **Gotchas:**
 - Do not add a `transport` field for HTTP servers: `url` alone means
@@ -792,6 +792,56 @@ same pattern as Gemini CLI.
   same event. `PostToolUse` and `PostToolUseFailure` reuse one handler command,
   but are mutually exclusive event triggers, so successful and failed calls
   are both captured once.
+
+## Command Code
+
+**Status:** MCP and the four stable shell-hook events are supported. Managed
+workstreams and experimental Mods are not installed.
+
+**Config files:** `~/.commandcode/mcp.json` for MCP and
+`~/.commandcode/settings.json` for lifecycle hooks.
+
+```bash
+ai-memory install-mcp --client command-code --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent command-code --apply \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+The MCP installer writes the documented user-scope remote shape:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "transport": "http",
+      "enabled": true,
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+The hook installer registers `SessionStart`, `PreToolUse`, `PostToolUse`, and
+`Stop`. It omits the outer `matcher` from every definition because Command
+Code documents omission as matching every tool and says a matcher prevents
+the non-tool `SessionStart` and `Stop` events from firing. Native installs
+spool events locally, enforce capture exclusions for the documented tool
+envelope, and inject pending handoffs with
+`hookSpecificOutput.additionalContext` at `SessionStart`.
+
+`Stop` is only a turn boundary. Run `ai-memory finalize-session --agent
+command-code` after the final turn (or add `--session-id <uuid>` when several
+sessions share the project). ai-memory does not generate a Mod: that API is
+experimental and unsandboxed. A managed adapter remains deferred until a real
+logged-in client acceptance test supplies safe fixtures for exact resume,
+checkout ownership, transcript import, dangerous mode, and native Windows.
+
+Sources: <https://commandcode.ai/docs/mcp>,
+<https://commandcode.ai/docs/hooks>,
+<https://commandcode.ai/docs/mods>, and
+<https://commandcode.ai/docs/reference/cli>.
 
 ## Kiro CLI
 
@@ -1027,8 +1077,8 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex and Antigravity CLI have no reliable true session-end event: run `ai-memory finalize-session` for Codex or `ai-memory finalize-session --agent antigravity-cli` for Antigravity after the final turn. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex, Antigravity CLI, Kiro CLI v2, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Kiro CLI v2 / Command Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. Its generated plugin also sends a deduped best-effort close for any

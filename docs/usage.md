@@ -297,6 +297,8 @@ Client cleanup hints:
 
 - Claude Code: check plugins, hooks, old SessionStart injection, and MCP servers.
 - Codex: check MCP config plus session/user-prompt/tool/compaction/stop hooks.
+- Command Code: check `~/.commandcode/mcp.json` and the four stable lifecycle
+  events in `~/.commandcode/settings.json`.
 - Devin CLI: check `.devin/config.json`, `.devin/hooks.v1.json`, and
   `.devin/skills` for stale MCP, hook, or routing-skill entries.
 - Gemini CLI and Antigravity CLI: check `settings.json` or equivalent hook/MCP
@@ -418,7 +420,7 @@ page and no argument, ai-memory appends no preference block.
 
 Durable project rules belong in the agent's rules file, not only in the
 wiki. For Claude Code that is `CLAUDE.md`; for Codex, Devin CLI, OpenCode,
-Cursor, Gemini CLI, Grok Build CLI, Kimi Code, and Kiro CLI it is usually
+Cursor, Gemini CLI, Grok Build CLI, Kimi Code, Kiro CLI, and Command Code it is usually
 `AGENTS.md`.
 
 The consolidator classifies compiled observations as `decision`,

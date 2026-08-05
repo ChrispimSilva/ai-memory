@@ -25,13 +25,13 @@ use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
 use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
-    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, build_antigravity_payload_with_data_dir,
-    build_claude_code_payload_with_data_dir, build_devin_payload_with_data_dir,
-    build_grok_payload_with_data_dir, build_kiro_cli_v2_hooks_value,
-    build_profile_payload_for_agent, hook_script_for_claude_code, hook_script_for_current_platform,
-    kimi_code_hook_commands, local_hook_policy_v1_supported, ts_capture_policy_v1,
-    ts_string_literal,
+    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
+    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
+    build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
+    build_devin_payload_with_data_dir, build_grok_payload_with_data_dir,
+    build_kiro_cli_v2_hooks_value, build_profile_payload_for_agent, hook_script_for_claude_code,
+    hook_script_for_current_platform, kimi_code_hook_commands, local_hook_policy_v1_supported,
+    ts_capture_policy_v1, ts_string_literal,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -63,6 +63,14 @@ pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .context("could not locate $HOME for ~/.codex/hooks.json")?
         .join(".codex")
         .join("hooks.json"))
+}
+
+/// `~/.commandcode/settings.json`.
+pub(crate) fn command_code_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.commandcode/settings.json")?
+        .join(".commandcode")
+        .join("settings.json"))
 }
 
 /// `~/.cursor/hooks.json`.
@@ -286,6 +294,16 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
                 apply_to_codex_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::CommandCode => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_command_code_settings(
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
+            }
             AgentChoice::Cursor => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
                 apply_to_cursor_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
@@ -360,6 +378,17 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 auth,
                 strategy,
                 &[CODEX_PROFILE.events],
+            )
+        }
+        AgentChoice::CommandCode => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_agent(
+                "command-code",
+                &hooks_dir,
+                &server_url,
+                auth,
+                strategy,
+                &[COMMAND_CODE_PROFILE.events],
             )
         }
         AgentChoice::Cursor => {
@@ -456,6 +485,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
         match args.agent {
             AgentChoice::ClaudeCode => claude_settings_path().ok()?,
             AgentChoice::Codex => codex_hooks_path().ok()?,
+            AgentChoice::CommandCode => command_code_settings_path().ok()?,
             AgentChoice::Cursor => cursor_hooks_path().ok()?,
             AgentChoice::GeminiCli => gemini_settings_path().ok()?,
             AgentChoice::OpenCode => opencode_plugin_path().ok()?,
@@ -681,6 +711,11 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
         // Codex uses `http_headers`; Grok uses `headers`. The shared TOML
         // inferencer accepts both.
         McpClient::Codex => Ok(infer_toml_mcp_config(&content)),
+        McpClient::CommandCode => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
         McpClient::Grok => infer_grok_mcp_config(&content),
         McpClient::OpenCode => Ok(infer_json_mcp_config(
             &content,
@@ -781,6 +816,7 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
     match agent {
         AgentChoice::ClaudeCode => Some(McpClient::ClaudeCode),
         AgentChoice::Codex => Some(McpClient::Codex),
+        AgentChoice::CommandCode => Some(McpClient::CommandCode),
         AgentChoice::Cursor => Some(McpClient::Cursor),
         AgentChoice::GeminiCli => Some(McpClient::GeminiCli),
         AgentChoice::OpenCode => Some(McpClient::OpenCode),
@@ -1288,6 +1324,103 @@ fn apply_to_devin_settings_with_staged(
                 Ok(())
             })
         }
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+/// Mutate `~/.commandcode/settings.json` so Command Code fires the stable
+/// four-event lifecycle integration. Command Code's schema requires the outer
+/// `matcher` to be omitted for SessionStart and Stop, so its profile must not
+/// reuse the otherwise similar Claude/Codex payload byte-for-byte.
+fn apply_to_command_code_settings(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "command-code")?;
+    apply_to_command_code_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+#[cfg(test)]
+fn apply_to_command_code_settings_in(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    staging_data_local: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts_in(hooks_dir, "command-code", staging_data_local)?;
+    let command_dir = staged_command_dir(&staged, "command-code");
+    let payload = crate::commands::render_shared::build_profile_script_payload_for_test(
+        &COMMAND_CODE_PROFILE,
+        &command_dir,
+        server_url,
+        auth_token,
+        "command-code",
+        Some(data_dir),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
+    );
+    apply_to_command_code_settings_with_payload(payload, args)
+}
+
+fn apply_to_command_code_settings_with_staged(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let command_dir = staged_command_dir(staged, "command-code");
+    let payload = build_profile_payload_for_agent(
+        &COMMAND_CODE_PROFILE,
+        &command_dir,
+        server_url,
+        auth_token,
+        "command-code",
+        Some(data_dir),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
+    );
+    apply_to_command_code_settings_with_payload(payload, args)
+}
+
+fn apply_to_command_code_settings_with_payload(
+    payload: serde_json::Value,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(path) => path.clone(),
+        None => command_code_settings_path()?,
+    };
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .context("internal: Command Code payload did not return a hooks object")?
+        .clone();
+    let outcome = apply_atomic(&path, |existing| {
+        mutate_json(existing, |root| {
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in settings.json but not an object")?;
+            for (event, value) in &our_hooks {
+                overlay_event_hooks(hooks, event, value);
+            }
+            Ok(())
+        })
     })?;
     println!(
         "✓ {} {} ({})",
@@ -3887,6 +4020,7 @@ mod tests {
         // opt-in cannot take effect for them, so the installer must bail.
         for agent in [
             Codex,
+            CommandCode,
             Cursor,
             GeminiCli,
             OpenCode,
@@ -3898,6 +4032,7 @@ mod tests {
             Zero,
             Devin,
             KimiCode,
+            KiroCli,
         ] {
             assert!(
                 !capture_assistant_allowed(agent),
@@ -3978,6 +4113,88 @@ mod tests {
             joined.contains("/new/.cargo/bin/ai-memory.exe"),
             "fresh ai-memory entry must be present"
         );
+    }
+
+    #[test]
+    fn command_code_apply_uses_only_stable_events_and_preserves_user_settings() {
+        let source = TempDir::new().unwrap();
+        stub_scripts(
+            source.path(),
+            &[
+                "session-start.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "stop.sh",
+            ],
+        );
+        let staging = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("settings.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "theme": "dark",
+                "hooks": {
+                    "SessionStart": [{
+                        "hooks": [{"type": "command", "command": "third-party"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::CommandCode,
+            config_file: Some(config_path.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_command_code_settings_in(
+            source.path(),
+            "http://memory:49374",
+            Some("token"),
+            config_dir.path(),
+            staging.path(),
+            &args,
+        )
+        .unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_command_code_settings_in(
+            source.path(),
+            "http://memory:49374",
+            Some("token"),
+            config_dir.path(),
+            staging.path(),
+            &args,
+        )
+        .unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(first, second, "re-apply must be idempotent");
+
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["theme"], "dark");
+        let hooks = value["hooks"].as_object().unwrap();
+        for event in ["SessionStart", "PreToolUse", "PostToolUse", "Stop"] {
+            let entries = hooks[event].as_array().unwrap();
+            let ours = entries
+                .iter()
+                .find(|entry| serde_json::to_string(entry).unwrap().contains("ai-memory"))
+                .unwrap_or_else(|| panic!("missing ai-memory entry for {event}"));
+            assert!(ours.get("matcher").is_none(), "event: {event}");
+        }
+        assert_eq!(
+            hooks["SessionStart"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| serde_json::to_string(entry)
+                    .unwrap()
+                    .contains("third-party"))
+                .count(),
+            1,
+            "third-party hook must survive"
+        );
+        assert_eq!(hooks.len(), COMMAND_CODE_PROFILE.events.len());
     }
 
     #[test]

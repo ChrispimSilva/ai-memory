@@ -76,6 +76,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Devin => render_devin(&args)?,
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::KiroCli => render_kiro_cli(&args)?,
+        McpClient::CommandCode => render_command_code(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
     };
@@ -210,6 +211,7 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         McpClient::KiroCli => kiro_home(std::env::var_os("KIRO_HOME"))?
             .join("settings")
             .join("mcp.json"),
+        McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -461,7 +463,8 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::AntigravityCli
         | McpClient::Devin
         | McpClient::KimiCode
-        | McpClient::KiroCli => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::KiroCli
+        | McpClient::CommandCode => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses.
@@ -676,6 +679,14 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         }
         McpClient::KiroCli => {
             entry.insert("url".into(), json!(bedrock_flavored_mcp_url(server_url)));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::CommandCode => {
+            entry.insert("transport".into(), json!("http"));
+            entry.insert("enabled".into(), json!(true));
+            entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -1155,6 +1166,20 @@ fn render_kiro_cli(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_command_code(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Command Code — merge into ~/.commandcode/mcp.json:\n\
+         #\n\
+         # The equivalent CLI registration is:\n\
+         #   cmd mcp add --transport http --scope user {name} {url}\n\
+         # (`cmdc` is the native Windows executable name.)\n\
+         {snippet}\n",
+        name = args.name,
+        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# VS Code GitHub Copilot (agent mode) — write to one of:\n\
@@ -1309,6 +1334,32 @@ mod tests {
                 .unwrap()
                 .contains("MCP-only")
         );
+    }
+
+    #[test]
+    fn command_code_renderer_uses_documented_user_scope_http_schema() {
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::CommandCode)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "mcpServers": {
+                    "ai-memory": {
+                        "transport": "http",
+                        "enabled": true,
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "headers": {
+                            "Authorization": "Bearer test-token-deadbeef"
+                        }
+                    }
+                }
+            })
+        );
+        let rendered = render_command_code(&args_for(McpClient::CommandCode)).unwrap();
+        assert!(rendered.contains("~/.commandcode/mcp.json"));
+        assert!(rendered.contains("cmd mcp add --transport http --scope user"));
+        assert!(rendered.contains("`cmdc` is the native Windows executable"));
     }
 
     #[test]
@@ -1561,6 +1612,7 @@ mod tests {
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
+            McpClient::CommandCode => render_command_code(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
         }
@@ -1585,6 +1637,7 @@ mod tests {
             McpClient::Devin,
             McpClient::KimiCode,
             McpClient::KiroCli,
+            McpClient::CommandCode,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
         ] {
@@ -1623,6 +1676,7 @@ mod tests {
             McpClient::Devin,
             McpClient::KimiCode,
             McpClient::KiroCli,
+            McpClient::CommandCode,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
         ] {
@@ -1654,6 +1708,7 @@ mod tests {
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
+            McpClient::CommandCode => render_command_code(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
         }
