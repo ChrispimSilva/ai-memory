@@ -641,6 +641,8 @@ auto-improvement eligibility for the current project, run:
 ```bash
 ai-memory finalize-session
 # add --all to close every matching open Codex session in this workspace/project
+# or target one exact concurrent session (mutually exclusive with --all)
+ai-memory finalize-session --session-id <uuid>
 ```
 
 Antigravity CLI also lacks a true session-end event. Its `Stop` hook marks the
@@ -656,6 +658,7 @@ explicitly:
 ```bash
 ai-memory finalize-session --agent antigravity-cli
 # add --all only to close every matching open Antigravity session in this scope
+# or add --session-id <uuid> to close one exact concurrent session
 ```
 
 ### Devin CLI
@@ -786,6 +789,15 @@ remains fail-open when ai-memory is unavailable, and delivers a pending handoff
 through successful `agentSpawn` stdout. Verified v2 tool payloads enforce
 `[capture] ignore_paths`; an unrecognized payload shape is stored as bounded
 metadata rather than exposing file content.
+
+Kiro v2's `stop` event ends a turn, not the session. After the final turn, close
+the matching session explicitly; use the exact id when several Kiro sessions
+are open in the same project:
+
+```bash
+ai-memory finalize-session --agent kiro-cli
+ai-memory finalize-session --agent kiro-cli --session-id <uuid>
+```
 
 Kiro v3 hook capture is intentionally not advertised or installed. Its
 [migration guide](https://kiro.dev/docs/cli/v3/hooks-migration/) documents the

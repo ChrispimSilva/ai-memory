@@ -142,6 +142,9 @@ to — and consumed by — the next session to start, whoever it belongs to.
   multi-user mode.
 - `ai-memory finalize-session --all-owners` does the same for sessions, and
   `GET /admin/open-sessions?all_owners=true` is the underlying switch.
+  `--session-id <uuid>` / `session_id=<uuid>` narrows the same owner-scoped
+  lookup to one exact open session; it cannot be combined with `--all` /
+  `all=true`.
 - `GET /admin/sessions/by-agent` reports how many sessions each agent CLI
   opened in a scope. It follows the same rule: the caller's own sessions
   plus the unowned ones, with `all_owners=true` to see every operator's. Pass

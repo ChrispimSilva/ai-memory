@@ -1853,6 +1853,56 @@ impl ReaderPool {
         owner_filter: OwnerFilter,
         limit: Option<usize>,
     ) -> StoreResult<Vec<OpenSession>> {
+        self.open_sessions_for_scope_agent_filtered(
+            workspace_id,
+            project_id,
+            agent_kind,
+            owner_filter,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    /// Return one exact open session for a scoped project and agent.
+    ///
+    /// The id narrows the scope, agent, open-state, and owner predicates; it
+    /// never replaces them. A known id therefore cannot expose or finalize a
+    /// colleague's session unless the caller explicitly uses
+    /// [`OwnerFilter::Any`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn open_session_for_scope_agent_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+        owner_filter: OwnerFilter,
+        session_id: SessionId,
+    ) -> StoreResult<Option<OpenSession>> {
+        let mut sessions = self
+            .open_sessions_for_scope_agent_filtered(
+                workspace_id,
+                project_id,
+                agent_kind,
+                owner_filter,
+                Some(1),
+                Some(session_id),
+            )
+            .await?;
+        Ok(sessions.pop())
+    }
+
+    async fn open_sessions_for_scope_agent_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+        owner_filter: OwnerFilter,
+        limit: Option<usize>,
+        exact_session_id: Option<SessionId>,
+    ) -> StoreResult<Vec<OpenSession>> {
         let agent = agent_kind.as_str().to_string();
         self.with_conn(move |conn| {
             let limit_clause = limit.map_or(String::new(), |n| format!(" LIMIT {}", n.max(1)));
@@ -1864,10 +1914,20 @@ impl ReaderPool {
                 OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = ?4)",
                 OwnerFilter::Unattributed => " AND actor_user IS NULL",
             };
+            let session_id_placeholder = if matches!(owner_filter, OwnerFilter::User(_)) {
+                "?5"
+            } else {
+                "?4"
+            };
+            let session_id_clause = if exact_session_id.is_some() {
+                format!(" AND id = {session_id_placeholder}")
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "SELECT id, cwd FROM sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
-                   AND agent_kind = ?3 AND ended_at IS NULL{owner_clause} \
+                   AND agent_kind = ?3 AND ended_at IS NULL{owner_clause}{session_id_clause} \
                  ORDER BY started_at DESC, id DESC{limit_clause}"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -1876,12 +1936,31 @@ impl ReaderPool {
                 let cwd: Option<String> = row.get(1)?;
                 Ok((id_bytes, cwd))
             };
-            let rows = match &owner_filter {
-                OwnerFilter::User(user) => stmt.query_map(
+            let rows = match (&owner_filter, exact_session_id) {
+                (OwnerFilter::User(user), Some(sid)) => stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        agent,
+                        user,
+                        sid.as_bytes()
+                    ],
+                    row_map,
+                )?,
+                (OwnerFilter::User(user), None) => stmt.query_map(
                     params![workspace_id.as_bytes(), project_id.as_bytes(), agent, user],
                     row_map,
                 )?,
-                _ => stmt.query_map(
+                (_, Some(sid)) => stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        agent,
+                        sid.as_bytes()
+                    ],
+                    row_map,
+                )?,
+                (_, None) => stmt.query_map(
                     params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
                     row_map,
                 )?,

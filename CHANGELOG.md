@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ai-memory finalize-session --session-id <uuid>` targets exactly one open
+  session instead of "the latest open one for this agent+scope". Agents with
+  no true SessionEnd hook (Kiro CLI, Codex, Antigravity CLI) rely on
+  `finalize-session` to synthesize the summary+handoff, and the
+  newest-first default breaks down with several concurrent sessions for the
+  same agent in one project — e.g. multiple terminal tabs each running Kiro
+  CLI against the same repo — where it can close out a still-active session
+  instead of the one that actually finished. Backed by a new optional
+  `session_id` filter on `GET /admin/open-sessions`, composed with (not
+  bypassing) the existing owner filter: a session id belonging to another
+  operator is still unreachable without `--all-owners`, same as the default
+  query ([#374]).
+
 ## [1.24.0] - 2026-08-04
 
 ### Added

@@ -902,6 +902,14 @@ struct OpenSessionsQuery {
     /// is unaffected.
     #[serde(default)]
     all_owners: bool,
+    /// When set, narrow to exactly this session id (still subject to the
+    /// owner filter above) instead of newest-first selection — lets a
+    /// caller that captured its own session id at spawn time finalize
+    /// precisely that session, even when other sessions for the same agent
+    /// are open concurrently in the same project (e.g. multiple terminal
+    /// tabs each running Kiro CLI against one repo).
+    #[serde(default)]
+    session_id: Option<SessionId>,
 }
 
 /// Wire shape for one open session in the `GET /admin/open-sessions`
@@ -1027,6 +1035,14 @@ async fn handle_open_sessions(
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Query(query): Query<OpenSessionsQuery>,
 ) -> impl IntoResponse {
+    if query.all && query.session_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "all and session_id cannot be combined"
+            })),
+        );
+    }
     let Some(agent) = parse_agent_kind(&query.agent) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -1040,7 +1056,6 @@ async fn handle_open_sessions(
         Ok(ids) => ids,
         Err(e) => return e,
     };
-    let limit = if query.all { None } else { Some(1) };
     let owner_filter = if query.all_owners {
         ai_memory_core::OwnerFilter::Any
     } else {
@@ -1048,11 +1063,20 @@ async fn handle_open_sessions(
             &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
         )
     };
-    match state
-        .reader
-        .open_sessions_for_scope_agent(ws, proj, agent, owner_filter, limit)
-        .await
-    {
+    let sessions = if let Some(session_id) = query.session_id {
+        state
+            .reader
+            .open_session_for_scope_agent_by_id(ws, proj, agent, owner_filter, session_id)
+            .await
+            .map(|session| session.into_iter().collect())
+    } else {
+        let limit = if query.all { None } else { Some(1) };
+        state
+            .reader
+            .open_sessions_for_scope_agent(ws, proj, agent, owner_filter, limit)
+            .await
+    };
+    match sessions {
         Ok(sessions) => {
             let sessions: Vec<OpenSessionEntry> = sessions
                 .into_iter()
@@ -5935,6 +5959,242 @@ mod tests {
                 .is_none(),
             "read route must not auto-create scopes"
         );
+    }
+
+    /// Regression for the race a naive wrapper hits with several concurrent
+    /// Kiro CLI tabs against one repo: two open sessions for the same
+    /// agent+scope exist (`older`, `latest`), and `?session_id=` must return
+    /// exactly the one requested — never falling back to "newest open" —
+    /// while still composing with the owner filter (a session_id belonging
+    /// to another operator must not be reachable just by knowing its id,
+    /// same invariant `all_owners` already protects for the default query).
+    #[tokio::test]
+    async fn open_sessions_session_id_targets_exact_session() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        let older = SessionId::new();
+        let latest = SessionId::new();
+        let other_scope = SessionId::new();
+        let ended = SessionId::new();
+        let bobs_session = SessionId::new();
+        let wrong_agent = SessionId::new();
+        for (id, project_id, agent_kind, actor_user) in [
+            (older, target, AgentKind::KiroCli, None),
+            (latest, target, AgentKind::KiroCli, None),
+            (other_scope, other_project, AgentKind::KiroCli, None),
+            (ended, target, AgentKind::KiroCli, None),
+            (wrong_agent, target, AgentKind::Codex, None),
+            (
+                bobs_session,
+                target,
+                AgentKind::KiroCli,
+                Some(IdentityKey::User("bob".into()).storage_key()),
+            ),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user,
+                })
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(ended, None).await.unwrap();
+
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        // Targeting `older` by id must return only `older`, not `latest`.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={older}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "must not fall back to newest-open");
+        assert_eq!(sessions[0]["session_id"], older.to_string());
+
+        // A session id that belongs to a different project must not be
+        // reachable just by knowing the id — scope is still enforced.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={other_scope}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["sessions"].as_array().unwrap().len(),
+            0,
+            "a session from another project must not be reachable by id"
+        );
+
+        // An already-ended session id is not "open" and must not match.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={ended}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+
+        // An exact id from another agent remains outside the requested
+        // agent boundary even when its scope matches.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={wrong_agent}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+
+        // A colleague's session id is not reachable without all_owners, even
+        // when the exact id is known — session_id composes with the owner
+        // filter (AND), it doesn't bypass it.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={bobs_session}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["sessions"].as_array().unwrap().len(),
+            0,
+            "session_id must not bypass the owner filter"
+        );
+
+        // ...but composes correctly WITH all_owners set.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={bobs_session}&all_owners=true"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 1);
+
+        // Selection modes are mutually exclusive instead of silently giving
+        // one of them precedence.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&all=true&session_id={older}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A malformed session_id fails closed with a 400, not a silent
+        // empty/ignored filter.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id=not-a-uuid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     fn read_page_test_router() -> (TempDir, Router) {
