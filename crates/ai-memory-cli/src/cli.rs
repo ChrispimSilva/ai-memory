@@ -1085,8 +1085,7 @@ pub struct FinalizeSessionArgs {
     #[arg(long, default_value_t = false)]
     pub all_owners: bool,
     /// Finalize every matching open session instead of just the latest one.
-    /// Ignored when `--session-id` is set.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "session_id")]
     pub all: bool,
     /// Finalize exactly this session id instead of "the latest open one"
     /// (still subject to `--all-owners`). Use this when other sessions for
@@ -1094,8 +1093,8 @@ pub struct FinalizeSessionArgs {
     /// multiple terminal tabs each running Kiro CLI against one repo) —
     /// picking "latest" in that case risks closing out the wrong
     /// (still-active) session.
-    #[arg(long)]
-    pub session_id: Option<String>,
+    #[arg(long, conflicts_with = "all")]
+    pub session_id: Option<ai_memory_core::SessionId>,
     /// Emit a JSON summary.
     #[arg(long)]
     pub json: bool,
@@ -1724,6 +1723,44 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn finalize_session_parses_typed_id_and_rejects_ambiguous_selection() {
+        let session_id = ai_memory_core::SessionId::new();
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "finalize-session",
+            "--session-id",
+            &session_id.to_string(),
+        ])
+        .expect("valid session id parses");
+        let Command::FinalizeSession(args) = parsed.command else {
+            panic!("expected finalize-session command");
+        };
+        assert_eq!(args.session_id, Some(session_id));
+
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "finalize-session",
+                "--session-id",
+                "not-a-uuid",
+            ])
+            .is_err(),
+            "malformed session ids must fail at the CLI boundary"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "finalize-session",
+                "--all",
+                "--session-id",
+                &session_id.to_string(),
+            ])
+            .is_err(),
+            "--all and --session-id must be mutually exclusive"
+        );
+    }
 
     #[test]
     fn architecture_lists_every_visible_cli_subcommand() {

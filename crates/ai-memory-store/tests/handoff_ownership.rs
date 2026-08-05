@@ -891,14 +891,7 @@ async fn open_session_lookup_is_owner_scoped() {
     // Bob sees only the shared session — never Alice's live one.
     let bobs = ids(store
         .reader
-        .open_sessions_for_scope_agent(
-            ws,
-            proj,
-            AgentKind::ClaudeCode,
-            filter_for("bob"),
-            None,
-            None,
-        )
+        .open_sessions_for_scope_agent(ws, proj, AgentKind::ClaudeCode, filter_for("bob"), None)
         .await
         .unwrap());
     assert_eq!(
@@ -910,14 +903,7 @@ async fn open_session_lookup_is_owner_scoped() {
     // Alice sees her own plus the shared one.
     let alices = ids(store
         .reader
-        .open_sessions_for_scope_agent(
-            ws,
-            proj,
-            AgentKind::ClaudeCode,
-            filter_for("alice"),
-            None,
-            None,
-        )
+        .open_sessions_for_scope_agent(ws, proj, AgentKind::ClaudeCode, filter_for("alice"), None)
         .await
         .unwrap());
     assert!(alices.contains(&alice_session) && alices.contains(&shared_session));
@@ -925,14 +911,7 @@ async fn open_session_lookup_is_owner_scoped() {
     // The recovery switch (`all_owners=true` on /admin/open-sessions) sees all.
     let all = ids(store
         .reader
-        .open_sessions_for_scope_agent(
-            ws,
-            proj,
-            AgentKind::ClaudeCode,
-            OwnerFilter::Any,
-            None,
-            None,
-        )
+        .open_sessions_for_scope_agent(ws, proj, AgentKind::ClaudeCode, OwnerFilter::Any, None)
         .await
         .unwrap());
     assert_eq!(all.len(), 2);

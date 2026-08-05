@@ -1,6 +1,6 @@
 //! `ai-memory finalize-session` — manually synthesize SessionEnd for an agent.
 
-use ai_memory_core::AgentKind;
+use ai_memory_core::{AgentKind, SessionId};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -53,9 +53,6 @@ struct FinalizeSessionReport {
 /// sessions or rejects a synthetic `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     let agent = args.agent.kind();
-    if let Some(raw) = args.session_id.as_deref() {
-        uuid::Uuid::parse_str(raw).with_context(|| format!("invalid --session-id: {raw}"))?;
-    }
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -66,7 +63,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
         agent,
         args.all,
         args.all_owners,
-        args.session_id.as_deref(),
+        args.session_id,
     )
     .await?;
     if sessions.is_empty() {
@@ -104,7 +101,7 @@ async fn fetch_open_sessions(
     agent: AgentKind,
     all: bool,
     all_owners: bool,
-    session_id: Option<&str>,
+    session_id: Option<SessionId>,
 ) -> Result<Vec<OpenSessionEntry>> {
     let all = if all { "true" } else { "false" };
     let all_owners = if all_owners { "true" } else { "false" };
@@ -115,7 +112,8 @@ async fn fetch_open_sessions(
         ("all", all),
         ("all_owners", all_owners),
     ];
-    if let Some(sid) = session_id {
+    let session_id = session_id.map(|sid| sid.to_string());
+    if let Some(sid) = session_id.as_deref() {
         query.push(("session_id", sid));
     }
     let result = get_json::<OpenSessionsResponse>(endpoint, "/admin/open-sessions", &query).await;
@@ -298,7 +296,6 @@ mod tests {
                 AgentKind::AntigravityCli,
                 ai_memory_core::OwnerFilter::Any,
                 Some(1),
-                None,
             )
             .await
             .unwrap();
@@ -347,24 +344,19 @@ mod tests {
 
         let selected = store
             .reader
-            .open_sessions_for_scope_agent(
+            .open_session_for_scope_agent_by_id(
                 ws,
                 proj,
                 AgentKind::KiroCli,
                 ai_memory_core::OwnerFilter::Any,
-                None,
-                Some(older),
+                older,
             )
             .await
             .unwrap();
 
         assert_eq!(
-            selected.len(),
-            1,
-            "exact session_id filter must return exactly one match"
-        );
-        assert_eq!(
-            selected[0].session_id, older,
+            selected.map(|session| session.session_id),
+            Some(older),
             "must target the requested session, not the newest open one"
         );
 
@@ -373,18 +365,16 @@ mod tests {
         // default query, it left the sibling session alone.
         let still_open = store
             .reader
-            .open_sessions_for_scope_agent(
+            .open_session_for_scope_agent_by_id(
                 ws,
                 proj,
                 AgentKind::KiroCli,
                 ai_memory_core::OwnerFilter::Any,
-                None,
-                Some(latest),
+                latest,
             )
             .await
             .unwrap();
-        assert_eq!(still_open.len(), 1);
-        assert_eq!(still_open[0].session_id, latest);
+        assert_eq!(still_open.map(|session| session.session_id), Some(latest));
     }
 
     #[test]

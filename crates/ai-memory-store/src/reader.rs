@@ -1843,17 +1843,58 @@ impl ReaderPool {
     /// Results are newest-first so callers can default to finalizing only the
     /// latest open session while offering an explicit all-sessions mode.
     ///
-    /// `exact_session_id`, when set, narrows to that one session id in
-    /// addition to (not instead of) the owner filter — this is what lets a
-    /// caller that already knows its own session id (e.g. a wrapper script
-    /// that captured it at spawn time) finalize precisely that session when
-    /// other sessions for the same agent are open concurrently in the same
-    /// project, without bypassing the "don't touch a colleague's session"
-    /// invariant `owner_filter` exists for.
-    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn open_sessions_for_scope_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+        owner_filter: OwnerFilter,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<OpenSession>> {
+        self.open_sessions_for_scope_agent_filtered(
+            workspace_id,
+            project_id,
+            agent_kind,
+            owner_filter,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    /// Return one exact open session for a scoped project and agent.
+    ///
+    /// The id narrows the scope, agent, open-state, and owner predicates; it
+    /// never replaces them. A known id therefore cannot expose or finalize a
+    /// colleague's session unless the caller explicitly uses
+    /// [`OwnerFilter::Any`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn open_session_for_scope_agent_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+        owner_filter: OwnerFilter,
+        session_id: SessionId,
+    ) -> StoreResult<Option<OpenSession>> {
+        let mut sessions = self
+            .open_sessions_for_scope_agent_filtered(
+                workspace_id,
+                project_id,
+                agent_kind,
+                owner_filter,
+                Some(1),
+                Some(session_id),
+            )
+            .await?;
+        Ok(sessions.pop())
+    }
+
+    async fn open_sessions_for_scope_agent_filtered(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,

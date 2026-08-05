@@ -903,13 +903,13 @@ struct OpenSessionsQuery {
     #[serde(default)]
     all_owners: bool,
     /// When set, narrow to exactly this session id (still subject to the
-    /// owner filter above) instead of `all`/newest-first selection — lets a
+    /// owner filter above) instead of newest-first selection — lets a
     /// caller that captured its own session id at spawn time finalize
     /// precisely that session, even when other sessions for the same agent
     /// are open concurrently in the same project (e.g. multiple terminal
     /// tabs each running Kiro CLI against one repo).
     #[serde(default)]
-    session_id: Option<String>,
+    session_id: Option<SessionId>,
 }
 
 /// Wire shape for one open session in the `GET /admin/open-sessions`
@@ -1035,6 +1035,14 @@ async fn handle_open_sessions(
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Query(query): Query<OpenSessionsQuery>,
 ) -> impl IntoResponse {
+    if query.all && query.session_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "all and session_id cannot be combined"
+            })),
+        );
+    }
     let Some(agent) = parse_agent_kind(&query.agent) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -1043,24 +1051,11 @@ async fn handle_open_sessions(
             })),
         );
     };
-    let exact_session_id = match query.session_id.as_deref().map(str::parse::<SessionId>) {
-        Some(Ok(sid)) => Some(sid),
-        Some(Err(_)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("invalid session_id: {}", query.session_id.unwrap_or_default())
-                })),
-            );
-        }
-        None => None,
-    };
     let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
     {
         Ok(ids) => ids,
         Err(e) => return e,
     };
-    let limit = if query.all { None } else { Some(1) };
     let owner_filter = if query.all_owners {
         ai_memory_core::OwnerFilter::Any
     } else {
@@ -1068,11 +1063,20 @@ async fn handle_open_sessions(
             &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
         )
     };
-    match state
-        .reader
-        .open_sessions_for_scope_agent(ws, proj, agent, owner_filter, limit, exact_session_id)
-        .await
-    {
+    let sessions = if let Some(session_id) = query.session_id {
+        state
+            .reader
+            .open_session_for_scope_agent_by_id(ws, proj, agent, owner_filter, session_id)
+            .await
+            .map(|session| session.into_iter().collect())
+    } else {
+        let limit = if query.all { None } else { Some(1) };
+        state
+            .reader
+            .open_sessions_for_scope_agent(ws, proj, agent, owner_filter, limit)
+            .await
+    };
+    match sessions {
         Ok(sessions) => {
             let sessions: Vec<OpenSessionEntry> = sessions
                 .into_iter()
@@ -5991,14 +5995,17 @@ mod tests {
         let other_scope = SessionId::new();
         let ended = SessionId::new();
         let bobs_session = SessionId::new();
-        for (id, project_id, actor_user) in [
-            (older, target, None),
-            (latest, target, None),
-            (other_scope, other_project, None),
-            (ended, target, None),
+        let wrong_agent = SessionId::new();
+        for (id, project_id, agent_kind, actor_user) in [
+            (older, target, AgentKind::KiroCli, None),
+            (latest, target, AgentKind::KiroCli, None),
+            (other_scope, other_project, AgentKind::KiroCli, None),
+            (ended, target, AgentKind::KiroCli, None),
+            (wrong_agent, target, AgentKind::Codex, None),
             (
                 bobs_session,
                 target,
+                AgentKind::KiroCli,
                 Some(IdentityKey::User("bob".into()).storage_key()),
             ),
         ] {
@@ -6008,7 +6015,7 @@ mod tests {
                     id,
                     workspace_id: ws,
                     project_id,
-                    agent_kind: AgentKind::KiroCli,
+                    agent_kind,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user,
                 })
@@ -6099,6 +6106,25 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
 
+        // An exact id from another agent remains outside the requested
+        // agent boundary even when its scope matches.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={wrong_agent}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+
         // A colleague's session id is not reachable without all_owners, even
         // when the exact id is known — session_id composes with the owner
         // filter (AND), it doesn't bypass it.
@@ -6140,6 +6166,22 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["sessions"].as_array().unwrap().len(), 1);
+
+        // Selection modes are mutually exclusive instead of silently giving
+        // one of them precedence.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&all=true&session_id={older}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // A malformed session_id fails closed with a 400, not a silent
         // empty/ignored filter.
