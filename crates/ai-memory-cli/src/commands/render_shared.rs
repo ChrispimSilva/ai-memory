@@ -518,6 +518,10 @@ pub(crate) enum HookShape {
     /// Gemini CLI tolerates (but doesn't require) a sibling
     /// `sequential` key at the outer level — we don't set it.
     Nested,
+    /// Command Code's nested handler shape without an outer matcher. Its
+    /// stable hook schema treats omission as "all tools" and does not fire
+    /// SessionStart/Stop when a matcher is present.
+    NestedWithoutMatcher,
     /// Cursor: `"e": [ { "type":"command", "command":"...",
     /// "matcher":"" } ]` (no inner `hooks` array). Cursor's
     /// `hooks.json` also requires a sibling `version: 1` key at
@@ -551,6 +555,16 @@ pub(crate) const CODEX_EVENTS: [(&str, &str); 6] = [
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+];
+
+/// Command Code's stable shell-hook vocabulary. Mods expose more lifecycle
+/// events but remain experimental, so the first-party integration uses only
+/// these documented stable boundaries.
+pub(crate) const COMMAND_CODE_EVENTS: [(&str, &str); 4] = [
+    ("SessionStart", "session-start.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
     ("Stop", "stop.sh"),
 ];
 
@@ -591,6 +605,10 @@ pub(crate) const GEMINI_EVENTS: [(&str, &str); 5] = [
 pub(crate) const CODEX_PROFILE: HookProfile = HookProfile {
     events: &CODEX_EVENTS,
     shape: HookShape::Nested,
+};
+pub(crate) const COMMAND_CODE_PROFILE: HookProfile = HookProfile {
+    events: &COMMAND_CODE_EVENTS,
+    shape: HookShape::NestedWithoutMatcher,
 };
 pub(crate) const CURSOR_PROFILE: HookProfile = HookProfile {
     events: &CURSOR_EVENTS,
@@ -1076,6 +1094,9 @@ fn build_hook_payload_for_platform(
         let entry = match shape {
             HookShape::Nested => json!([{
                 "matcher": "",
+                "hooks": [handler],
+            }]),
+            HookShape::NestedWithoutMatcher => json!([{
                 "hooks": [handler],
             }]),
             HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler)]),
@@ -2142,7 +2163,9 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
                 HookCommandContext::new(platform, agent, None, None).allow_claude_windows_exec(),
             );
             match shape {
-                HookShape::Nested => v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone(),
+                HookShape::Nested | HookShape::NestedWithoutMatcher => {
+                    v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone()
+                }
                 HookShape::Flat => v.pointer("/hooks/SessionStart/0").unwrap().clone(),
             }
         }
@@ -2238,6 +2261,25 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
                 .is_none(),
             "Antigravity must retain command-string schema: {antigravity}"
         );
+    }
+
+    #[test]
+    fn command_code_profile_omits_matchers_and_uses_native_agent_identity() {
+        let value = build_hook_payload_for_platform(
+            &COMMAND_CODE_EVENTS,
+            Path::new("/hooks"),
+            "http://memory:49374",
+            None,
+            HookShape::NestedWithoutMatcher,
+            HookCommandContext::new(HookCommandPlatform::PosixNative, "command-code", None, None),
+        );
+
+        for event in ["SessionStart", "PreToolUse", "PostToolUse", "Stop"] {
+            let definition = &value["hooks"][event][0];
+            assert!(definition.get("matcher").is_none(), "event: {event}");
+            let command = definition["hooks"][0]["command"].as_str().unwrap();
+            assert!(command.contains("--agent command-code"), "{command}");
+        }
     }
 
     #[test]

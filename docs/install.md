@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -738,6 +738,58 @@ Kimi Code hook entries accept only `event`, `matcher`, `command`, and
 `timeout`; extra fields make the whole `config.toml` fail to load, so prefer
 `install-hooks --apply` over hand edits.
 
+### Command Code
+
+Command Code keeps user-scope MCP and hook configuration in separate JSON
+files under `~/.commandcode/`. Install both integrations with:
+
+```bash
+ai-memory install-mcp --client command-code --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+ai-memory install-hooks --agent command-code --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+The aliases `commandcode`, `cmdc`, and `cmd` are accepted. `install-mcp`
+merges a native HTTP entry into `~/.commandcode/mcp.json`; `install-hooks`
+merges only Command Code's four stable events (`SessionStart`, `PreToolUse`,
+`PostToolUse`, and `Stop`) into `~/.commandcode/settings.json`, preserving
+other settings and hook handlers. The hook definitions deliberately omit
+`matcher`: Command Code documents omission as "all tools", while any matcher
+on `SessionStart` or `Stop` prevents that lifecycle hook from firing.
+
+Local installs use the native `ai-memory hook` command, so Command Code's
+native `session_id` and `cwd` are attributed directly;
+recognized `shell_command`, `read_file`, `write_file`, and `edit_file`
+payloads pass through the same bounded capture-exclusion policy as other
+native integrations. A pending handoff is injected through
+`hookSpecificOutput.additionalContext` at `SessionStart`.
+
+Command Code's stable `Stop` event ends a turn, not a session. Finalize the
+open session after the last turn when you need immediate consolidation and a
+handoff:
+
+```bash
+ai-memory finalize-session --agent command-code
+ai-memory finalize-session --agent command-code --session-id <uuid>
+```
+
+ai-memory does not install Command Code Mods. Mods are currently documented
+as experimental, run unsandboxed, and do not provide the same stable native
+session identity at every callback. Managed `ai-memory run command-code`
+support is also withheld. Command Code documents append-only JSONL transcripts
+under `~/.commandcode/projects/<project-slug>/`, native `--continue`,
+`--resume`, and `--session` selectors, `--yolo`, and the Windows `cmdc` alias.
+It does not document the JSONL record schema needed for bounded visible-event
+import. A logged-in acceptance run must still supply sanitized structural
+fixtures and validate checkout matching, incremental import, resume identity,
+normal-exit finalization, and native Windows behavior before ai-memory manages
+those sessions. Direct `cmd`, `cmdc`, or `command-code` launches remain
+unchanged.
+
 ### Kiro CLI
 
 Kiro CLI has one MCP surface. ai-memory supports the documented v2 lifecycle
@@ -965,6 +1017,14 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "https://memory.example"
 
 docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client command-code    --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-hooks --agent command-code   --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374"
+
+docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client vscode-copilot  --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
 
@@ -973,7 +1033,7 @@ docker run --rm akitaonrails/ai-memory:latest \
     --server-url "http://homelab:49374/mcp"
 ```
 
-Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, and OpenClaw support both
+Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and OpenClaw support both
 `install-mcp` and `install-hooks`. Grok's `install-mcp --client grok` writes
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
@@ -1373,7 +1433,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | Subcommand | Pattern | What it does |
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
-| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
+| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI v2, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |

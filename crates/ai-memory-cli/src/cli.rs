@@ -1020,6 +1020,10 @@ pub enum AgentChoice {
     /// tool payload fixtures.
     #[value(alias = "kiro")]
     KiroCli,
+    /// Command Code CLI — stable JSON-config shell hooks in
+    /// `~/.commandcode/settings.json`.
+    #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
+    CommandCode,
 }
 
 impl AgentChoice {
@@ -1046,6 +1050,7 @@ impl AgentChoice {
             Self::Devin => AgentKind::Devin,
             Self::KimiCode => AgentKind::KimiCode,
             Self::KiroCli => AgentKind::KiroCli,
+            Self::CommandCode => AgentKind::CommandCode,
         }
     }
 
@@ -1153,6 +1158,9 @@ pub enum McpClient {
     /// `install-hooks --agent kiro-cli` for verified v2 lifecycle capture.
     #[value(alias = "kiro")]
     KiroCli,
+    /// Command Code CLI — `~/.commandcode/mcp.json`.
+    #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
+    CommandCode,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -2239,6 +2247,39 @@ mod tests {
                 error.to_string().contains("invalid value"),
                 "v3 must remain unsupported until its live payload fixtures are verified: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn command_code_mcp_and_hook_aliases_parse() {
+        for alias in ["command-code", "commandcode", "cmdc", "cmd"] {
+            let mcp = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "http://memory.example:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse MCP alias {alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp for {alias}");
+            };
+            assert_eq!(args.client, McpClient::CommandCode);
+
+            let hooks = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://memory.example:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse hook alias {alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks for {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::CommandCode);
         }
     }
 

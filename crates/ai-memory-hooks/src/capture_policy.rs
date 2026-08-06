@@ -126,7 +126,7 @@ pub(crate) fn tool_observation_metadata(
 ) -> Option<ToolObservationMetadata> {
     let object = raw.as_object()?;
     let (name, id) = match agent {
-        AgentKind::ClaudeCode => (
+        AgentKind::ClaudeCode | AgentKind::CommandCode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -161,7 +161,10 @@ pub(crate) fn tool_observation_metadata(
                 .get(
                     if matches!(
                         agent,
-                        AgentKind::ClaudeCode | AgentKind::Hermes | AgentKind::KiroCli
+                        AgentKind::ClaudeCode
+                            | AgentKind::CommandCode
+                            | AgentKind::Hermes
+                            | AgentKind::KiroCli
                     ) {
                         "tool_input"
                     } else {
@@ -529,6 +532,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
             .and_then(Value::as_str)
             .map(|name| (name, object.get("input"))),
         AgentKind::ClaudeCode
+        | AgentKind::CommandCode
         | AgentKind::Codex
         | AgentKind::Cursor
         | AgentKind::GeminiCli
@@ -603,11 +607,11 @@ fn family(name: &str) -> ToolFamily {
         | "write_to_file"
         | "fs_read"
         | "fs_write" => ToolFamily::File,
-        "read_file" | "write_file" | "patch" => ToolFamily::File,
+        "read_file" | "write_file" | "edit_file" | "patch" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
         | "list_dir" | "grep_search" | "search_files" => ToolFamily::SearchList,
-        "bash" | "shell" | "execute" | "run_command" | "web_search" | "terminal"
-        | "execute_bash" | "execute_cmd" => ToolFamily::NonFile,
+        "bash" | "shell" | "shell_command" | "execute" | "run_command" | "web_search"
+        | "terminal" | "execute_bash" | "execute_cmd" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
 }
@@ -1072,6 +1076,43 @@ mod tests {
             ("patch", ToolFamily::File),
             ("search_files", ToolFamily::SearchList),
             ("terminal", ToolFamily::NonFile),
+        ] {
+            assert_eq!(family(tool), expected, "tool: {tool}");
+        }
+    }
+
+    #[test]
+    fn command_code_official_tool_shape_is_closed_and_honors_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let ignored = json!({
+            "session_id": "command-session",
+            "cwd": "/repo",
+            "tool_use_id": "tool-42",
+            "tool_name": "edit_file",
+            "tool_input": {
+                "file_path": "secret/token.txt",
+                "old_value": "old",
+                "new_value": "new"
+            }
+        });
+
+        let metadata = tool_observation_metadata(AgentKind::CommandCode, &ignored, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("tool-42"));
+        let decision = policy.inspect(AgentKind::CommandCode, &ignored, "/repo");
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        for (tool, expected) in [
+            ("read_file", ToolFamily::File),
+            ("write_file", ToolFamily::File),
+            ("edit_file", ToolFamily::File),
+            ("shell_command", ToolFamily::NonFile),
         ] {
             assert_eq!(family(tool), expected, "tool: {tool}");
         }

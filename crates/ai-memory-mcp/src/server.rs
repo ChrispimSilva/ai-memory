@@ -3536,6 +3536,7 @@ impl AiMemoryServer {
                 "zero": "AGENTS.md",
                 "devin": "AGENTS.md",
                 "kimi_code": "AGENTS.md",
+                "command_code": "AGENTS.md",
                 "grok": "AGENTS.md",
                 "default": "AGENTS.md"
             },
@@ -5063,6 +5064,12 @@ mod tests {
         );
         assert_eq!(
             response["agent_filenames"]["kimi_code"].as_str().unwrap(),
+            "AGENTS.md"
+        );
+        assert_eq!(
+            response["agent_filenames"]["command_code"]
+                .as_str()
+                .unwrap(),
             "AGENTS.md"
         );
         // Proposed symmetrically alongside the devin assertion above:

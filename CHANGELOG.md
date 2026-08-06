@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added first-party Command Code MCP and stable lifecycle-hook support.
+  `install-mcp --client command-code` merges the documented user-scope HTTP
+  entry; `install-hooks --agent command-code` preserves existing settings and
+  registers only `SessionStart`, `PreToolUse`, `PostToolUse`, and `Stop` with
+  native session attribution, capture exclusions, and startup handoff
+  injection. Experimental Mods and managed resume remain acceptance-gated,
+  and the turn-only Stop boundary is documented with the manual finalizer
+  workflow (#373).
 - `ai-memory finalize-session --session-id <uuid>` targets exactly one open
   session instead of "the latest open one for this agent+scope". Agents with
   no true SessionEnd hook (Kiro CLI, Codex, Antigravity CLI) rely on

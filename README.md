@@ -24,6 +24,7 @@
 | Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Local supported profiles default to host-native hook commands; Claude Code may use its Windows exec form, while other agents use native single command strings matching their hook schema. PowerShell/Git Bash scripts are compatibility fallbacks. See [`docs/windows.md`](docs/windows.md). |
 | Claude Code | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. `install-mcp --session-aware` optionally enables per-session auto-scope isolation through a local stdio bridge. Optionally captures the assistant's final turn on `Stop` when installed with `--capture-assistant` and the server enables `capture_assistant` (double opt-in, off by default). |
 | Codex | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. No automatic true session-end hook, so run `ai-memory finalize-session` when you need a final summary/handoff. |
+| Command Code | Supported | MCP config (`~/.commandcode/mcp.json`) + its four stable lifecycle-hook events (`~/.commandcode/settings.json`); native commands enforce capture exclusions and `SessionStart` injects handoffs. `Stop` is only a turn boundary, so use `ai-memory finalize-session --agent command-code` after the final turn. Experimental Mods and managed workstreams remain acceptance-gated. |
 | Devin CLI | Supported | MCP config + lifecycle hooks. Hooks use Devin's `PostCompaction` event, inject handoffs via `hookSpecificOutput.additionalContext`, and omit subagent events because Devin does not expose them. |
 | OpenCode | Supported | Remote MCP config + generated TypeScript plugin; generated plugin enforces capture exclusions. |
 | Cursor | Supported | MCP config + lifecycle hooks. |
@@ -154,7 +155,7 @@ priors are at the [bottom](#influences-and-prior-art).
   volume; shared deployments keep the endpoint root-only. See
   [MCP client activity](docs/users.md#mcp-client-activity).
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
-  Code, Codex, Devin CLI, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
+  Code, Codex, Command Code, Devin CLI, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
   Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, OpenClaw, Oh My Pi
   / OMP (`omp` / `oh-my-pi`), Pi via generated bridge extension, VS Code
   GitHub Copilot agent mode (MCP-only, workspace `.vscode/mcp.json`), Kiro CLI
@@ -460,7 +461,7 @@ docker run -d --name ai-memory \
 
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
-#    `--agent codex`, `--agent devin`, `--agent opencode`, `--agent gemini-cli`,
+#    `--agent codex`, `--agent command-code`, `--agent devin`, `--agent opencode`, `--agent gemini-cli`,
 #    `--agent grok`, `--agent kimi-code`, `--agent kiro-cli`, `--agent omp`,
 #    `--agent oh-my-pi`, `--client cursor`,
 #    `--client gemini-cli`, `--client grok`, `--client kiro-cli`, etc.
@@ -474,6 +475,9 @@ ai-memory install-hooks --agent  claude-code --apply
 # ai-memory install-mcp   --client kiro-cli --apply
 # ai-memory install-hooks --agent  kiro-cli --apply
 # Kiro CLI v3 hook capture is not yet supported; see docs/install.md.
+# Command Code stable MCP + lifecycle example:
+# ai-memory install-mcp   --client command-code --apply
+# ai-memory install-hooks --agent  command-code --apply
 ```
 
 On Linux/macOS, that's it. Start a Claude Code session as usual - every
@@ -976,7 +980,7 @@ diagram, crate breakdown, schema notes, and invariants.
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
-| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
+| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI v2, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for contributors adding managed resume, read-only transcript import, and startup context delivery to another harness. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |

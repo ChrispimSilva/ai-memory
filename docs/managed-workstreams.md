@@ -234,6 +234,18 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
 
+Command Code is intentionally absent from this table. Its first-party MCP and
+stable lifecycle-hook integration does not imply managed resume support.
+The official session contract establishes append-only JSONL transcripts at
+`~/.commandcode/projects/<project-slug>/<session-id>.jsonl`, native
+`--continue`, `--resume`, and `--session` selectors, `--yolo`, and `cmdc` as
+the native Windows alias. The record-level JSONL schema is not documented.
+Before adding a managed adapter, a logged-in current release must therefore
+supply sanitized structural fixtures and validate project-slug ownership,
+branch-aware visible-event extraction, incremental append behavior, resume
+identity, normal-exit finalization, and native Windows execution. Experimental
+Mod APIs are not a substitute for those native-session acceptance artifacts.
+
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter
