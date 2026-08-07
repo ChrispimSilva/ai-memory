@@ -35,18 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session starts, user prompts, and pre-tool events now advance shared or
   identity-only fallbacks; other events refresh exact session mappings, and
   dropped-subagent preflight no longer publishes scope (#372).
-- The Anthropic provider no longer sends `temperature` to models that
-  rejected it. Claude 5 (Opus / Sonnet / Fable) and Opus 4.7+ answer any
-  request carrying a sampling parameter with a 400 reporting `temperature`
-  as deprecated for that model, which the server surfaced as a 502 — so
-  `bootstrap`, consolidation, `lint`, and the auto-improvement loop all
-  failed on those models, since every structured call site sets 0.1-0.2.
-  The field is now omitted for the affected models (the API applies its own
-  default) and forwarded unchanged everywhere else, mirroring the existing
-  gpt-5 / o-series handling in the OpenAI provider. Affects both
-  `anthropic` and `anthropic-oauth`. Note that `llm-test` sends no
-  `temperature`, so it reported these models as healthy while every real
-  pipeline call failed ([#377]).
+- The Anthropic provider stopped sending `temperature` to Claude 4.7 and later
+  models, including the Claude 5 families, and to Claude Mythos Preview. Those
+  models reject non-default sampling parameters, which made `bootstrap`,
+  consolidation, `lint`, and auto-improvement fail with an upstream 400. Both
+  `anthropic` and `anthropic-oauth` now omit the field for affected models and
+  preserve it elsewhere. `llm-test` also sends a representative 0.2 value
+  before provider normalization, so it exercises the same compatibility path
+  as the real pipeline (#377).
 - Both wrappers (`bin/ai-memory` and `bin/ai-memory.ps1`) now forward
   `ANTHROPIC_OAUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` to the helper
   container. Their API-key counterparts were already in the passthrough list,

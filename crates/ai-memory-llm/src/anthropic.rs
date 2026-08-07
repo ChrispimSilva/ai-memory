@@ -236,8 +236,8 @@ impl AnthropicProvider {
             ),
             None => (None, None),
         };
-        // Newer models reject any caller-supplied `temperature` with a 400;
-        // omit the field so the API applies its own default.
+        // Newer models reject ai-memory's non-default `temperature` with a
+        // 400; omit the field so the API applies its own default.
         let temperature = if model_rejects_temperature(&self.model) {
             None
         } else {
@@ -295,14 +295,13 @@ impl AnthropicProvider {
     }
 }
 
-/// Models that reject any caller-supplied `temperature`.
+/// Models that reject ai-memory's non-default `temperature`.
 ///
 /// Anthropic deprecated sampling parameters on the newer models: sending
-/// `temperature` to Claude 5 (Opus / Sonnet / Fable) or to Opus 4.7+ returns a
+/// `temperature` to Claude 4.7+ or to Claude Mythos Preview returns a
 /// 400 with `` `temperature` is deprecated for this model. `` Every structured
 /// call site — bootstrap, consolidation, lint, auto-improve — passes 0.1-0.2,
-/// so without this the whole LLM pipeline is unusable on those models while
-/// `llm-test` (which sends no temperature) still reports the model as healthy.
+/// so without this the whole LLM pipeline is unusable on those models.
 /// Omitting the field lets the API apply its own default, the same escape
 /// hatch `openai.rs::model_requires_default_temperature` uses for gpt-5 /
 /// o-series.
@@ -313,10 +312,29 @@ impl AnthropicProvider {
 /// proxying a non-Claude model behind this wire format must not be silently
 /// stripped either.
 fn model_rejects_temperature(model: &str) -> bool {
+    if is_mythos_preview(model) {
+        return true;
+    }
     match claude_family_version(model) {
         Some((major, minor)) => major >= 5 || (major == 4 && minor >= 7),
         None => false,
     }
+}
+
+/// Match the dateless preview id, including vendor-prefixed variants.
+fn is_mythos_preview(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let Some(rest) = lower
+        .find("claude-")
+        .map(|start| &lower[start + "claude-".len()..])
+    else {
+        return false;
+    };
+    let mut parts = rest.split(|c: char| !c.is_ascii_alphanumeric());
+    matches!(
+        (parts.next(), parts.next()),
+        (Some("mythos"), Some("preview"))
+    )
 }
 
 /// Parse the `<major>[-<minor>]` version following the family name of a modern
@@ -330,7 +348,10 @@ fn claude_family_version(model: &str) -> Option<(u32, u32)> {
     // the same `claude-<family>-<version>` core.
     let rest = &lower[lower.find("claude-")? + "claude-".len()..];
     let mut parts = rest.split(|c: char| !c.is_ascii_alphanumeric());
-    if !matches!(parts.next()?, "opus" | "sonnet" | "haiku" | "fable") {
+    if !matches!(
+        parts.next()?,
+        "opus" | "sonnet" | "haiku" | "fable" | "mythos"
+    ) {
         return None;
     }
     let major = version_segment(parts.next()?)?;
@@ -444,6 +465,9 @@ mod tests {
             "claude-opus-5",
             "claude-sonnet-5",
             "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "anthropic.claude-mythos-preview-v1:0",
             "claude-opus-4-7",
             "claude-opus-4-8",
             "anthropic.claude-opus-5-v1:0",
