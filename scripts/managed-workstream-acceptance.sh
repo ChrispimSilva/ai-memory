@@ -306,12 +306,13 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
     fi
     # The bucket directory name is intentionally opaque: the real layout
     # hashes the working directory one-way, and discovery must read
-    # state.json's workDir instead of parsing the bucket name.
+    # state.json's current cwd field instead of parsing the bucket name.
     session_dir="${KIMI_CODE_HOME:?kimi fake mode requires KIMI_CODE_HOME}/sessions/wd_fixture_bucket/$session_id"
     mkdir -p "$session_dir/agents/main"
     wire="$session_dir/agents/main/wire.jsonl"
     if [ ! -f "$session_dir/state.json" ]; then
-      printf '{"workDir":"%s"}\n' "$PWD" >"$session_dir/state.json"
+      printf '{"id":"%s","version":2,"cwd":"%s"}\n' \
+        "$session_id" "$PWD" >"$session_dir/state.json"
       printf '{"type":"metadata","protocol_version":"1","created_at":%s}\n' \
         "$(date +%s)000" >"$wire"
     fi

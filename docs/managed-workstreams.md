@@ -310,7 +310,9 @@ Known Kimi Code adapter limitations: subagent transcripts
 (`agents/<id>/wire.jsonl` other than `main`) are not imported in v1 and are
 recorded as an extraction-loss annotation; the session bucket directory name
 is a one-way hash of the working directory, so discovery always reads
-`state.json`'s `workDir` and never parses the bucket name. Event ids derive
+`state.json`'s current `cwd` field or legacy `workDir` alias and never parses
+the bucket name. Conflicting aliases or a persisted id that disagrees with the
+session directory are rejected. Event ids derive
 from the SHA-256 of the raw wire.jsonl line, so two byte-identical lines —
 only possible with identical content in the same millisecond, because Kimi
 Code stamps each record with `time` — collapse into a single ledger event.
@@ -322,7 +324,7 @@ workstream.
 Legacy sessions that keep `wire.jsonl` directly in the session directory
 (the pre-`agents/` layout the kimi session-store still reads through its
 stat fallback) are neither discovered nor imported in v1. The native
-contract was verified against Kimi Code v0.29.0. The managed launcher accepts
+contract was reverified against Kimi Code v0.34.0. The managed launcher accepts
 `kimi`, `kimi-code`, and `kimi-cli`; all three resolve the installed `kimi`
 executable.
 
@@ -468,9 +470,10 @@ belong in wiki pages through consolidation or explicit durable writes.
 project name. Wiki paths are UUID-keyed, so it moves no server directory, source
 checkout, or native harness session. If the source checkout path itself is
 renamed, absolute-path session locators used by Claude Code, Codex, OpenCode,
-Pi, Kimi Code (`state.json`'s `workDir`), Kiro v2 (`<uuid>.json`'s `cwd`), Kiro
-v3 (`session.json`'s `workspacePaths`), OMP, and Antigravity may still reference
-the old path; Crush's project-local `.crush` database moves with the checkout.
+Pi, Kimi Code (`state.json`'s `cwd` or legacy `workDir`), Kiro v2
+(`<uuid>.json`'s `cwd`), Kiro v3 (`session.json`'s `workspacePaths`), OMP, and
+Antigravity may still reference the old path; Crush's project-local `.crush`
+database moves with the checkout.
 
 There is no portable, supported API that rewrites every harness's private
 project locator. ai-memory therefore does not mutate those stores or silently

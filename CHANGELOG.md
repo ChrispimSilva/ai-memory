@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   query ([#374]).
 
 ### Fixed
+- Kimi Code 0.34.0 managed runs now discover checkout-local sessions from the
+  current `state.json` `cwd` field as well as the legacy `workDir` alias. The
+  parser rejects conflicting aliases and persisted ids that disagree with the
+  session directory, and deterministic acceptance now exercises the current
+  state schema (#382).
 - Prevented delayed post-tool and shutdown hook tails from redirecting the
   shared active-project fallback after work moved to another project. Only
   session starts, user prompts, and pre-tool events now advance shared or

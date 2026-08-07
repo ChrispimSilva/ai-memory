@@ -2166,9 +2166,11 @@ fn session_header_for_cwd(
 /// Kimi sessions are self-describing in `<session-dir>/state.json` — the wire
 /// journal itself carries no session id or cwd, and the bucket directory name
 /// is a one-way hash of the cwd, so neither can be inferred from the layout.
-/// The journal path is `<session-dir>/agents/main/wire.jsonl`, making the
-/// session directory the third ancestor. Missing/invalid state means the
-/// session is unusable for checkout matching, not an error.
+/// Kimi 0.29 used `workDir`; 0.34 uses `cwd`. Conflicting aliases and an
+/// optional id that disagrees with the directory fail closed. The journal path
+/// is `<session-dir>/agents/main/wire.jsonl`, making the session directory the
+/// third ancestor. Missing/invalid state means the session is unusable for
+/// checkout matching, not an error.
 fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     let Some(session_dir) = path.ancestors().nth(3) else {
         return Ok(None);
@@ -2179,11 +2181,32 @@ fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     let Ok(state) = serde_json::from_str::<Value>(&raw) else {
         return Ok(None);
     };
-    let Some(cwd) = state.get("workDir").and_then(Value::as_str) else {
-        return Ok(None);
-    };
     let Some(id) = session_dir.file_name().and_then(|name| name.to_str()) else {
         return Ok(None);
+    };
+    match state.get("id") {
+        Some(Value::String(recorded)) if recorded == id => {}
+        Some(_) => return Ok(None),
+        None => {}
+    }
+    let legacy = match state.get("workDir") {
+        Some(Value::String(cwd)) => Some(cwd.as_str()),
+        Some(_) => return Ok(None),
+        None => None,
+    };
+    let current = match state.get("cwd") {
+        Some(Value::String(cwd)) => Some(cwd.as_str()),
+        Some(_) => return Ok(None),
+        None => None,
+    };
+    let cwd = match (legacy, current) {
+        (Some(legacy), Some(current))
+            if legacy == current || same_path(Path::new(legacy), Path::new(current)) =>
+        {
+            current
+        }
+        (Some(_), Some(_)) | (None, None) => return Ok(None),
+        (Some(cwd), None) | (None, Some(cwd)) => cwd,
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
 }
@@ -3278,15 +3301,18 @@ mod tests {
     /// `session_b` at `other`. Returns `(root, wire_a)`.
     fn kimi_store_fixture(cwd: &Path, other: &Path) -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
-        for (bucket, id, work_dir) in [
-            ("wd_repo_a1b2c3d4e5f6", "session_aaa", cwd),
-            ("wd_other_f6e5d4c3b2a1", "session_bbb", other),
+        for (bucket, id, locator_key, work_dir) in [
+            ("wd_repo_a1b2c3d4e5f6", "session_aaa", "workDir", cwd),
+            ("wd_other_f6e5d4c3b2a1", "session_bbb", "cwd", other),
         ] {
             let session_dir = root.path().join(bucket).join(id);
             fs::create_dir_all(session_dir.join("agents/main")).unwrap();
+            let mut state = serde_json::Map::new();
+            state.insert("id".into(), Value::String(id.into()));
+            state.insert(locator_key.into(), json!(work_dir));
             fs::write(
                 session_dir.join("state.json"),
-                json!({"workDir": work_dir}).to_string(),
+                Value::Object(state).to_string(),
             )
             .unwrap();
         }
@@ -3314,7 +3340,7 @@ mod tests {
             .join("wd_other_f6e5d4c3b2a1/session_bbb/agents/main/wire.jsonl");
         fs::write(&wire_b, "").unwrap();
         // The "other" bucket is alphabetically first and its session newer,
-        // so only an exact workDir match can pick the right session.
+        // so only an exact state locator match can pick the right session.
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&wire_b, "{\"type\":\"metadata\"}\n").unwrap();
 
@@ -3379,6 +3405,50 @@ mod tests {
                 "missing"
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn kimi_state_rejects_conflicting_locators_and_mismatched_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let session_dir = temp.path().join("session_expected");
+        let wire = session_dir.join("agents/main/wire.jsonl");
+        fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(&wire, "").unwrap();
+
+        fs::write(
+            session_dir.join("state.json"),
+            json!({"id":"session_expected","workDir":cwd,"cwd":other}).to_string(),
+        )
+        .unwrap();
+        assert!(kimi_session_header(&wire).unwrap().is_none());
+
+        fs::write(
+            session_dir.join("state.json"),
+            json!({"id":"session_other","cwd":cwd}).to_string(),
+        )
+        .unwrap();
+        assert!(kimi_session_header(&wire).unwrap().is_none());
+
+        fs::write(
+            session_dir.join("state.json"),
+            json!({"id":"session_expected","cwd":[cwd]}).to_string(),
+        )
+        .unwrap();
+        assert!(kimi_session_header(&wire).unwrap().is_none());
+
+        fs::write(
+            session_dir.join("state.json"),
+            json!({"id":"session_expected","workDir":cwd,"cwd":cwd}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            kimi_session_header(&wire).unwrap(),
+            Some(("session_expected".into(), cwd))
         );
     }
 
