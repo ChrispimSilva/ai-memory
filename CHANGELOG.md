@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the container boundary. The visible symptom is that the retry `status`
   itself recommends — `llm-test --provider anthropic-oauth` — fails with a
   missing-token error, because `llm-test` runs client-side in the helper
-  rather than on the server ([#379]).
+  rather than on the server (#379).
 
 ## [1.24.0] - 2026-08-04
 

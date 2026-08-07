@@ -22,6 +22,10 @@
 #                           the wrapper reaches the host loopback server
 #                           started by the README quick start.
 #   COPILOT_GITHUB_TOKEN    GitHub token for AI_MEMORY_LLM_PROVIDER=copilot
+#   ANTHROPIC_OAUTH_TOKEN   Claude subscription token forwarded to helper
+#                           commands
+#   CLAUDE_CODE_OAUTH_TOKEN fallback Claude subscription token forwarded
+#                           likewise
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
 #   AI_MEMORY_NATIVE_BIN    native binary used for `run`/`show`/`continue` (optional)

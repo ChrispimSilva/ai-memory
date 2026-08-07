@@ -3,7 +3,7 @@
 #[cfg(unix)]
 use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::process::Command;
 #[cfg(unix)]
 use std::process::Stdio;
@@ -1028,7 +1028,17 @@ fn run_wrapper_with_fake_docker_and_claude_config(
         None,
         Some(claude_config_dir),
         None,
+        &[],
     )
+}
+
+#[cfg(unix)]
+fn run_wrapper_with_fake_docker_and_forwarded_env(
+    args: &[&str],
+    docker_info_stdout: &str,
+    forwarded_env: &[(&str, &str)],
+) -> String {
+    run_wrapper_with_fake_docker_env(args, docker_info_stdout, None, None, None, forwarded_env)
 }
 
 // The wrapper also shells out to `id -u` / `id -g` when choosing its default
@@ -1044,7 +1054,7 @@ fn run_wrapper_with_fake_docker_and_uname(
     docker_info_stdout: &str,
     uname_stdout: Option<&str>,
 ) -> String {
-    run_wrapper_with_fake_docker_env(args, docker_info_stdout, uname_stdout, None, None)
+    run_wrapper_with_fake_docker_env(args, docker_info_stdout, uname_stdout, None, None, &[])
 }
 
 #[cfg(unix)]
@@ -1059,6 +1069,7 @@ fn run_wrapper_with_fake_selinux(
         Some("Linux"),
         None,
         Some(selinux_mode),
+        &[],
     )
 }
 
@@ -1069,6 +1080,7 @@ fn run_wrapper_with_fake_docker_env(
     uname_stdout: Option<&str>,
     claude_config_dir: Option<&str>,
     selinux_mode: Option<&str>,
+    forwarded_env: &[(&str, &str)],
 ) -> String {
     let tmp = tempfile::tempdir().unwrap();
     let docker_args = tmp.path().join("docker-args.txt");
@@ -1144,6 +1156,9 @@ fn run_wrapper_with_fake_docker_env(
         .env_remove("CLAUDE_CONFIG_DIR");
     if let Some(claude_config_dir) = claude_config_dir {
         command.env("CLAUDE_CONFIG_DIR", claude_config_dir);
+    }
+    for (name, value) in forwarded_env {
+        command.env(name, value);
     }
     let output = command.output().unwrap();
     assert!(
@@ -1305,21 +1320,95 @@ fn selinux_label_exception_requires_enforcement_and_daemon_support() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn wrapper_forwards_subscription_oauth_tokens_to_the_helper() {
-    // `llm-test` runs client-side, inside the helper container, so the retry
-    // that `status` itself suggests fails with a missing-token error unless
-    // the subscription tokens reach it. The API-key variables were already
-    // forwarded; their OAuth counterparts were not. Both wrappers keep their
-    // own hand-maintained list, and both had the same hole.
-    for wrapper_path in ["bin/ai-memory", "bin/ai-memory.ps1"] {
-        let wrapper = read_repo(wrapper_path);
-        for var in ["ANTHROPIC_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"] {
-            assert!(
-                wrapper.contains(var),
-                "{wrapper_path} must forward {var} to the helper container"
-            );
-        }
+fn posix_wrapper_forwards_subscription_oauth_tokens_without_putting_values_in_argv() {
+    let tokens = [
+        ("ANTHROPIC_OAUTH_TOKEN", "oauth-canary-primary"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "oauth-canary-fallback"),
+    ];
+    let args = run_wrapper_with_fake_docker_and_forwarded_env(
+        &["llm-test", "--provider", "anthropic-oauth"],
+        "[name=seccomp,profile=default]",
+        &tokens,
+    );
+    let args: Vec<&str> = args.lines().collect();
+
+    for (name, value) in tokens {
+        assert!(
+            args.windows(2).any(|pair| pair == ["-e", name]),
+            "wrapper must forward {name} by name; got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains(value)),
+            "wrapper must not put the value of {name} in Docker argv"
+        );
+    }
+}
+
+#[test]
+fn powershell_wrapper_lists_subscription_oauth_tokens_in_its_env_allowlist() {
+    let wrapper = read_repo("bin/ai-memory.ps1");
+    let allowlist = wrapper
+        .split_once("foreach ($Name in @(")
+        .and_then(|(_, rest)| rest.split_once(")) {"))
+        .map(|(allowlist, _)| allowlist)
+        .expect("PowerShell wrapper env allowlist");
+
+    for name in ["ANTHROPIC_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"] {
+        assert!(
+            allowlist
+                .lines()
+                .any(|line| line.trim() == format!("\"{name}\",")),
+            "PowerShell wrapper must list {name} in the helper env allowlist"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_wrapper_forwards_subscription_oauth_tokens_without_putting_values_in_argv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docker_args = tmp.path().join("docker-args.txt");
+    let docker = tmp.path().join("docker.cmd");
+    std::fs::write(
+        &docker,
+        "@echo off\r\n>\"%AI_MEMORY_TEST_DOCKER_ARGS%\" echo %*\r\nexit /b 0\r\n",
+    )
+    .unwrap();
+
+    let tokens = [
+        ("ANTHROPIC_OAUTH_TOKEN", "oauth-canary-primary"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "oauth-canary-fallback"),
+    ];
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+        .arg(repo_root().join("bin/ai-memory.ps1"))
+        .args(["llm-test", "--provider", "anthropic-oauth"])
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args);
+    for (name, value) in tokens {
+        command.env(name, value);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "PowerShell wrapper failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let args = std::fs::read_to_string(docker_args).unwrap();
+    for (name, value) in tokens {
+        assert!(
+            args.contains(&format!("-e {name}")),
+            "PowerShell wrapper must forward {name} by name; got {args}"
+        );
+        assert!(
+            !args.contains(value),
+            "PowerShell wrapper must not put the value of {name} in Docker argv"
+        );
     }
 }
 

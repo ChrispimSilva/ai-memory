@@ -1247,7 +1247,12 @@ docker run -d --name ai-memory \
 ```
 
 Both `ANTHROPIC_OAUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are accepted;
-ai-memory checks `ANTHROPIC_OAUTH_TOKEN` first.
+ai-memory checks `ANTHROPIC_OAUTH_TOKEN` first. When either variable is exported
+on the host, the POSIX and PowerShell Docker wrappers forward its name to
+short-lived helper commands such as `llm-test`; the token value is inherited by
+Docker rather than placed in the wrapper's command line. The long-lived server
+container still needs the provider and token variables in its own environment,
+as in the example above.
 
 > [!TIP]
 > **Pick a small, fast model.** ai-memory's LLM work — session
