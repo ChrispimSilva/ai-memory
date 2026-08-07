@@ -1254,6 +1254,12 @@ Docker rather than placed in the wrapper's command line. The long-lived server
 container still needs the provider and token variables in its own environment,
 as in the example above.
 
+For both Anthropic providers, ai-memory omits `temperature` for Claude
+4.7 and later models and Claude Mythos Preview because those models reject
+non-default sampling parameters. `llm-test` deliberately starts with the same
+representative 0.2 value as bootstrap and consolidation, then exercises the
+provider's compatibility normalization before sending the request.
+
 > [!TIP]
 > **Pick a small, fast model.** ai-memory's LLM work — session
 > consolidation, lint, and explore — is summarisation/extraction, not hard

@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session starts, user prompts, and pre-tool events now advance shared or
   identity-only fallbacks; other events refresh exact session mappings, and
   dropped-subagent preflight no longer publishes scope (#372).
+- The Anthropic provider stopped sending `temperature` to Claude 4.7 and later
+  models, including the Claude 5 families, and to Claude Mythos Preview. Those
+  models reject non-default sampling parameters, which made `bootstrap`,
+  consolidation, `lint`, and auto-improvement fail with an upstream 400. Both
+  `anthropic` and `anthropic-oauth` now omit the field for affected models and
+  preserve it elsewhere. `llm-test` also sends a representative 0.2 value
+  before provider normalization, so it exercises the same compatibility path
+  as the real pipeline (#377).
 - Both wrappers (`bin/ai-memory` and `bin/ai-memory.ps1`) now forward
   `ANTHROPIC_OAUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` to the helper
   container. Their API-key counterparts were already in the passthrough list,

@@ -884,6 +884,13 @@ setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed. The Docker
 wrappers forward either token by name to short-lived helper commands such as
 `llm-test`; configure the long-lived server container separately as shown in the
 installation guide.
+
+For both Anthropic providers, ai-memory omits `temperature` for Claude
+4.7 and later models and Claude Mythos Preview because those models reject
+non-default sampling parameters. `llm-test` sends the same representative 0.2
+value as the normal pipeline before the provider applies that compatibility
+rule.
+
 **⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
 it may get your account rate-limited or banned. See
 [the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
