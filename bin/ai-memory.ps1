@@ -44,7 +44,7 @@ $HomePath = (Resolve-Path -LiteralPath $HOME).Path
 $WorkPath = (Get-Location).Path
 $HookHostRoot = ($HomePath -replace '\\', '/') + "/.local/share/ai-memory/hooks"
 
-$HomeRoot = $HomePath.TrimEnd([char[]]@('/', '\\'))
+$HomeRoot = $HomePath.TrimEnd([char[]]@('/', '\'))
 $HomePrefix = $HomeRoot + [IO.Path]::DirectorySeparatorChar
 $InsideHome = $WorkPath.Equals($HomeRoot, [StringComparison]::OrdinalIgnoreCase) -or
     $WorkPath.StartsWith($HomePrefix, [StringComparison]::OrdinalIgnoreCase)
@@ -64,7 +64,7 @@ if ($InsideHome) {
             $ScopeRoot = [IO.Path]::GetFullPath($DetectedScopeRoot.Trim())
         }
     }
-    $ScopeRoot = $ScopeRoot.TrimEnd([char[]]@('/', '\\'))
+    $ScopeRoot = $ScopeRoot.TrimEnd([char[]]@('/', '\'))
     $ScopePrefix = $ScopeRoot + [IO.Path]::DirectorySeparatorChar
     if ($WorkPath.Equals($ScopeRoot, [StringComparison]::OrdinalIgnoreCase)) {
         $ScopeSuffix = ""

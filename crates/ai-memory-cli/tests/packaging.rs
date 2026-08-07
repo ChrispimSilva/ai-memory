@@ -1365,6 +1365,21 @@ fn powershell_wrapper_lists_subscription_oauth_tokens_in_its_env_allowlist() {
     }
 }
 
+#[test]
+fn powershell_wrapper_trims_paths_with_single_character_separators() {
+    let wrapper = read_repo("bin/ai-memory.ps1");
+
+    assert_eq!(
+        wrapper.matches(r"TrimEnd([char[]]@('/', '\'))").count(),
+        2,
+        "PowerShell TrimEnd arguments must contain individual characters"
+    );
+    assert!(
+        !wrapper.contains(r"TrimEnd([char[]]@('/', '\\'))"),
+        "a multi-character backslash string cannot be converted to System.Char"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn powershell_wrapper_forwards_subscription_oauth_tokens_without_putting_values_in_argv() {
