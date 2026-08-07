@@ -609,11 +609,7 @@ async fn handle_hook(
     // extensions still exist, and travels with the event into `process()`.
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
-    let actor_key = ActorKey {
-        user: actor_storage_key.clone(),
-        session_id: env.session_id.clone(),
-    };
-    if should_drop_subagent(&state, &env, &actor_key).await {
+    if should_drop_subagent(&state, &env).await {
         return (StatusCode::ACCEPTED, "subagent capture dropped");
     }
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
@@ -769,14 +765,10 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         };
-        let actor_key = ActorKey {
-            user: actor_storage_key.clone(),
-            session_id: env.session_id.clone(),
-        };
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
         // as committed so the client clears it from its spool, but do not store
         // it. Keeps the contiguous-prefix ack contract intact.
-        if should_drop_subagent(&state, &env, &actor_key).await {
+        if should_drop_subagent(&state, &env).await {
             accepted_indices.push(idx);
             continue;
         }
@@ -1058,7 +1050,7 @@ const fn canonical_tool_name(family: ToolFamily) -> &'static str {
 /// `stop` / `session_end`) of a session already known to be a subagent. No-op
 /// (returns `false`) unless this event's project opted in via the per-event
 /// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
-async fn should_drop_subagent(state: &HookState, env: &HookEnvelope, actor: &ActorKey) -> bool {
+async fn should_drop_subagent(state: &HookState, env: &HookEnvelope) -> bool {
     if !env.drop_subagent_requested {
         return false;
     }
@@ -1071,8 +1063,6 @@ async fn should_drop_subagent(state: &HookState, env: &HookEnvelope, actor: &Act
         env.workspace_override.as_deref(),
         env.project_override.as_deref(),
         env.project_strategy,
-        actor,
-        env.recall_default_global_requested,
     )
     .await
     else {
@@ -1206,12 +1196,15 @@ async fn fetch_and_accept_handoff(
         query.workspace.as_deref(),
         query.project.as_deref(),
         ProjectStrategy::parse(query.project_strategy.as_deref()),
-        &actor_key,
-        // The /handoff query carries no recall preference; the main capture
-        // path is what publishes default_global for read tools.
-        false,
     )
     .await?;
+    // Session-start handoff delivery is a foreground action. Publish it so
+    // static MCP callers resolve to the directory that is opening now. The
+    // query carries no recall preference; the main capture path publishes
+    // `default_global` when its SessionStart arrives.
+    if has_publishable_scope_hint(query.cwd.as_deref(), query.project.as_deref()) {
+        state.active_project.set_for(&actor_key, ws, proj, false);
+    }
     // The actor is what makes this lookup safe on a shared server: without it
     // the newest open handoff in the project is returned to whoever starts a
     // session next, and the claim below consumes it — so one operator's baton
@@ -1740,7 +1733,13 @@ fn normalize_project_path_key(path: &str) -> String {
     }
 }
 
-/// Resolve the `(workspace_id, project_id)` pair for a hook event.
+fn has_publishable_scope_hint(cwd: Option<&str>, project_override: Option<&str>) -> bool {
+    cwd.is_some_and(|value| !value.is_empty()) || project_override.is_some()
+}
+
+/// Resolve the `(workspace_id, project_id)` pair for a hook event without
+/// publishing it as active. Callers decide separately whether the event is a
+/// foreground interaction allowed to advance fallback routing.
 ///
 /// Precedence:
 /// 1. `workspace_override` (typically declared by the agent's host-side
@@ -1753,15 +1752,12 @@ fn normalize_project_path_key(path: &str) -> String {
 /// project_strategy)` so the same `cwd` resolved with and without an
 /// override (e.g. during a hook-script upgrade window) doesn't poison each
 /// other's slot.
-#[allow(clippy::too_many_arguments)]
 async fn resolve_project_ids_inner(
     state: &HookState,
     cwd: Option<&str>,
     workspace_override: Option<&str>,
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
-    actor: &ai_memory_core::ActorKey,
-    default_global: bool,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
     let cwd_norm = cwd
         .filter(|s| !s.is_empty())
@@ -1783,14 +1779,6 @@ async fn resolve_project_ids_inner(
     {
         let mut cache = state.project_cache.lock().await;
         if let Some(ids) = cache.get(&cache_key) {
-            // Republish on every hit: a cache hit still means the agent
-            // is active in this project *now*, which is exactly what the
-            // MCP read tools need as their default. Keyed by the actor so
-            // opt-in isolation modes (`per_session`/`per_actor`) keep
-            // concurrent callers separated.
-            state
-                .active_project
-                .set_for(actor, ids.0, ids.1, default_global);
             return Ok(ids);
         }
     }
@@ -1807,15 +1795,7 @@ async fn resolve_project_ids_inner(
         (Some(p), None) => (p.to_string(), None),
         (None, Some(c)) => match derive_project_from_cwd(c, project_strategy) {
             Some(resolved) => resolved,
-            None => {
-                state.active_project.set_for(
-                    actor,
-                    state.workspace_id,
-                    state.project_id,
-                    default_global,
-                );
-                return Ok((state.workspace_id, state.project_id));
-            }
+            None => return Ok((state.workspace_id, state.project_id)),
         },
         (None, None) => {
             // The early-return at the top of the function guards
@@ -1824,12 +1804,6 @@ async fn resolve_project_ids_inner(
             // gets refactored. Same effect as `unreachable!`, but
             // visible at compile time instead of inside the panic
             // message.
-            state.active_project.set_for(
-                actor,
-                state.workspace_id,
-                state.project_id,
-                default_global,
-            );
             return Ok((state.workspace_id, state.project_id));
         }
     };
@@ -1846,9 +1820,6 @@ async fn resolve_project_ids_inner(
             "hook router: refusing to attribute event capture to the reserved \
              global scope; using the server-default project"
         );
-        state
-            .active_project
-            .set_for(actor, state.workspace_id, state.project_id, default_global);
         return Ok((state.workspace_id, state.project_id));
     }
 
@@ -2002,9 +1973,6 @@ async fn resolve_project_ids_inner(
     };
     let ids = (ws, proj);
     state.project_cache.lock().await.insert(cache_key, ids);
-    state
-        .active_project
-        .set_for(actor, ws, proj, default_global);
     Ok(ids)
 }
 
@@ -2021,16 +1989,18 @@ async fn resolve_project_ids(
     project_strategy: ProjectStrategy,
     actor: &ai_memory_core::ActorKey,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
-    resolve_project_ids_inner(
+    let ids = resolve_project_ids_inner(
         state,
         cwd,
         workspace_override,
         project_override,
         project_strategy,
-        actor,
-        false,
     )
-    .await
+    .await?;
+    if has_publishable_scope_hint(cwd, project_override) {
+        state.active_project.set_for(actor, ids.0, ids.1, false);
+    }
+    Ok(ids)
 }
 
 /// Whether session-sticky attribution may apply: the event's cwd must sit
@@ -2107,6 +2077,36 @@ async fn enqueue_session_end_consolidation(
     Ok(())
 }
 
+/// Only events that begin or actively advance work may move the legacy
+/// process-wide and identity-only fallbacks. Completion events can arrive
+/// after the operator has moved to another project, especially when a native
+/// hook spool drains after an agent process exits unexpectedly (#372).
+const fn advances_active_project_fallback(event: HookEvent) -> bool {
+    matches!(
+        event,
+        HookEvent::SessionStart | HookEvent::UserPrompt | HookEvent::PreToolUse
+    )
+}
+
+fn publish_active_project_for_event(
+    state: &HookState,
+    event: HookEvent,
+    actor: &ActorKey,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    default_global: bool,
+) {
+    if advances_active_project_fallback(event) {
+        state
+            .active_project
+            .set_for(actor, workspace_id, project_id, default_global);
+    } else {
+        state
+            .active_project
+            .set_scoped_for(actor, workspace_id, project_id, default_global);
+    }
+}
+
 async fn process(
     state: &HookState,
     env: HookEnvelope,
@@ -2163,19 +2163,10 @@ async fn process(
     } else {
         None
     };
+    let publishable_scope = sticky_scope.is_some()
+        || has_publishable_scope_hint(env.cwd.as_deref(), env.project_override.as_deref());
     let (mut ws, mut proj) = match sticky_scope {
-        Some((session_ws, session_proj, _)) => {
-            // Publish the pointer like resolve_project_ids does on a cache
-            // hit: this session being active is exactly what the MCP read
-            // tools should default to.
-            state.active_project.set_for(
-                &actor_key,
-                session_ws,
-                session_proj,
-                env.recall_default_global_requested,
-            );
-            (session_ws, session_proj)
-        }
+        Some((session_ws, session_proj, _)) => (session_ws, session_proj),
         None => {
             resolve_project_ids_inner(
                 state,
@@ -2183,8 +2174,6 @@ async fn process(
                 env.workspace_override.as_deref(),
                 env.project_override.as_deref(),
                 env.project_strategy,
-                &actor_key,
-                env.recall_default_global_requested,
             )
             .await?
         }
@@ -2291,8 +2280,6 @@ async fn process(
             env.workspace_override.as_deref(),
             env.project_override.as_deref(),
             env.project_strategy,
-            &actor_key,
-            env.recall_default_global_requested,
         )
         .await?;
         ws = refreshed.0;
@@ -2308,6 +2295,17 @@ async fn process(
                 actor_user: owner_stamp.clone(),
             })
             .await?;
+    }
+
+    if publishable_scope {
+        publish_active_project_for_event(
+            state,
+            env.event,
+            &actor_key,
+            ws,
+            proj,
+            env.recall_default_global_requested,
+        );
     }
 
     // `AI_MEMORY_RUN_ID` is invocation-scoped. A valid active run links the
@@ -3561,6 +3559,83 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delayed_hook_tail_does_not_steal_active_project_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let project_a = tmp.path().join("project-a");
+        let project_b = tmp.path().join("project-b");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+        let session_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let session_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let fire = |event: &str, session_id: &str, cwd: &std::path::Path| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "prompt": "continue",
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+
+        process(
+            &state,
+            fire("session-start", session_b, &project_b),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let active_b = state.active_project.get().expect("B published its scope");
+
+        process(
+            &state,
+            fire("user-prompt-submit", session_a, &project_a),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let active_a = state.active_project.get().expect("A published its scope");
+        assert_ne!(active_a, active_b, "the fixture must resolve two projects");
+
+        process(
+            &state,
+            fire("post-tool-use", session_b, &project_b),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.active_project.get(),
+            Some(active_a),
+            "a delayed completion tail from B must not redirect unscoped reads away from A"
+        );
+
+        process(
+            &state,
+            fire("pre-tool-use", session_b, &project_b),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.active_project.get(),
+            Some(active_b),
+            "a new foreground action in B must still advance the fallback"
+        );
+    }
+
     /// Completed replays are skipped, while a claim left pending after the
     /// observation commit resumes and completes its downstream processing.
     /// Fresh keys and keyless older clients keep landing normally.
@@ -4483,7 +4558,6 @@ mod tests {
     async fn drop_subagent_tracking_is_scoped_by_project() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
-        let actor = ai_memory_core::ActorKey::default();
 
         let marked_project_a = HookEnvelope::from_query_and_body(
             HookQuery {
@@ -4497,7 +4571,11 @@ mod tests {
                 "sessionId": "shared-session", "subagentType": "general-purpose"
             }),
         );
-        assert!(should_drop_subagent(&state, &marked_project_a, &actor).await);
+        assert!(should_drop_subagent(&state, &marked_project_a).await);
+        assert!(
+            state.active_project.get().is_none(),
+            "drop preflight may resolve scope but must not publish it as active"
+        );
 
         let unmarked_project_b = HookEnvelope::from_query_and_body(
             HookQuery {
@@ -4510,7 +4588,7 @@ mod tests {
             serde_json::json!({ "sessionId": "shared-session", "toolName": "kept" }),
         );
         assert!(
-            !should_drop_subagent(&state, &unmarked_project_b, &actor).await,
+            !should_drop_subagent(&state, &unmarked_project_b).await,
             "a subagent session tracked in project-a must not drop same-id events in project-b"
         );
 
@@ -4525,7 +4603,7 @@ mod tests {
             serde_json::json!({ "sessionId": "shared-session", "toolName": "dropped" }),
         );
         assert!(
-            should_drop_subagent(&state, &unmarked_project_a, &actor).await,
+            should_drop_subagent(&state, &unmarked_project_a).await,
             "the originally tracked project's unmarked tail still drops"
         );
     }
@@ -4534,7 +4612,6 @@ mod tests {
     async fn subagent_stop_keeps_session_tracked_until_session_end_tail_drops() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
-        let actor = ai_memory_core::ActorKey::default();
 
         let query = |event: &str| HookQuery {
             event: event.into(),
@@ -4548,20 +4625,20 @@ mod tests {
             query("subagent-start"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
-        assert!(should_drop_subagent(&state, &start, &actor).await);
+        assert!(should_drop_subagent(&state, &start).await);
 
         let subagent_stop = HookEnvelope::from_query_and_body(
             query("subagent-stop"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
-        assert!(should_drop_subagent(&state, &subagent_stop, &actor).await);
+        assert!(should_drop_subagent(&state, &subagent_stop).await);
 
         let unmarked_stop_tail = HookEnvelope::from_query_and_body(
             query("stop"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
         assert!(
-            should_drop_subagent(&state, &unmarked_stop_tail, &actor).await,
+            should_drop_subagent(&state, &unmarked_stop_tail).await,
             "SubagentStop must not clear tracking before the unmarked stop tail"
         );
 
@@ -4570,7 +4647,7 @@ mod tests {
             serde_json::json!({ "sessionId": "tail-session" }),
         );
         assert!(
-            should_drop_subagent(&state, &session_end_tail, &actor).await,
+            should_drop_subagent(&state, &session_end_tail).await,
             "SessionEnd tail is dropped and then clears tracking"
         );
 
@@ -4579,7 +4656,7 @@ mod tests {
             serde_json::json!({ "sessionId": "tail-session", "toolName": "kept" }),
         );
         assert!(
-            !should_drop_subagent(&state, &after_session_end, &actor).await,
+            !should_drop_subagent(&state, &after_session_end).await,
             "SessionEnd clears tracking for that scoped session"
         );
     }
