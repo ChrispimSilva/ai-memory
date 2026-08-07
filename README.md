@@ -572,11 +572,13 @@ one matching entry.
 
 ### Install Notes
 
-- **SELinux:** on enforcing Linux hosts, the Docker wrapper automatically adds
-  `--security-opt label=disable` only to short-lived helper commands that write
+- **SELinux:** on enforcing Linux hosts, the wrapper automatically adds
+  `--security-opt label=disable` only to short-lived helper commands that touch
   bind-mounted host files. It does not alter the long-lived server container
-  or relabel `$HOME`; do not add `:z`/`:Z` to the whole home bind. See
-  [`docs/install.md`](docs/install.md#selinux-enforcing-hosts).
+  or relabel `$HOME`; do not add `:z`/`:Z` to the whole home bind. Rootless
+  engines also get `-u 0:0` for those commands. Docker and podman report
+  rootless mode and SELinux support under different `info` keys; both are
+  read. See [`docs/install.md`](docs/install.md#selinux-enforcing-hosts).
 - **Windows:** use the Linux path inside WSL2, or the native Windows wrapper
   from PowerShell/cmd. Local supported profiles default to host-native commands:
   Claude Code may use its supported `ai-memory.exe` exec form, while other

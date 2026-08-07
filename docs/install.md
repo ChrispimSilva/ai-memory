@@ -33,6 +33,12 @@ path (docker + Claude Code). This page covers everything else:
 The Docker image is published for `linux/amd64` and `linux/arm64`; Apple
 Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
 
+> **Podman.** The `bin/ai-memory` wrapper works with rootless podman, either
+> through the `podman-docker` `docker` shim or by pointing it at podman
+> directly with `AI_MEMORY_DOCKER=podman`. See
+> [SELinux-enforcing hosts](#selinux-enforcing-hosts) for how it detects the
+> engine's rootless and SELinux state.
+
 ---
 
 ## Server on a different machine
@@ -1717,14 +1723,29 @@ URL as the generated agent config.
 #### SELinux-enforcing hosts
 
 On SELinux-enforcing Linux systems such as Fedora, RHEL, and openSUSE, normal
-home-directory labels can prevent the helper container from writing agent
+home-directory labels can prevent the helper container from reaching agent
 config even when its UID and GID match the host user. The wrapper checks both
-the host enforcement mode and Docker's advertised security options. For the
-short-lived helper commands that write host files (`install-*`, `setup-agent`,
-`uninstall`, and `backup`), it adds `--security-opt label=disable`; thin-client
-commands remain confined. This relaxes SELinux label confinement only for that
-trusted helper invocation. It does not modify the long-lived ai-memory server,
-which uses a Docker-managed named volume.
+the host enforcement mode and the engine's advertised security options. For the
+short-lived helper commands that touch host files (`install-*`, `setup-agent`,
+`uninstall`, `backup`, and `bootstrap`), it adds `--security-opt
+label=disable`; thin-client commands remain confined. This relaxes SELinux
+label confinement only for that trusted helper invocation. It does not modify
+the long-lived ai-memory server, which uses an engine-managed named volume.
+
+`bootstrap` is in that list even though it only *reads* host files: an
+unmapped UID and a confined label block reads just as hard, and the failure is
+misleading — it degrades silently to `no .git found at /work; bootstrapping
+from README/docs/rules only` before dying with `Permission denied (os error
+13)`.
+
+The two engines report these facts under different keys. Docker answers
+`docker info --format '{{.SecurityOptions}}'`; podman has no such field and
+fails that template, so the wrapper falls back to podman's
+`{{.Host.Security.Rootless}}` and `{{.Host.Security.SELinuxEnabled}}` when the
+Docker probe comes back empty. Rootless engines additionally need `-u 0:0`,
+because only container UID 0 maps back to the invoking host user — on rootless
+podman with SELinux enforcing, both adjustments are required and neither alone
+lets the write land.
 
 Do not add `:z` or `:Z` to the wrapper's whole `$HOME` bind. Docker's
 [bind-mount documentation](https://docs.docker.com/engine/storage/bind-mounts/#configure-the-selinux-label)
