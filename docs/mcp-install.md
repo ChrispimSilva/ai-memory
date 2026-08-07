@@ -917,10 +917,11 @@ agents, so `--config-file` is required when the active definition lives under
 through `agentSpawn` stdout, and honors `$KIRO_HOME`. The v3 installer writes
 the standalone `v1` file with PascalCase triggers, preserves third-party
 entries, and shares the same fail-open sanitizer and capture-exclusion
-boundary. Follow [#356](https://github.com/akitaonrails/ai-memory/issues/356)
-for automatic selection and version-aware managed support. Explicit
-`ai-memory run kiro` (alias `kiro-cli`) manages the default v2 engine;
-non-v2 engine selections pass through without session injection or import.
+boundary. `ai-memory run kiro` (alias `kiro-cli`) manages the default v2
+engine; add `--v3`, `--mode`, or `--agent-engine v3` for the incompatible v3
+store. Once linked, later plain Kiro launches recover that engine
+transparently, and bare `ai-memory run` considers checkout-local sessions from
+both engines without cross-resuming them.
 
 Sources: <https://kiro.dev/docs/mcp/configuration/>,
 <https://kiro.dev/docs/reference/settings/>,
@@ -1090,8 +1091,8 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex, Antigravity CLI, Kiro CLI v2, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Kiro CLI v2 / Command Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex, Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. Its generated plugin also sends a deduped best-effort close for any

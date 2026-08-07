@@ -49,6 +49,11 @@ pub struct ExportedTranscript {
 struct FileCursor {
     path: String,
     offset: u64,
+    /// Identifies incompatible native stores that share one wire-level agent.
+    /// Older cursors omit this field and remain readable after exact path and
+    /// metadata validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    flavor: Option<FileFlavor>,
     /// Hash of every committed byte through `offset`. Kimi Code and Grok can
     /// rewrite their journals in place (Kimi on fork/compaction/resume, Grok
     /// on rewind); Kiro's append-only behavior is not documented. Those
@@ -58,12 +63,38 @@ struct FileCursor {
     prefix_sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FileFlavor {
+    KiroV2,
+    KiroV3,
+}
+
+/// Recover Kiro's incompatible engine flavor from an opaque transcript cursor.
+/// The result is advisory only: callers must still validate the exact native
+/// session against that engine's store before injecting a resume selector.
+#[must_use]
+pub fn kiro_harness_from_source_cursor(raw: &str) -> Option<ManagedHarness> {
+    match serde_json::from_str::<FileCursor>(raw).ok()?.flavor? {
+        FileFlavor::KiroV2 => Some(ManagedHarness::Kiro),
+        FileFlavor::KiroV3 => Some(ManagedHarness::KiroV3),
+    }
+}
+
+const fn file_flavor(harness: ManagedHarness) -> Option<FileFlavor> {
+    match harness {
+        ManagedHarness::Kiro => Some(FileFlavor::KiroV2),
+        ManagedHarness::KiroV3 => Some(FileFlavor::KiroV3),
+        _ => None,
+    }
+}
+
 /// Harnesses whose JSONL journal can be rewritten in place, requiring
 /// prefix-validated cursors and content-hash record ids.
 const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
     matches!(
         harness,
-        ManagedHarness::Kimi | ManagedHarness::Kiro | ManagedHarness::Grok
+        ManagedHarness::Kimi | ManagedHarness::Kiro | ManagedHarness::KiroV3 | ManagedHarness::Grok
     )
 }
 
@@ -119,15 +150,17 @@ pub async fn discover_native_session(
     if harness == ManagedHarness::Crush {
         return discover_crush(cwd, session_dir, started_at);
     }
-    let root = session_root(harness, home, session_dir);
-    let mut candidates = collect_files(&root, |path| transcript_file(harness, path))?;
-    candidates.sort_by_key(|path| modified(path));
-    candidates.reverse();
+    let mut candidates = collect_session_files(harness, home, session_dir)?;
+    candidates.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
     for path in candidates.into_iter().take(512) {
         if modified(&path).is_some_and(|time| time + Duration::from_secs(2) < started_at) {
             break;
         }
-        if let Some((id, record_cwd)) = session_header(harness, &path)?
+        if let Some((id, record_cwd)) = session_header_for_cwd(harness, &path, cwd)?
             && same_path(&record_cwd, cwd)
         {
             return Ok(Some(id));
@@ -156,17 +189,21 @@ pub async fn list_native_sessions(
         return list_crush_sessions(cwd, session_dir, limit);
     }
 
-    let root = session_root(harness, home, session_dir);
-    let mut files = collect_files(&root, |path| transcript_file(harness, path))?;
-    files.sort_by_key(|path| modified(path));
-    files.reverse();
+    let mut files = collect_session_files(harness, home, session_dir)?;
+    files.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
     let mut seen = HashSet::new();
     let mut sessions = Vec::new();
     for path in files.into_iter().take(2_000) {
         let Some(updated_at) = modified(&path) else {
             continue;
         };
-        let Ok(Some((native_session_id, recorded_cwd))) = session_header(harness, &path) else {
+        let Ok(Some((native_session_id, recorded_cwd))) =
+            session_header_for_cwd(harness, &path, cwd)
+        else {
             continue;
         };
         if !same_path(&recorded_cwd, cwd)
@@ -204,6 +241,36 @@ pub fn native_session_exists(
         return Ok(crush_updated(cwd, session_dir, native_session_id)?.is_some());
     }
     Ok(locate_session_file(harness, home, cwd, session_dir, native_session_id)?.is_some())
+}
+
+/// Whether a linked Kiro v3 session was found only in the default home rather
+/// than the configured `KIRO_HOME` session root.
+///
+/// Kiro CLI 2.16.2 writes v3 sessions to the default root while a custom
+/// `KIRO_HOME` is active, then searches only the custom root on resume. The
+/// launcher uses this proof to remove `KIRO_HOME` for that one native process.
+pub fn kiro_v3_resume_uses_default_store(
+    home: &Path,
+    cwd: &Path,
+    configured_root: Option<&Path>,
+    native_session_id: &str,
+) -> Result<bool> {
+    let Some(configured_root) = configured_root else {
+        return Ok(false);
+    };
+    let default_root = home.join(".kiro/sessions");
+    if configured_root == default_root {
+        return Ok(false);
+    }
+    let found = locate_session_file(
+        ManagedHarness::KiroV3,
+        home,
+        cwd,
+        Some(configured_root),
+        native_session_id,
+    )?;
+    Ok(found
+        .is_some_and(|path| path.starts_with(&default_root) && !path.starts_with(configured_root)))
 }
 
 /// Wait briefly for buffered transcript writers to settle before importing.
@@ -244,9 +311,12 @@ fn export_jsonl(
     native_session_id: &str,
     source_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
+    let flavor = file_flavor(harness);
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<FileCursor>(raw).ok())
-        .filter(|cursor| Path::new(&cursor.path) == path);
+        .filter(|cursor| {
+            Path::new(&cursor.path) == path && (cursor.flavor.is_none() || cursor.flavor == flavor)
+        });
     let mut file = File::open(path)
         .with_context(|| format!("opening native transcript {}", path.display()))?;
     let len = file.metadata()?.len();
@@ -349,6 +419,13 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
+            ManagedHarness::KiroV3 => parse_kiro_v3(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
             ManagedHarness::Grok => parse_grok(
                 &value,
                 native_session_id,
@@ -372,6 +449,7 @@ fn export_jsonl(
         source_cursor: Some(serde_json::to_string(&FileCursor {
             path: path.to_string_lossy().into_owned(),
             offset: committed_offset,
+            flavor,
             prefix_sha256: journal_rewrites_in_place(harness)
                 .then(|| format!("{:x}", prefix_hasher.finalize())),
         })?),
@@ -1107,6 +1185,117 @@ fn parse_kiro(
     }
 }
 
+/// Import the visible allowlist from Kiro v3's `messages.jsonl` journal.
+/// Session bookkeeping, lifecycle-hook records, usage summaries, turn
+/// boundaries, and assistant operations other than visible `Say` output are
+/// deliberately excluded.
+fn parse_kiro_v3(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let payload = value.get("payload").unwrap_or(&Value::Null);
+    let occurred_at = timestamp(value);
+    match payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "user" => {
+            if let Some(content) = payload.get("content").and_then(Value::as_str) {
+                push_event(
+                    events,
+                    AgentKind::KiroCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("user"),
+                    content,
+                    occurred_at,
+                    json!({}),
+                );
+            }
+        }
+        "assistant" => {
+            if payload.get("operationType").and_then(Value::as_str) != Some("Say") {
+                losses.push(
+                    "Kiro v3 non-visible assistant operations were intentionally excluded".into(),
+                );
+                return;
+            }
+            if let Some(content) = payload.get("content").and_then(Value::as_str) {
+                push_event(
+                    events,
+                    AgentKind::KiroCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    content,
+                    occurred_at,
+                    json!({}),
+                );
+            }
+        }
+        "tool_call" => {
+            let name = payload
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let arguments = payload.get("args").map(compact_json).unwrap_or_default();
+            push_event(
+                events,
+                AgentKind::KiroCli,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolCall,
+                Some("assistant"),
+                &format!("{name}: {arguments}"),
+                occurred_at,
+                json!({
+                    "tool": name,
+                    "tool_call_id": payload.get("toolCallId").and_then(Value::as_str)
+                }),
+            );
+        }
+        "tool_result" => {
+            let Some(content) = payload.get("content").and_then(Value::as_str) else {
+                return;
+            };
+            push_event(
+                events,
+                AgentKind::KiroCli,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolResult,
+                Some("tool"),
+                content,
+                occurred_at,
+                json!({
+                    "tool_call_id": payload.get("toolCallId").and_then(Value::as_str),
+                    "is_error": payload.get("success").and_then(Value::as_bool).map(|success| !success)
+                }),
+            );
+        }
+        "ContextualHookInvoked"
+        | "session_metadata"
+        | "usage_summary"
+        | "turn_start"
+        | "turn_end"
+        | "session_start"
+        | "session_event" => {
+            losses.push("Kiro v3 private session records were intentionally excluded".into());
+        }
+        _ => {}
+    }
+}
+
 /// Kiro event timestamps ride `data.meta.timestamp` as a unix epoch in
 /// milliseconds.
 fn kiro_timestamp(data: &Value) -> Option<String> {
@@ -1765,7 +1954,8 @@ fn locate_session_file(
     session_dir: Option<&Path>,
     id: &str,
 ) -> Result<Option<PathBuf>> {
-    let root = session_root(harness, home, session_dir);
+    let roots = session_roots(harness, home, session_dir);
+    let root = &roots[0];
     if !valid_native_session_id(id) {
         return Ok(None);
     }
@@ -1788,7 +1978,7 @@ fn locate_session_file(
         // Bucket names are one-way cwd hashes, so only the bucket level can
         // be enumerated — but the session id below it is a plain directory
         // name, giving an exact fast path per bucket.
-        if let Ok(buckets) = fs::read_dir(&root) {
+        if let Ok(buckets) = fs::read_dir(root) {
             for bucket in buckets.flatten() {
                 let candidate = bucket.path().join(id).join("agents/main/wire.jsonl");
                 if session_path_matches(harness, &candidate, id, cwd)? {
@@ -1811,7 +2001,31 @@ fn locate_session_file(
         }
         return Ok(None);
     }
-    let mut files = collect_files(&root, |path| transcript_file(harness, path))?;
+    if harness == ManagedHarness::KiroV3 {
+        let Some(uuid) = id.strip_prefix("sess_") else {
+            return Ok(None);
+        };
+        if Uuid::parse_str(uuid).is_err() {
+            return Ok(None);
+        }
+        for root in roots {
+            let Ok(buckets) = fs::read_dir(&root) else {
+                continue;
+            };
+            for bucket in buckets.take(MAX_SCAN_FILES) {
+                let bucket = bucket?;
+                if !bucket.file_type()?.is_dir() {
+                    continue;
+                }
+                let exact = bucket.path().join(id).join("messages.jsonl");
+                if session_path_matches(harness, &exact, id, cwd)? {
+                    return Ok(Some(exact));
+                }
+            }
+        }
+        return Ok(None);
+    }
+    let mut files = collect_session_files(harness, home, session_dir)?;
     files.sort_by_key(|path| temporary_transcript(path));
     for path in files.into_iter().take(2_000) {
         if session_path_matches(harness, &path, id, cwd)? {
@@ -1830,7 +2044,7 @@ fn session_path_matches(
     if !path.is_file() {
         return Ok(false);
     }
-    Ok(session_header(harness, path)?
+    Ok(session_header_for_cwd(harness, path, cwd)?
         .is_some_and(|(found, recorded_cwd)| found == id && same_path(&recorded_cwd, cwd)))
 }
 
@@ -1857,6 +2071,15 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| Uuid::parse_str(stem).is_ok());
+    }
+    if harness == ManagedHarness::KiroV3 {
+        return path.file_name().and_then(|name| name.to_str()) == Some("messages.jsonl")
+            && path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("sess_"))
+                .is_some_and(|uuid| Uuid::parse_str(uuid).is_ok());
     }
     if harness == ManagedHarness::Antigravity {
         // One SQLite database per conversation, named by its id.
@@ -1917,6 +2140,7 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             | ManagedHarness::Crush
             | ManagedHarness::Kimi
             | ManagedHarness::Kiro
+            | ManagedHarness::KiroV3
             | ManagedHarness::Grok
             | ManagedHarness::Antigravity => (None, None),
         };
@@ -1925,6 +2149,18 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
         }
     }
     Ok(None)
+}
+
+fn session_header_for_cwd(
+    harness: ManagedHarness,
+    path: &Path,
+    cwd: &Path,
+) -> Result<Option<(String, PathBuf)>> {
+    if harness == ManagedHarness::KiroV3 {
+        kiro_v3_session_header(path, cwd)
+    } else {
+        session_header(harness, path)
+    }
 }
 
 /// Kimi sessions are self-describing in `<session-dir>/state.json` — the wire
@@ -1978,6 +2214,48 @@ fn kiro_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
+}
+
+/// Kiro v3 stores one self-describing directory per `sess_<uuid>` session.
+/// Only the observed schema/data-model pair is accepted, and at least one
+/// recorded workspace must resolve to the current checkout.
+fn kiro_v3_session_header(path: &Path, cwd: &Path) -> Result<Option<(String, PathBuf)>> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("messages.jsonl") {
+        return Ok(None);
+    }
+    let Some(session_dir) = path.parent() else {
+        return Ok(None);
+    };
+    let Some(id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let Some(uuid) = id.strip_prefix("sess_") else {
+        return Ok(None);
+    };
+    if Uuid::parse_str(uuid).is_err() {
+        return Ok(None);
+    }
+    let Ok(raw) = fs::read_to_string(session_dir.join("session.json")) else {
+        return Ok(None);
+    };
+    let Ok(metadata) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(None);
+    };
+    if metadata.get("schemaVersion").and_then(Value::as_str) != Some("1.0.0")
+        || metadata.get("dataModelVersion").and_then(Value::as_u64) != Some(1)
+        || metadata.get("id").and_then(Value::as_str) != Some(id)
+    {
+        return Ok(None);
+    }
+    let Some(workspaces) = metadata.get("workspacePaths").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let matching = workspaces
+        .iter()
+        .filter_map(Value::as_str)
+        .map(PathBuf::from)
+        .find(|workspace| same_path(workspace, cwd));
+    Ok(matching.map(|workspace| (id.to_string(), workspace)))
 }
 
 /// Grok sessions are self-describing in `<session-dir>/summary.json`
@@ -2316,9 +2594,47 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Omp => home.join(".omp/agent/sessions"),
         ManagedHarness::Kimi => home.join(".kimi-code/sessions"),
         ManagedHarness::Kiro => home.join(".kiro/sessions/cli"),
+        ManagedHarness::KiroV3 => home.join(".kiro/sessions"),
         ManagedHarness::Grok => home.join(".grok/sessions"),
         ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
     }
+}
+
+/// Kiro CLI 2.16.2 honored `KIRO_HOME` for its v2 store but wrote v3 sessions
+/// to the default home during acceptance. Scan the configured root first and
+/// the default root as a compatibility fallback; every result still passes
+/// strict metadata and checkout validation.
+fn session_roots(
+    harness: ManagedHarness,
+    home: &Path,
+    override_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let primary = session_root(harness, home, override_dir);
+    let mut roots = vec![primary.clone()];
+    if harness == ManagedHarness::KiroV3 {
+        let fallback = home.join(".kiro/sessions");
+        if fallback != primary {
+            roots.push(fallback);
+        }
+    }
+    roots
+}
+
+fn collect_session_files(
+    harness: ManagedHarness,
+    home: &Path,
+    override_dir: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for root in session_roots(harness, home, override_dir) {
+        for path in collect_files(&root, |path| transcript_file(harness, path))? {
+            if seen.insert(path.clone()) {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn collect_files(root: &Path, predicate: impl Fn(&Path) -> bool + Copy) -> Result<Vec<PathBuf>> {
@@ -2502,6 +2818,7 @@ mod tests {
                     | ManagedHarness::Crush
                     | ManagedHarness::Kimi
                     | ManagedHarness::Kiro
+                    | ManagedHarness::KiroV3
                     | ManagedHarness::Grok
                     | ManagedHarness::Antigravity => {
                         unreachable!()
@@ -3691,6 +4008,7 @@ mod tests {
 
     const KIRO_SESSION_A: &str = "3f6d1c2a-0000-4000-8000-000000000aaa";
     const KIRO_SESSION_B: &str = "3f6d1c2a-0000-4000-8000-000000000bbb";
+    const KIRO_V3_SESSION: &str = "sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e";
 
     fn write_kiro_session(root: &Path, id: &str, cwd: &Path, lines: &[Value]) {
         fs::write(
@@ -3711,6 +4029,27 @@ mod tests {
             .map(|line| format!("{line}\n"))
             .collect::<String>();
         fs::write(root.join(format!("{id}.jsonl")), transcript).unwrap();
+    }
+
+    fn write_kiro_v3_session(root: &Path, id: &str, workspaces: &[&Path], messages: &str) {
+        let session_dir = root.join("checkout-fixture").join(id);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            json!({
+                "schemaVersion": "1.0.0",
+                "dataModelVersion": 1,
+                "id": id,
+                "workspacePaths": workspaces,
+                "createdAt": "2026-08-06T10:00:00Z",
+                "lastModifiedAt": "2026-08-06T10:05:00Z",
+                "agentMode": "vibe",
+                "status": "idle"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(session_dir.join("messages.jsonl"), messages).unwrap();
     }
 
     #[tokio::test]
@@ -3800,42 +4139,151 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn kiro_v3_discovery_is_checkout_scoped_and_never_cross_resumes_v2() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let v2_root = temp.path().join("v2");
+        let v3_root = temp.path().join("v3");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&v2_root).unwrap();
+        write_kiro_session(&v2_root, KIRO_SESSION_A, &cwd, &[]);
+        write_kiro_v3_session(
+            &v3_root,
+            KIRO_V3_SESSION,
+            &[&other, &cwd],
+            include_str!("../tests/fixtures/kiro-v3-messages.jsonl"),
+        );
+
+        let sessions =
+            list_native_sessions(ManagedHarness::KiroV3, temp.path(), &cwd, Some(&v3_root), 8)
+                .await
+                .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, KIRO_V3_SESSION);
+        assert!(
+            native_session_exists(
+                ManagedHarness::KiroV3,
+                temp.path(),
+                &cwd,
+                Some(&v3_root),
+                KIRO_V3_SESSION,
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Kiro,
+                temp.path(),
+                &cwd,
+                Some(&v2_root),
+                KIRO_V3_SESSION,
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::KiroV3,
+                temp.path(),
+                &cwd,
+                Some(&v3_root),
+                KIRO_SESSION_A,
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_v3_rejects_unknown_schema_and_history_only_mirrors() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(root.join("cli")).unwrap();
+        fs::write(root.join("cli/fixture.history"), "sanitized prompt\n").unwrap();
+        write_kiro_v3_session(&root, KIRO_V3_SESSION, &[&cwd], "{}\n");
+        let metadata = root
+            .join("checkout-fixture")
+            .join(KIRO_V3_SESSION)
+            .join("session.json");
+        let mut value: Value =
+            serde_json::from_str(&fs::read_to_string(&metadata).unwrap()).unwrap();
+        value["schemaVersion"] = Value::String("2.0.0".into());
+        fs::write(&metadata, value.to_string()).unwrap();
+
+        assert!(
+            list_native_sessions(ManagedHarness::KiroV3, temp.path(), &cwd, Some(&root), 8,)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            list_native_sessions(
+                ManagedHarness::Kiro,
+                temp.path(),
+                &cwd,
+                Some(&root.join("cli")),
+                8,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn kiro_v3_detects_the_custom_home_resume_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let configured = temp.path().join("custom-kiro/sessions");
+        let default = temp.path().join(".kiro/sessions");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&configured).unwrap();
+        write_kiro_v3_session(&default, KIRO_V3_SESSION, &[&cwd], "{}\n");
+
+        assert!(
+            kiro_v3_resume_uses_default_store(
+                temp.path(),
+                &cwd,
+                Some(&configured),
+                KIRO_V3_SESSION,
+            )
+            .unwrap()
+        );
+        assert!(
+            !kiro_v3_resume_uses_default_store(temp.path(), &cwd, Some(&default), KIRO_V3_SESSION,)
+                .unwrap()
+        );
+    }
+
     #[test]
     fn kiro_export_maps_only_visible_v1_records() {
         let temp = tempfile::tempdir().unwrap();
         let stream = temp.path().join(format!("{KIRO_SESSION_A}.jsonl"));
-        let records = [
-            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m1","content":[{"kind":"text","data":"hello kiro"}],"meta":{"timestamp":1_700_000_000_000_i64}}}),
-            json!({"version":"v1","kind":"AssistantMessage","data":{"message_id":"m2","content":[
-                {"kind":"text","data":"visible answer"},
-                {"kind":"toolUse","data":{"name":"fs_read","tool_use_id":"call_1","input":{"path":"README.md"}}}
-            ]}}),
-            json!({"version":"v1","kind":"ToolResults","data":{"message_id":"m3","content":[
-                {"kind":"toolResult","data":{"tool_use_id":"call_1","content":[{"kind":"text","data":"result ok"}],"is_error":false}}
-            ]}}),
-            json!({"version":"v1","kind":"Prompt","data":{"message_id":"m4","content":[{"kind":"image","data":{"format":"png"}}]}}),
-            json!({"version":"v2","kind":"Prompt","data":{"message_id":"m5","content":[{"kind":"text","data":"future"}]}}),
-        ];
         fs::write(
             &stream,
-            records
-                .iter()
-                .map(|record| format!("{record}\n"))
-                .collect::<String>(),
+            format!(
+                "{}{}\n{}\n",
+                include_str!("../tests/fixtures/kiro-v2-messages.jsonl"),
+                json!({"version":"v1","kind":"Prompt","data":{"message_id":"m4","content":[{"kind":"image","data":{"format":"png"}}]}}),
+                json!({"version":"v2","kind":"Prompt","data":{"message_id":"m5","content":[{"kind":"text","data":"future"}]}}),
+            ),
         )
         .unwrap();
 
         let export = export_jsonl(ManagedHarness::Kiro, &stream, KIRO_SESSION_A, None).unwrap();
         assert_eq!(export.events.len(), 4);
-        assert_eq!(export.events[0].content, "hello kiro");
+        assert_eq!(export.events[0].content, "sanitized v2 prompt");
         assert_eq!(export.events[0].role.as_deref(), Some("user"));
         assert_eq!(
             export.events[0].occurred_at.as_deref(),
             Some("2023-11-14T22:13:20Z")
         );
-        assert_eq!(export.events[1].content, "visible answer");
+        assert_eq!(export.events[1].content, "sanitized v2 reply");
         assert_eq!(export.events[2].kind, WorkstreamEventKind::ToolCall);
-        assert_eq!(export.events[3].content, "result ok");
+        assert_eq!(export.events[3].content, "sanitized v2 result");
         assert!(
             export
                 .losses
@@ -3847,6 +4295,42 @@ mod tests {
                 .losses
                 .iter()
                 .any(|loss| loss.contains("unsupported envelope version v2"))
+        );
+    }
+
+    #[test]
+    fn kiro_v3_export_maps_only_visible_records_and_persists_flavor() {
+        let temp = tempfile::tempdir().unwrap();
+        let stream = temp.path().join("messages.jsonl");
+        fs::write(
+            &stream,
+            include_str!("../tests/fixtures/kiro-v3-messages.jsonl"),
+        )
+        .unwrap();
+
+        let export = export_jsonl(ManagedHarness::KiroV3, &stream, KIRO_V3_SESSION, None).unwrap();
+        assert_eq!(export.events.len(), 4);
+        assert_eq!(export.events[0].content, "sanitized v3 prompt");
+        assert_eq!(export.events[0].role.as_deref(), Some("user"));
+        assert_eq!(export.events[1].content, "sanitized v3 reply");
+        assert_eq!(export.events[2].kind, WorkstreamEventKind::ToolCall);
+        assert_eq!(export.events[3].content, "sanitized v3 result");
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("private session"))
+        );
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("non-visible assistant"))
+        );
+        let cursor: Value = serde_json::from_str(export.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            cursor.get("flavor").and_then(Value::as_str),
+            Some("kiro-v3")
         );
     }
 

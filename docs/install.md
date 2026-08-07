@@ -877,13 +877,12 @@ ai-memory finalize-session --agent kiro-cli --session-id <uuid>
 `ai-memory uninstall --only hooks --apply --yes` removes only exact ai-memory
 entries from global v2 agents, the current project's `.kiro/agents` directory,
 and ai-memory's global/current-project v3 registration. A purely generated v3
-file is deleted; third-party entries in a shared file remain. Explicit
-`ai-memory run kiro` (alias `kiro-cli`) still manages the default v2 engine and
-honors `$KIRO_HOME`; Kiro stays
-outside no-argument automatic selection until its current event stream is
-validated in a logged-in real-harness acceptance run. `--v3`, `--mode`, and
-non-v2 `--agent-engine` invocations pass through without managed session
-injection; issue #356 tracks v3 managed-workstream support. See
+file is deleted; third-party entries in a shared file remain. `ai-memory run
+kiro` (alias `kiro-cli`) manages the default v2 engine and honors `$KIRO_HOME`;
+add `--v3`, `--mode`, or `--agent-engine v3` for version-safe v3 resume. Once
+linked, a later plain Kiro launch recovers the stored engine transparently, and
+bare `ai-memory run` considers checkout-local sessions from both incompatible
+stores. See
 [managed workstreams](managed-workstreams.md#native-adapter-behavior).
 
 ### OpenCode
@@ -1460,7 +1459,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | Subcommand | Pattern | What it does |
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
-| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI v2, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
+| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI v2/v3, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |

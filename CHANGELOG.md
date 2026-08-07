@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added version-aware Kiro CLI v3 managed workstreams. `ai-memory run kiro
+  --v3` reads the authenticated 2.16.2 nested `session.json` / `messages.jsonl`
+  store through a visible-event allowlist, persists the incompatible engine
+  flavor in its cursor, resumes with exact `--v3 --resume-id`, and joins bare
+  automatic selection alongside v2 without cross-resuming either store. Plain
+  returning Kiro launches recover the linked engine transparently; v3 wrapper
+  `--yolo` adds no flag because Kiro replaced `--trust-all-tools` with
+  `permissions.yaml`. A targeted compatibility path also handles Kiro 2.16.2
+  writing v3 sessions to default `~/.kiro` despite custom `KIRO_HOME`: only a
+  resume proven to live in that fallback drops the override for its child
+  process. The optional deterministic acceptance runner now covers fresh,
+  resume, and import round trips for both engines (#356).
 - Added first-party Command Code MCP and stable lifecycle-hook support.
   `install-mcp --client command-code` merges the documented user-scope HTTP
   entry; `install-hooks --agent command-code` preserves existing settings and
