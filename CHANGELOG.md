@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-08-07
+
 ### Added
 - Added version-aware Kiro CLI v3 managed workstreams. `ai-memory run kiro
   --v3` reads the authenticated 2.16.2 nested `session.json` / `messages.jsonl`
@@ -3093,7 +3095,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.24.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.25.0...HEAD
+[1.25.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.25.0
 [1.24.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.24.0
 [1.23.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.23.0
 [1.22.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.22.0
