@@ -306,9 +306,9 @@ Client cleanup hints:
 - Kimi Code: check `~/.kimi-code/mcp.json` and the `[[hooks]]` entries in
   `~/.kimi-code/config.toml` (both under `$KIMI_CODE_HOME` when set) for stale
   MCP or hook entries.
-- Kiro CLI: check the `hooks` objects inside `~/.kiro/agents/*.json` (v2
-  engine) and `~/.kiro/settings/mcp.json` (both under `$KIRO_HOME` when set)
-  for stale ai-memory entries. ai-memory does not install Kiro v3 hook files.
+- Kiro CLI: check the `hooks` objects inside `~/.kiro/agents/*.json` (v2),
+  `~/.kiro/hooks/ai-memory.json` (v3), and `~/.kiro/settings/mcp.json` (all
+  under `$KIRO_HOME` when set) for stale ai-memory entries.
 - OpenCode, OpenClaw, and OMP: check MCP config and plugin/extension directories;
   move old memory plugins to a disabled/quarantine directory before deleting.
 - VS Code Copilot, Claude Desktop, and Zed: these are MCP-only, so confirm

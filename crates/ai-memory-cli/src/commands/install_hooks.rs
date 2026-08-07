@@ -26,12 +26,12 @@ use crate::commands::openclaw_plugin;
 use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
-    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
+    CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
     build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
     build_devin_payload_with_data_dir, build_grok_payload_with_data_dir,
-    build_kiro_cli_v2_hooks_value, build_profile_payload_for_agent, hook_script_for_claude_code,
-    hook_script_for_current_platform, kimi_code_hook_commands, local_hook_policy_v1_supported,
-    ts_capture_policy_v1, ts_string_literal,
+    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value, build_profile_payload_for_agent,
+    hook_script_for_claude_code, hook_script_for_current_platform, kimi_code_hook_commands,
+    local_hook_policy_v1_supported, ts_capture_policy_v1, ts_string_literal,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -196,6 +196,14 @@ pub(crate) fn kiro_cli_agents_dir() -> anyhow::Result<std::path::PathBuf> {
     kiro_cli_home_join(std::env::var_os("KIRO_HOME"), "agents")
 }
 
+/// `$KIRO_HOME/hooks/ai-memory.json` when set, else
+/// `~/.kiro/hooks/ai-memory.json`. Kiro v3 loads each standalone JSON file in
+/// this directory; using one ai-memory-owned file avoids mutating unrelated
+/// registrations.
+pub(crate) fn kiro_cli_v3_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(kiro_cli_home_join(std::env::var_os("KIRO_HOME"), "hooks")?.join("ai-memory.json"))
+}
+
 /// The env value comes in as a parameter so tests can exercise both
 /// branches without mutating process env (mirrors
 /// `kimi_code_config_path_in`).
@@ -346,6 +354,10 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                     &args,
                 )
             }
+            AgentChoice::KiroCliV3 => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_kiro_cli_v3_hooks(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -445,6 +457,10 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
             render_kiro_cli(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
+        AgentChoice::KiroCliV3 => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_kiro_cli_v3(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+        }
     }
 }
 
@@ -500,6 +516,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Devin => devin_hooks_path().ok()?,
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
             AgentChoice::KiroCli => return None,
+            AgentChoice::KiroCliV3 => kiro_cli_v3_hooks_path().ok()?,
         }
     };
     std::fs::read_to_string(path).ok()
@@ -541,6 +558,23 @@ fn baked_project_strategy(agent: AgentChoice, existing: &str) -> Option<ProjectS
                             .get("command")
                             .and_then(|item| item.as_str())
                             .and_then(project_strategy_from_text)
+                    })
+                })
+        }
+        AgentChoice::KiroCliV3 => {
+            let root: serde_json::Value = serde_json::from_str(existing).ok()?;
+            root.get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|hooks| {
+                    hooks.iter().find_map(|entry| {
+                        is_ai_memory_kiro_v3_hook_entry(entry)
+                            .then(|| {
+                                entry
+                                    .pointer("/action/command")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(project_strategy_from_text)
+                            })
+                            .flatten()
                     })
                 })
         }
@@ -830,7 +864,7 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // Pi bridges MCP through its generated extension, not a native
         // mcp.json the installer can scrape.
         AgentChoice::Pi => None,
-        AgentChoice::KiroCli => Some(McpClient::KiroCli),
+        AgentChoice::KiroCli | AgentChoice::KiroCliV3 => Some(McpClient::KiroCli),
     }
 }
 
@@ -2009,8 +2043,8 @@ fn apply_to_kiro_cli_agent_configs(
             anyhow::ensure!(
                 p.is_file(),
                 "{} does not exist. Kiro CLI v2 hooks live inside an existing agent config; \
-                 create one first (`kiro-cli agent create`) and re-run. Kiro v3 hooks remain \
-                 unsupported pending fixture-verified lifecycle and built-in tool payloads.",
+                 create one first (`kiro-cli agent create`) and re-run. For Kiro v3, select \
+                 the explicit `--agent kiro-cli-v3` standalone-hook target instead.",
                 p.display()
             );
             vec![p.clone()]
@@ -2022,8 +2056,7 @@ fn apply_to_kiro_cli_agent_configs(
         "no Kiro CLI agent configs found in {}. The v2 engine only fires hooks defined in an \
          agent config and the built-in default agent has no file on disk, so create an agent \
          first (`kiro-cli agent create`, then `kiro-cli agent set-default <name>`) and re-run. \
-         Kiro v3 hooks remain unsupported pending fixture-verified lifecycle and built-in tool \
-         payloads.",
+         For Kiro v3, select the explicit `--agent kiro-cli-v3` standalone-hook target instead.",
         kiro_cli_agents_dir()?.display()
     );
     let prepared = preflight_kiro_cli_agent_configs(
@@ -2147,6 +2180,176 @@ fn render_kiro_cli_agent_hooks(
         }
         Ok(())
     })
+}
+
+fn apply_to_kiro_cli_v3_hooks(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(path) => path.clone(),
+        None => kiro_cli_v3_hooks_path()?,
+    };
+    let existing = match fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+
+    // Validate before staging scripts so an incompatible registration file
+    // cannot leave a partial installation behind.
+    render_kiro_cli_v3_hooks(
+        &existing, hooks_dir, server_url, auth_token, data_dir, strategy, &path,
+    )?;
+
+    let staged = stage_hook_scripts(hooks_dir, "kiro-cli")?;
+    let command_dir = staged_command_dir(&staged, "kiro-cli");
+    let outcome = merge_kiro_cli_v3_hooks(
+        &command_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        strategy,
+        &path,
+    )?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+fn merge_kiro_cli_v3_hooks(
+    command_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+    config_path: &Path,
+) -> Result<ApplyOutcome> {
+    apply_atomic(config_path, |existing| {
+        render_kiro_cli_v3_hooks(
+            existing,
+            command_dir,
+            server_url,
+            auth_token,
+            data_dir,
+            project_strategy,
+            config_path,
+        )
+    })
+}
+
+fn render_kiro_cli_v3_hooks(
+    existing: &str,
+    command_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+    config_path: &Path,
+) -> Result<String> {
+    let desired = build_kiro_cli_v3_hooks_value(
+        command_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let desired_hooks = desired
+        .get("hooks")
+        .and_then(serde_json::Value::as_array)
+        .expect("static Kiro v3 hook payload has a hooks array")
+        .clone();
+
+    mutate_json(existing, |root| {
+        match root.get("version") {
+            Some(serde_json::Value::String(version)) if version == "v1" => {}
+            Some(serde_json::Value::String(version)) => anyhow::bail!(
+                "unsupported Kiro hook schema version `{version}` in {}; expected `v1`",
+                config_path.display()
+            ),
+            Some(_) => anyhow::bail!(
+                "`version` in {} is present but not a string",
+                config_path.display()
+            ),
+            None => {
+                root.insert(
+                    "version".to_string(),
+                    serde_json::Value::String("v1".to_string()),
+                );
+            }
+        }
+
+        let hooks = root
+            .entry("hooks")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .with_context(|| {
+                format!(
+                    "`hooks` in {} is present but not an array",
+                    config_path.display()
+                )
+            })?;
+
+        for entry in hooks.iter() {
+            if let Some(name) = entry.get("name").and_then(serde_json::Value::as_str)
+                && kiro_cli_v3_hook_name_is_reserved(name)
+                && !is_ai_memory_kiro_v3_hook_entry(entry)
+            {
+                anyhow::bail!(
+                    "Kiro v3 hook `{name}` in {} uses ai-memory's reserved name but is not an \
+                     ai-memory hook; rename it before installing",
+                    config_path.display()
+                );
+            }
+        }
+        hooks.retain(|entry| !is_ai_memory_kiro_v3_hook_entry(entry));
+        hooks.extend(desired_hooks);
+        Ok(())
+    })
+}
+
+fn kiro_cli_v3_hook_name_is_reserved(name: &str) -> bool {
+    KIRO_CLI_V3_EVENTS.iter().any(|(_, script)| {
+        script
+            .strip_suffix(".sh")
+            .is_some_and(|stem| name == format!("ai-memory-{stem}"))
+    })
+}
+
+pub(crate) fn is_ai_memory_kiro_v3_hook_entry(entry: &serde_json::Value) -> bool {
+    let Some(name) = entry.get("name").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(trigger) = entry.get("trigger").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let known_pair = KIRO_CLI_V3_EVENTS.iter().any(|(expected_trigger, script)| {
+        *expected_trigger == trigger
+            && script
+                .strip_suffix(".sh")
+                .is_some_and(|stem| name == format!("ai-memory-{stem}"))
+    });
+    known_pair
+        && entry
+            .pointer("/action/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("command")
+        && entry
+            .pointer("/action/command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_ai_memory_kiro_hook_command)
 }
 
 /// Every `*.json` agent config in the Kiro CLI global agents directory,
@@ -3984,9 +4187,8 @@ fn render_kiro_cli(
     println!("// or re-run with --apply to merge into every existing agent config,");
     println!("// preserving third-party hook entries. The v2 engine fires hooks");
     println!("// only for the active agent config; the built-in default agent has");
-    println!("// no file, so create one first (`kiro-cli agent create`). Kiro v3");
-    println!("// hooks remain unsupported pending fixture-verified lifecycle and");
-    println!("// built-in tool payloads; do not reuse this v2 registration there.");
+    println!("// no file, so create one first (`kiro-cli agent create`). Do not reuse");
+    println!("// this v2 registration for v3; use `--agent kiro-cli-v3` instead.");
     println!("// Hook scripts: {}", hooks_dir.display());
     println!("// AI-memory server URL: {server_url}");
     if auth_token.is_some() {
@@ -3998,6 +4200,48 @@ fn render_kiro_cli(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks }))
             .expect("static hook payload serializes")
+    );
+    Ok(())
+}
+
+fn render_kiro_cli_v3(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    for (_, script) in KIRO_CLI_V3_EVENTS {
+        let abs = hooks_dir.join(hook_script_for_current_platform(script).as_ref());
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. If this command is running \
+                 inside docker against a host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    let payload = build_kiro_cli_v3_hooks_value(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    println!("// Kiro CLI v3 hooks — write this document to");
+    println!("// $KIRO_HOME/hooks/ai-memory.json (~/.kiro/hooks/ai-memory.json when unset),");
+    println!("// or re-run with --apply for an atomic, idempotent merge.");
+    println!("// Hook scripts: {}", hooks_dir.display());
+    println!("// AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("// Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("//       Treat the hook file as sensitive (chmod 600).");
+    }
+    println!();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).expect("static hook payload serializes")
     );
     Ok(())
 }
@@ -4033,6 +4277,7 @@ mod tests {
             Devin,
             KimiCode,
             KiroCli,
+            KiroCliV3,
         ] {
             assert!(
                 !capture_assistant_allowed(agent),
@@ -6691,6 +6936,10 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         };
         let agents = kiro_cli_home_join(Some(std::ffi::OsString::from(custom)), "agents").unwrap();
         assert_eq!(agents, Path::new(custom).join("agents"));
+        let hooks = kiro_cli_home_join(Some(std::ffi::OsString::from(custom)), "hooks")
+            .unwrap()
+            .join("ai-memory.json");
+        assert_eq!(hooks, Path::new(custom).join("hooks/ai-memory.json"));
 
         // Empty override and unset var both fall back to ~/.kiro.
         for env in [None, Some(std::ffi::OsString::new())] {
@@ -6709,6 +6958,126 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             mcp_client_for_agent(AgentChoice::KiroCli),
             Some(McpClient::KiroCli)
         );
+        assert_eq!(
+            mcp_client_for_agent(AgentChoice::KiroCliV3),
+            Some(McpClient::KiroCli)
+        );
+    }
+
+    #[test]
+    fn kiro_cli_v3_apply_writes_documented_schema_and_is_idempotent() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIRO_CLI_STUB_SCRIPTS);
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks/ai-memory.json");
+
+        let apply = || {
+            merge_kiro_cli_v3_hooks(
+                hooks_tmp.path(),
+                "https://memory.example",
+                Some("test-token"),
+                config_tmp.path(),
+                Some("repo-root"),
+                &config_path,
+            )
+        };
+        assert_eq!(apply().unwrap(), ApplyOutcome::Created);
+
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(root["version"], "v1");
+        let hooks = root["hooks"].as_array().expect("hooks array");
+        assert_eq!(hooks.len(), KIRO_CLI_V3_EVENTS.len());
+        for ((trigger, script), entry) in KIRO_CLI_V3_EVENTS.iter().zip(hooks) {
+            assert_eq!(entry["trigger"], *trigger);
+            assert_eq!(entry["action"]["type"], "command");
+            assert_eq!(
+                entry["timeout"],
+                if *trigger == "SessionStart" { 5 } else { 1 }
+            );
+            assert_eq!(entry["enabled"], true);
+            assert_eq!(
+                entry["name"],
+                format!("ai-memory-{}", script.trim_end_matches(".sh"))
+            );
+            let command = entry["action"]["command"].as_str().unwrap();
+            assert!(is_ai_memory_kiro_hook_command(command), "{command}");
+            assert!(command.contains("test-token"), "{command}");
+            assert!(command.contains("repo-root"), "{command}");
+            assert!(entry.get("matcher").is_none());
+        }
+        assert_eq!(apply().unwrap(), ApplyOutcome::NoOp);
+    }
+
+    #[test]
+    fn kiro_cli_v3_apply_preserves_third_party_hooks_and_replaces_only_ours() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("ai-memory.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "version": "v1",
+  "owner": "user",
+  "hooks": [
+    {"name":"audit","trigger":"PreToolUse","action":{"type":"command","command":"audit-tool"}},
+    {"name":"ai-memory-session-start","trigger":"SessionStart","action":{"type":"command","command":"AI_MEMORY_HOOK_URL=http://old /old/hooks/kiro-cli/session-start.sh"}}
+  ]
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            merge_kiro_cli_v3_hooks(
+                tmp.path(),
+                "https://memory.example",
+                None,
+                tmp.path(),
+                None,
+                &config_path,
+            )
+            .unwrap(),
+            ApplyOutcome::Updated
+        );
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(root["owner"], "user");
+        let hooks = root["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1 + KIRO_CLI_V3_EVENTS.len());
+        assert_eq!(hooks[0]["name"], "audit");
+        assert!(hooks[1..].iter().all(is_ai_memory_kiro_v3_hook_entry));
+    }
+
+    #[test]
+    fn kiro_cli_v3_apply_rejects_incompatible_schema_and_reserved_collision() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("ai-memory.json");
+        fs::write(&config_path, r#"{"version":"v2","hooks":[]}"#).unwrap();
+        let error = merge_kiro_cli_v3_hooks(
+            tmp.path(),
+            "https://memory.example",
+            None,
+            tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported Kiro hook schema version"));
+
+        fs::write(
+            &config_path,
+            r#"{"version":"v1","hooks":[{"name":"ai-memory-stop","trigger":"Stop","action":{"type":"command","command":"third-party"}}]}"#,
+        )
+        .unwrap();
+        let error = merge_kiro_cli_v3_hooks(
+            tmp.path(),
+            "https://memory.example",
+            None,
+            tmp.path(),
+            None,
+            &config_path,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("reserved name"));
     }
 
     #[test]
