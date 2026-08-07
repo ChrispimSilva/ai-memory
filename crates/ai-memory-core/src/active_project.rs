@@ -5,15 +5,17 @@
 //! The MCP protocol carries no working-directory context: a `memory_query`
 //! call arrives with its arguments and nothing else, so a tool handler has
 //! no way to know which project the agent is sitting in. The lifecycle hooks
-//! *do* know — every `/hook` event carries the agent's `cwd`, and the hook
+//! *do* know — lifecycle `/hook` events carry the agent's `cwd`, and the hook
 //! router resolves it to the correct per-cwd `(workspace_id, project_id)`.
 //!
 //! In HTTP mode the `/hook` ingress and the `/mcp` endpoint live in the same
 //! process, so the hook router can publish "the project the user is currently
-//! active in" to this shared pointer, and the MCP tools can read it as their
-//! default instead of falling back to the server's static `--project` (which
-//! defaults to `scratch` and made the read tools return empty memory even
-//! when the hooks were correctly populating a real project).
+//! active in" to this shared pointer when work starts or advances, and the MCP
+//! tools can read it as their default instead of falling back to the server's
+//! static `--project` (which defaults to `scratch` and made the read tools
+//! return empty memory even when the hooks were correctly populating a real
+//! project). Completion events refresh exact actor-scoped entries only; a
+//! delayed tail from an older session must not redirect a shared fallback.
 //!
 //! ## Isolation modes
 //!
@@ -353,6 +355,38 @@ impl ActiveProject {
                 Instant::now(),
             );
         }
+        guard.insert(
+            scoped,
+            workspace_id,
+            project_id,
+            default_global,
+            Instant::now(),
+        );
+    }
+
+    /// Refresh only the exact actor-scoped entry without advancing either
+    /// fallback slot.
+    ///
+    /// Hook completion events use this path so an exact `per_session` or
+    /// `per_actor` caller keeps a fresh mapping, while a delayed tail from an
+    /// older session cannot redirect the process-wide single slot or the
+    /// identity-only fallback used by a caller with no session coordinate.
+    /// `Single` mode and actors without a usable coordinate are no-ops.
+    pub fn set_scoped_for(
+        &self,
+        actor: &ActorKey,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        default_global: bool,
+    ) {
+        if self.mode == ActiveProjectMode::Single || actor.is_empty() {
+            return;
+        }
+        let scoped = self.scoped_key(actor);
+        if scoped.is_empty() {
+            return;
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
         guard.insert(
             scoped,
             workspace_id,
@@ -731,6 +765,48 @@ mod tests {
         ap.set_for(&sess_b, ws, p_b, false);
         assert_eq!(ap.get_for(&sess_a), Some((ws, p_a)));
         assert_eq!(ap.get_for(&sess_b), Some((ws, p_b)));
+    }
+
+    #[test]
+    fn scoped_refresh_does_not_advance_single_fallback() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerSession);
+        let ws = WorkspaceId::new();
+        let foreground = key_session("foreground");
+        let stale = key_session("stale");
+        let foreground_project = ProjectId::new();
+        let stale_project = ProjectId::new();
+
+        ap.set_for(&foreground, ws, foreground_project, true);
+        ap.set_scoped_for(&stale, ws, stale_project, false);
+
+        assert_eq!(ap.get(), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&foreground), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&stale), Some((ws, stale_project)));
+        assert!(ap.default_global_for(&foreground));
+        assert!(!ap.default_global_for(&stale));
+    }
+
+    #[test]
+    fn scoped_refresh_does_not_advance_per_actor_identity_fallback() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerActor);
+        let ws = WorkspaceId::new();
+        let foreground = key_actor("alice", "foreground");
+        let stale = key_actor("alice", "stale");
+        let foreground_project = ProjectId::new();
+        let stale_project = ProjectId::new();
+
+        ap.set_for(&foreground, ws, foreground_project, true);
+        ap.set_scoped_for(&stale, ws, stale_project, false);
+
+        let identity_only = ActorKey {
+            user: Some("alice".to_string()),
+            session_id: None,
+        };
+        assert_eq!(ap.get(), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&identity_only), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&stale), Some((ws, stale_project)));
+        assert!(ap.default_global_for(&identity_only));
+        assert!(!ap.default_global_for(&stale));
     }
 
     #[test]

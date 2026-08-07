@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator is still unreachable without `--all-owners`, same as the default
   query ([#374]).
 
+### Fixed
+- Prevented delayed post-tool and shutdown hook tails from redirecting the
+  shared active-project fallback after work moved to another project. Only
+  session starts, user prompts, and pre-tool events now advance shared or
+  identity-only fallbacks; other events refresh exact session mappings, and
+  dropped-subagent preflight no longer publishes scope (#372).
+
 ## [1.24.0] - 2026-08-04
 
 ### Added
