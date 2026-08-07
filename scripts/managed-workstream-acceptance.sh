@@ -255,6 +255,40 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
     printf '{"version":"v1","kind":"AssistantMessage","data":{"message_id":"m-%s-a","content":[{"kind":"text","data":"%s reply"}],"meta":{"timestamp":%s}}}\n' \
       "$(date +%s)" "$sentinel" "$(date +%s)000" >>"$stream"
     ;;
+  kiro-v3)
+    printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    session_id=""
+    previous_arg=""
+    for arg in "$@"; do
+      if [ "$previous_arg" = --resume-id ]; then
+        session_id=$arg
+      fi
+      previous_arg=$arg
+    done
+    if [ -z "$session_id" ]; then
+      if command -v uuidgen >/dev/null 2>&1; then
+        session_id="sess_$(uuidgen | tr '[:upper:]' '[:lower:]')"
+      elif [ -r /proc/sys/kernel/random/uuid ]; then
+        session_id="sess_$(cat /proc/sys/kernel/random/uuid)"
+      else
+        printf 'kiro v3 fake mode needs uuidgen or /proc/sys/kernel/random/uuid\n' >&2
+        exit 1
+      fi
+    fi
+    session_dir="${KIRO_HOME:?kiro v3 fake mode requires KIRO_HOME}/sessions/checkout_fixture/$session_id"
+    mkdir -p "$session_dir"
+    stream="$session_dir/messages.jsonl"
+    if [ ! -f "$session_dir/session.json" ]; then
+      printf '{"schemaVersion":"1.0.0","dataModelVersion":1,"id":"%s","workspacePaths":["%s"],"createdAt":"2026-08-06T10:00:00Z","lastModifiedAt":"2026-08-06T10:00:00Z","agentMode":"vibe","status":"idle"}\n' \
+        "$session_id" "$PWD" >"$session_dir/session.json"
+      : >"$stream"
+    fi
+    sentinel=${AI_MEMORY_ACCEPTANCE_SENTINEL:-AMWS-FAKE-KIRO-V3}
+    printf '{"id":"u-%s","timestamp":"2026-08-06T10:00:00Z","payload":{"type":"user","content":"%s"}}\n' \
+      "$(date +%s)" "$sentinel" >>"$stream"
+    printf '{"id":"a-%s","timestamp":"2026-08-06T10:00:01Z","payload":{"type":"assistant","operationType":"Say","content":"%s reply"}}\n' \
+      "$(date +%s)" "$sentinel" >>"$stream"
+    ;;
   kimi)
     printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
     # Honor `--session <id>` (resume); a fresh launch mints its own id
@@ -658,10 +692,9 @@ kimi_current_id=$(sqlite3 "$DATA/db/memory.sqlite" \
   exit 1
 }
 
-# Kiro fake-mode fixture: the fake owns the fresh UUID, writes the documented
-# flat metadata/event pair, and honors `--resume-id` on the second launch.
-# These deterministic checks cover wrapper mechanics only; the current Kiro
-# event schema still requires a separate logged-in interactive acceptance pass.
+# Kiro fake-mode fixtures cover both incompatible native stores. The fake owns
+# each fresh id, writes the sanitized schema observed in live acceptance, and
+# honors the exact engine-specific resume selected by the wrapper.
 KIRO_FAKE_HOME="$CONFIG/kiro-fake"
 mkdir -p "$KIRO_FAKE_HOME"
 (
@@ -719,12 +752,53 @@ jq -e \
 (
   cd "$REPO"
   KIRO_HOME="$KIRO_FAKE_HOME" \
-  AI_MEMORY_ACCEPTANCE_FAKE_MODE=argv \
-  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/kiro-v3-argv.log" \
-    "$BIN" --data-dir "$DATA" run --workstream edge-kiro --executable "$FAKE" \
-      kiro --v3 >"$LOGS/edge-kiro-v3.log" 2>&1
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=kiro-v3 \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/kiro-v3-first-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-KIRO-V3-ONE" \
+    "$BIN" --data-dir "$DATA" run --new edge-kiro-v3 --executable "$FAKE" \
+      --yolo kiro --v3 >"$LOGS/edge-kiro-v3-first.log" 2>&1
 )
-diff -u <(printf '%s\n' --v3) "$TMP/kiro-v3-argv.log"
+diff -u <(printf '%s\n' --v3) "$TMP/kiro-v3-first-argv.log"
+kiro_v3_session_dir=$(find "$KIRO_FAKE_HOME/sessions" -mindepth 2 -maxdepth 2 \
+  -type d -name 'sess_*' -print -quit)
+[ -n "$kiro_v3_session_dir" ] || {
+  printf 'fake kiro v3 did not create a native session store\n' >&2
+  exit 1
+}
+kiro_v3_session_id=$(basename "$kiro_v3_session_dir")
+kiro_v3_ws_hex=$(sqlite3 "$DATA/db/memory.sqlite" \
+  "SELECT lower(hex(id)) FROM workstreams WHERE name = 'edge-kiro-v3' ORDER BY selected_at DESC LIMIT 1;")
+kiro_v3_ws_id="${kiro_v3_ws_hex:0:8}-${kiro_v3_ws_hex:8:4}-${kiro_v3_ws_hex:12:4}-${kiro_v3_ws_hex:16:4}-${kiro_v3_ws_hex:20:12}"
+kiro_v3_first_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$kiro_v3_ws_id" --limit 100 --json "AMWS-FAKE-KIRO-V3-ONE")
+jq -e --arg id "$kiro_v3_session_id" \
+  '[.[] | select(.agent == "kiro-cli" and .role == "assistant" and (.content | contains("AMWS-FAKE-KIRO-V3-ONE")) and .native_session_id == $id)] | length == 1' \
+  <<<"$kiro_v3_first_hits" >/dev/null || {
+  printf 'kiro v3 sentinel was not imported from the discovered session\n' >&2
+  tail -80 "$LOGS/edge-kiro-v3-first.log" >&2
+  exit 1
+}
+(
+  cd "$REPO"
+  KIRO_HOME="$KIRO_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=kiro-v3 \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/kiro-v3-second-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-KIRO-V3-TWO" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-kiro-v3 --executable "$FAKE" \
+      kiro >"$LOGS/edge-kiro-v3-second.log" 2>&1
+)
+diff -u <(printf '%s\n' --v3 --resume-id "$kiro_v3_session_id") \
+  "$TMP/kiro-v3-second-argv.log"
+kiro_v3_second_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$kiro_v3_ws_id" --limit 100 --json "AMWS-FAKE-KIRO-V3")
+jq -e \
+  '([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-KIRO-V3-ONE")))] | length == 1)
+   and ([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-KIRO-V3-TWO")))] | length == 1)' \
+  <<<"$kiro_v3_second_hits" >/dev/null || {
+  printf 'kiro v3 incremental import duplicated or missed a round sentinel\n' >&2
+  tail -80 "$LOGS/edge-kiro-v3-second.log" >&2
+  exit 1
+}
 
 # Antigravity fake-mode fixture: `agy` owns the conversation id and SQLite
 # database, while its real PreInvocation hook links that id and accepts any
