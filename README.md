@@ -880,7 +880,10 @@ lands in the same `ai-memory-data` volume as the server.
 authenticates with an OAuth bearer token instead of an API key. Run
 `claude setup-token` once, then set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` and
 `ANTHROPIC_OAUTH_TOKEN=<token>` (or `CLAUDE_CODE_OAUTH_TOKEN`, which `claude
-setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed.
+setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed. The Docker
+wrappers forward either token by name to short-lived helper commands such as
+`llm-test`; configure the long-lived server container separately as shown in the
+installation guide.
 **⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
 it may get your account rate-limited or banned. See
 [the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
