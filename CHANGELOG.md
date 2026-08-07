@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The `bin/ai-memory` wrapper now detects rootless mode and SELinux under
+  podman, so host-file commands stop failing with `Permission denied (os error
+  13)` on podman-based distros. Both the `-u 0:0` remap and `--security-opt
+  label=disable` were decided from `docker info --format
+  '{{.SecurityOptions}}'`, a Docker-only field that podman cannot evaluate;
+  the swallowed error left both gates off exactly where they were needed.
+  Podman's `.Host.Security.*` keys are consulted when that probe comes back
+  empty. `bootstrap` is now covered as well: it only reads host files, but an
+  unmapped UID blocks reads just as hard, and it degraded silently to "no
+  `.git` found" before dying (#385).
+
 ## [1.25.0] - 2026-08-07
 
 ### Added
