@@ -138,7 +138,7 @@ pub(crate) fn tool_observation_metadata(
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
-        // Kiro v2 tool hooks use `tool_name` + `tool_input`. Unknown payload
+        // Kiro v2/v3 tool hooks use `tool_name` + `tool_input`. Unknown payload
         // shapes fail safe to metadata-only under an active policy.
         AgentKind::KiroCli => (object.get("tool_name")?.as_str()?, None),
         AgentKind::AntigravityCli => (object.get("toolCall")?.get("name")?.as_str()?, None),
@@ -656,7 +656,7 @@ fn extract_paths(name: &str, args: &Value) -> Option<Vec<String>> {
             paths.extend(paths_in_entry);
         }
     }
-    if name.eq_ignore_ascii_case("fs_read")
+    if matches!(name.to_ascii_lowercase().as_str(), "read" | "fs_read")
         && let Some(operations) = object.get("operations")
     {
         let entries = operations.as_array()?;
@@ -1116,6 +1116,74 @@ mod tests {
         ] {
             assert_eq!(family(tool), expected, "tool: {tool}");
         }
+    }
+
+    #[test]
+    fn kiro_v3_documented_and_live_tool_shapes_honor_exclusions_and_fail_closed() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let official_read = json!({
+            "session_id": "kiro-session",
+            "cwd": "/repo",
+            "tool_name": "read",
+            "tool_input": {
+                "operations": [
+                    {"mode": "Line", "path": "src/lib.rs"},
+                    {"mode": "Line", "path": "secret/token.txt"}
+                ]
+            }
+        });
+        let decision = policy.inspect(AgentKind::KiroCli, &official_read, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().path_count(), 2);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        let live_read = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "kiro-session",
+            "cwd": "/repo",
+            "tool_name": "read_file",
+            "tool_input": {
+                "path": "secret/token.txt",
+                "offset": null,
+                "limit": null
+            }
+        });
+        let decision = policy.inspect(AgentKind::KiroCli, &live_read, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().path_count(), 1);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        let mut official_post = official_read.clone();
+        official_post.as_object_mut().unwrap().insert(
+            "tool_response".to_string(),
+            json!({"success": true, "result": ["sanitized"]}),
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::KiroCli, &official_post),
+            ToolOutcome::Success
+        );
+
+        let unknown_shape = json!({
+            "session_id": "kiro-session",
+            "cwd": "/repo",
+            "tool_name": "read",
+            "tool_input": {"files": ["secret/token.txt"]}
+        });
+        let decision = policy.inspect(AgentKind::KiroCli, &unknown_shape, "/repo");
+        assert_eq!(
+            decision.protocol().extraction_state(),
+            ExtractionState::MissingOrMalformed
+        );
+        assert_eq!(
+            decision.protocol().disposition(),
+            CaptureDisposition::MetadataOnly
+        );
     }
 
     #[test]

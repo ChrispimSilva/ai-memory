@@ -888,7 +888,8 @@ Kiro permits remote MCP URLs over HTTPS. Plain HTTP is accepted only for
 non-loopback HTTP URL before writing the config. See
 [HTTPS via reverse proxy](https-via-proxy.md) for a homelab deployment.
 
-ai-memory supports Kiro's documented v2 hook registration format:
+ai-memory supports both documented Kiro hook registration formats through
+explicit engine targets:
 
 ```bash
 # v2: update every existing global agent definition.
@@ -897,19 +898,27 @@ ai-memory install-hooks --agent kiro-cli --apply
 # v2 project-local agent: target the active definition explicitly.
 ai-memory install-hooks --agent kiro-cli --apply \
     --config-file .kiro/agents/<agent-name>.json
+
+# v3: standalone global registration.
+ai-memory install-hooks --agent kiro-cli-v3 --apply
+
+# v3 project-local registration.
+ai-memory install-hooks --agent kiro-cli-v3 --apply \
+    --config-file .kiro/hooks/ai-memory.json
 ```
+
+The standalone format was acceptance-tested with an interactive Kiro CLI
+2.16.2 `--v3` session.
 
 The v2 installer refuses to create a synthetic agent file and parses every
 target before changing any of them. Project-local Kiro agents override global
 agents, so `--config-file` is required when the active definition lives under
 `.kiro/agents/`. The integration remains fail-open, injects pending handoffs
-through `agentSpawn` stdout, and honors `$KIRO_HOME`. Kiro v3 hook capture is
-not installed: its standalone schema and generic command context are now
-documented, but sanitized live lifecycle and built-in tool payload fixtures are
-still needed to validate capture, exclusions, and fail-open behavior. Follow
-[#355](https://github.com/akitaonrails/ai-memory/issues/355) for v3 hook support
-and [#356](https://github.com/akitaonrails/ai-memory/issues/356) for automatic
-selection and broader version-aware managed support. Explicit
+through `agentSpawn` stdout, and honors `$KIRO_HOME`. The v3 installer writes
+the standalone `v1` file with PascalCase triggers, preserves third-party
+entries, and shares the same fail-open sanitizer and capture-exclusion
+boundary. Follow [#356](https://github.com/akitaonrails/ai-memory/issues/356)
+for automatic selection and version-aware managed support. Explicit
 `ai-memory run kiro` (alias `kiro-cli`) manages the default v2 engine;
 non-v2 engine selections pass through without session injection or import.
 

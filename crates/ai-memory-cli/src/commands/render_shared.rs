@@ -89,16 +89,22 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
 /// the matching `.sh` and `.ps1` files under `hooks/kiro-cli/`; the
 /// install-hooks parity test fails if the bundle drifts.
 ///
-/// Kiro's v3 engine uses a documented standalone registration format, but its
-/// live lifecycle and built-in tool payloads have not been accepted as
-/// fixtures. Do not advertise or install v3 hooks until those exact contracts
-/// are captured and tested.
 pub(crate) const KIRO_CLI_V2_EVENTS: [(&str, &str); 5] = [
     ("agentSpawn", "session-start.sh"),
     ("userPromptSubmit", "user-prompt-submit.sh"),
     ("preToolUse", "pre-tool-use.sh"),
     ("postToolUse", "post-tool-use.sh"),
     ("stop", "stop.sh"),
+];
+
+/// Kiro CLI v3-engine lifecycle events. V3 uses PascalCase triggers in a
+/// standalone versioned hook file rather than v2's camelCase agent field.
+pub(crate) const KIRO_CLI_V3_EVENTS: [(&str, &str); 5] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
 ];
 
 /// Devin lifecycle events ai-memory hooks. Each pair is
@@ -905,6 +911,47 @@ fn build_kiro_cli_v2_hooks_value_for_platform(
         hooks.insert(event.to_string(), json!([Value::Object(entry)]));
     }
     hooks
+}
+
+/// Build Kiro CLI v3's standalone `{ "version": "v1", "hooks": [...] }`
+/// registration document. Each entry is deliberately named so apply and
+/// uninstall can prove ownership using both the name and command signature.
+pub(crate) fn build_kiro_cli_v3_hooks_value(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    let platform = HookCommandPlatform::current();
+    let hooks = KIRO_CLI_V3_EVENTS
+        .iter()
+        .map(|(trigger, script)| {
+            let platform_script = script_for_platform(script, platform);
+            let command = hook_command(
+                &emit_root.join(platform_script.as_ref()),
+                server_url,
+                auth_token,
+                HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
+            );
+            let name = script.strip_suffix(".sh").map_or_else(
+                || format!("ai-memory-{script}"),
+                |stem| format!("ai-memory-{stem}"),
+            );
+            let timeout = if *trigger == "SessionStart" { 5 } else { 1 };
+            json!({
+                "name": name,
+                "trigger": trigger,
+                "action": {
+                    "type": "command",
+                    "command": command,
+                },
+                "timeout": timeout,
+                "enabled": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"version": "v1", "hooks": hooks})
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

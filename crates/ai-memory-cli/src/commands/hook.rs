@@ -374,7 +374,7 @@ fn write_success_response<W: std::io::Write>(
 ) -> std::io::Result<()> {
     if agent == AgentKind::KiroCli {
         // Kiro adds successful SessionStart/UserPromptSubmit stdout to model
-        // context, and v2 Stop parses stdout for a block decision. Capture-only
+        // context, and v2/v3 Stop parse stdout for a block decision. Capture-only
         // hooks therefore stay silent unless SessionStart has real context.
         Ok(())
     } else if agent == AgentKind::AntigravityCli && event == HookEvent::PreToolUse {
@@ -631,7 +631,7 @@ where
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
                 if agent_kind == AgentKind::KiroCli {
-                    // Kiro v2 consumes agentSpawn stdout verbatim and defines
+                    // Kiro v2/v3 consume SessionStart stdout verbatim and define
                     // no wrapper envelope.
                     writeln!(stdout, "{handoff}")?;
                 } else {
@@ -922,11 +922,40 @@ mod tests {
             ),
             (AgentKind::KiroCli, HookEvent::PreToolUse, b"".as_slice()),
             (AgentKind::KiroCli, HookEvent::SessionStart, b"".as_slice()),
+            (AgentKind::KiroCli, HookEvent::UserPrompt, b"".as_slice()),
+            (AgentKind::KiroCli, HookEvent::PostToolUse, b"".as_slice()),
+            (AgentKind::KiroCli, HookEvent::Stop, b"".as_slice()),
         ] {
             let mut output = Vec::new();
             write_success_response(&mut output, agent, event).unwrap();
             assert_eq!(output, expected, "{agent:?} {event:?}");
         }
+    }
+
+    #[test]
+    fn kiro_v3_live_lifecycle_fixtures_share_native_context() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/kiro-v3-hook-payloads.json"
+        ))
+        .unwrap();
+        let events = fixture["events"].as_array().unwrap();
+        assert_eq!(events.len(), 5);
+        for event in events {
+            let payload = &event["payload"];
+            let (cwd, session_id) = hook_context("kiro-cli", payload);
+            assert_eq!(cwd.as_deref(), Some("/workspace/project"));
+            assert_eq!(session_id.as_deref(), Some("kiro-v3-session"));
+        }
+        assert_eq!(events[0]["payload"]["hook_event_name"], "SessionStart");
+        assert_eq!(events[1]["payload"]["hook_event_name"], "UserPromptSubmit");
+        assert_eq!(events[2]["payload"]["hook_event_name"], "PreToolUse");
+        assert_eq!(events[3]["payload"]["hook_event_name"], "PostToolUse");
+        assert_eq!(events[4]["payload"]["hook_event_name"], "Stop");
+        assert_eq!(events[2]["payload"]["tool_name"], "read_file");
+        assert_eq!(
+            events[2]["payload"]["tool_input"]["path"],
+            "/workspace/project/sample.txt"
+        );
     }
 
     #[tokio::test]

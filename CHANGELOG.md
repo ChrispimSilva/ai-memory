@@ -85,14 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without session injection. Kiro remains outside bare automatic selection
   until a logged-in current-format acceptance run is available, and v3 managed
   sessions remain unsupported (#356).
-- Added verified Kiro CLI v2 lifecycle hooks. CamelCase hooks merge into
-  existing agent configs, honor `$KIRO_HOME`, preserve unrelated hooks and
-  per-agent project strategies, fail before changing any target when one is
-  invalid, infer remote connectivity from the managed Kiro MCP entry, inject
-  handoffs through `agentSpawn` stdout, enforce capture exclusions for known
-  v2 tool payloads, and uninstall only exact ai-memory entries. Kiro v3 hook
-  capture remains unsupported pending sanitized live lifecycle and built-in
-  tool payload fixtures, despite its now-documented standalone schema (#355).
+- Added verified Kiro CLI lifecycle hooks for both incompatible engines. The
+  existing `kiro` / `kiro-cli` target keeps v2's camelCase hooks in agent
+  configs; the explicit `kiro-cli-v3` target atomically merges Kiro's
+  standalone `v1` registration under `$KIRO_HOME/hooks`. Both preserve
+  unrelated entries and project strategies, infer remote MCP connectivity,
+  inject startup handoffs, enforce capture exclusions for documented file-tool
+  payloads, and uninstall only proven ai-memory entries (#355).
 - Added `[consolidation] max_input_tokens` and `max_output_tokens`
   (`AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS` /
   `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS`) for provider-specific context

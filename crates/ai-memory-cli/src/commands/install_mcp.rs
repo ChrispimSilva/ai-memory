@@ -1156,10 +1156,9 @@ fn render_kiro_cli(args: &InstallMcpArgs) -> Result<String> {
          # Kiro accepts HTTPS remote endpoints and plain HTTP only on\n\
          # localhost. `?flavor=bedrock` removes unsupported root-level\n\
          # schema combinators while handler validation remains unchanged.\n\
-         # Lifecycle capture for the documented v2 engine is installed\n\
-         # separately with `install-hooks --agent kiro-cli`. Kiro v3 hook\n\
-         # capture remains unsupported pending fixture-verified lifecycle\n\
-         # and built-in tool payloads for its standalone schema.\n\
+         # Lifecycle capture is installed separately: use\n\
+         # `install-hooks --agent kiro-cli` for v2 or the explicit\n\
+         # `install-hooks --agent kiro-cli-v3` target for v3.\n\
          # Managed workstreams are not installed by this command.\n\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
@@ -1868,7 +1867,7 @@ mod tests {
         assert!(kiro.contains("http://127.0.0.1:49374/mcp?flavor=bedrock"));
         assert!(!kiro.contains("\"transport\""));
         assert!(kiro.contains("install-hooks --agent kiro-cli"));
-        assert!(kiro.contains("Kiro v3 hook"));
+        assert!(kiro.contains("install-hooks --agent kiro-cli-v3"));
         let kiro_with_token = render_with_token(McpClient::KiroCli);
         assert!(kiro_with_token.contains("\"Authorization\": \"Bearer test-token-deadbeef\""));
         // VS Code Copilot must use the `servers` top-level key — the

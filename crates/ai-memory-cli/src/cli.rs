@@ -1015,11 +1015,13 @@ pub enum AgentChoice {
     #[value(alias = "kimi")]
     KimiCode,
     /// Kiro CLI (AWS), v2 agent engine — camelCase lifecycle hooks embedded
-    /// in agent configs under `~/.kiro/agents/*.json`. Kiro v3's standalone
-    /// schema is documented but lacks accepted live lifecycle and built-in
-    /// tool payload fixtures.
+    /// in agent configs under `~/.kiro/agents/*.json`.
     #[value(alias = "kiro")]
     KiroCli,
+    /// Kiro CLI (AWS), v3 agent engine — PascalCase lifecycle hooks in the
+    /// standalone `$KIRO_HOME/hooks/ai-memory.json` registration file.
+    #[value(alias = "kiro-v3")]
+    KiroCliV3,
     /// Command Code CLI — stable JSON-config shell hooks in
     /// `~/.commandcode/settings.json`.
     #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
@@ -1049,7 +1051,7 @@ impl AgentChoice {
             Self::Zero => AgentKind::Zero,
             Self::Devin => AgentKind::Devin,
             Self::KimiCode => AgentKind::KimiCode,
-            Self::KiroCli => AgentKind::KiroCli,
+            Self::KiroCli | Self::KiroCliV3 => AgentKind::KiroCli,
             Self::CommandCode => AgentKind::CommandCode,
         }
     }
@@ -2217,7 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_v2_hook_aliases_parse_and_v3_is_not_advertised() {
+    fn kiro_hook_engine_aliases_parse_explicitly() {
         for alias in ["kiro-cli", "kiro"] {
             let cli = Cli::try_parse_from([
                 "ai-memory",
@@ -2233,20 +2235,21 @@ mod tests {
             };
             assert_eq!(args.agent, AgentChoice::KiroCli);
         }
-        for unsupported in ["kiro-cli-v3", "kiro-v3"] {
-            let error = Cli::try_parse_from([
+        for alias in ["kiro-cli-v3", "kiro-v3"] {
+            let cli = Cli::try_parse_from([
                 "ai-memory",
                 "install-hooks",
                 "--agent",
-                unsupported,
+                alias,
                 "--server-url",
                 "http://127.0.0.1:49374",
             ])
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("invalid value"),
-                "v3 must remain unsupported until its live payload fixtures are verified: {error}"
-            );
+            .unwrap_or_else(|error| panic!("failed to parse Kiro v3 alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for Kiro v3 alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::KiroCliV3);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::KiroCli);
         }
     }
 

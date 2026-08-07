@@ -792,11 +792,10 @@ unchanged.
 
 ### Kiro CLI
 
-Kiro CLI has one MCP surface. ai-memory supports the documented v2 lifecycle
-hook surface. Kiro v3 now documents its incompatible standalone registration
-schema and generic command context, but ai-memory does not install it without
-sanitized live lifecycle and built-in tool payload fixtures. The global MCP
-file is `$KIRO_HOME/settings/mcp.json`, defaulting to
+Kiro CLI has one MCP surface and two incompatible lifecycle-hook formats.
+ai-memory supports both through explicit installer targets: `kiro-cli` remains
+the v2 target, while `kiro-cli-v3` selects the standalone v3 registration. The
+global MCP file is `$KIRO_HOME/settings/mcp.json`, defaulting to
 `~/.kiro/settings/mcp.json`; pass `--config-file .kiro/settings/mcp.json` for a
 project-scoped entry.
 
@@ -842,6 +841,30 @@ through successful `agentSpawn` stdout. Verified v2 tool payloads enforce
 `[capture] ignore_paths`; an unrecognized payload shape is stored as bounded
 metadata rather than exposing file content.
 
+Install v3 hooks with the explicit `kiro-cli-v3` target. This distinction is
+intentional: `kiro` and `kiro-cli` continue to mean v2 so an upgrade cannot
+silently rewrite an existing installation into an incompatible format. The
+standalone registration was acceptance-tested with an interactive Kiro CLI
+2.16.2 `--v3` session.
+
+```bash
+# Global v3 registration under $KIRO_HOME/hooks (default ~/.kiro/hooks).
+ai-memory install-hooks --agent kiro-cli-v3 --apply
+
+# Project-local v3 registration.
+ai-memory install-hooks --agent kiro-cli-v3 --apply \
+    --config-file .kiro/hooks/ai-memory.json
+```
+
+The v3 installer writes the documented standalone `version: "v1"` schema with
+PascalCase triggers. It preserves third-party entries in a shared file,
+refuses an unsupported schema version or a third-party collision with an
+ai-memory-reserved hook name, and bounds capture-only commands to one second.
+SessionStart gets five seconds so ai-memory's bounded handoff fetch can finish.
+Both engines use the same sanitized hook-ingress boundary: documented and live
+`tool_name`/`tool_input` file operations honor `[capture] ignore_paths`, while
+unknown file-tool payload shapes degrade to metadata-only capture.
+
 Kiro v2's `stop` event ends a turn, not the session. After the final turn, close
 the matching session explicitly; use the exact id when several Kiro sessions
 are open in the same project:
@@ -851,24 +874,17 @@ ai-memory finalize-session --agent kiro-cli
 ai-memory finalize-session --agent kiro-cli --session-id <uuid>
 ```
 
-Kiro v3 hook capture is intentionally not advertised or installed. Its
-[migration guide](https://kiro.dev/docs/cli/v3/hooks-migration/) documents the
-standalone registration schema, and the
-[shared hook reference](https://kiro.dev/docs/hooks/types/) documents generic
-command context plus `agentSpawn` and MCP tool examples. It does not yet
-establish the exact built-in file and shell tool payloads, and ai-memory has no
-sanitized live fixtures covering the complete v3 lifecycle. Supporting it
-without that evidence would risk silently losing capture and exclusion
-semantics. Add v3 only after real payload fixtures can exercise that boundary.
-
-`ai-memory uninstall --only hooks --apply --yes` removes only exact ai-memory v2
-entries from global agents and the current project's `.kiro/agents` directory;
-it leaves standalone v3 files untouched. Explicit `ai-memory run kiro` (alias
-`kiro-cli`) manages the default v2 engine and honors `$KIRO_HOME`; Kiro stays
+`ai-memory uninstall --only hooks --apply --yes` removes only exact ai-memory
+entries from global v2 agents, the current project's `.kiro/agents` directory,
+and ai-memory's global/current-project v3 registration. A purely generated v3
+file is deleted; third-party entries in a shared file remain. Explicit
+`ai-memory run kiro` (alias `kiro-cli`) still manages the default v2 engine and
+honors `$KIRO_HOME`; Kiro stays
 outside no-argument automatic selection until its current event stream is
 validated in a logged-in real-harness acceptance run. `--v3`, `--mode`, and
 non-v2 `--agent-engine` invocations pass through without managed session
-injection. See [managed workstreams](managed-workstreams.md#native-adapter-behavior).
+injection; issue #356 tracks v3 managed-workstream support. See
+[managed workstreams](managed-workstreams.md#native-adapter-behavior).
 
 ### OpenCode
 
