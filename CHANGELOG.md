@@ -35,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session starts, user prompts, and pre-tool events now advance shared or
   identity-only fallbacks; other events refresh exact session mappings, and
   dropped-subagent preflight no longer publishes scope (#372).
+- The Anthropic provider no longer sends `temperature` to models that
+  rejected it. Claude 5 (Opus / Sonnet / Fable) and Opus 4.7+ answer any
+  request carrying a sampling parameter with a 400 reporting `temperature`
+  as deprecated for that model, which the server surfaced as a 502 — so
+  `bootstrap`, consolidation, `lint`, and the auto-improvement loop all
+  failed on those models, since every structured call site sets 0.1-0.2.
+  The field is now omitted for the affected models (the API applies its own
+  default) and forwarded unchanged everywhere else, mirroring the existing
+  gpt-5 / o-series handling in the OpenAI provider. Affects both
+  `anthropic` and `anthropic-oauth`. Note that `llm-test` sends no
+  `temperature`, so it reported these models as healthy while every real
+  pipeline call failed ([#377]).
 
 ## [1.24.0] - 2026-08-04
 
