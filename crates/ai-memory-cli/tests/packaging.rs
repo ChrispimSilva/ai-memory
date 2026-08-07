@@ -1306,6 +1306,24 @@ fn selinux_label_exception_requires_enforcement_and_daemon_support() {
 }
 
 #[test]
+fn wrapper_forwards_subscription_oauth_tokens_to_the_helper() {
+    // `llm-test` runs client-side, inside the helper container, so the retry
+    // that `status` itself suggests fails with a missing-token error unless
+    // the subscription tokens reach it. The API-key variables were already
+    // forwarded; their OAuth counterparts were not. Both wrappers keep their
+    // own hand-maintained list, and both had the same hole.
+    for wrapper_path in ["bin/ai-memory", "bin/ai-memory.ps1"] {
+        let wrapper = read_repo(wrapper_path);
+        for var in ["ANTHROPIC_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"] {
+            assert!(
+                wrapper.contains(var),
+                "{wrapper_path} must forward {var} to the helper container"
+            );
+        }
+    }
+}
+
+#[test]
 fn macos_docs_use_valid_install_commands_and_release_body_points_to_them() {
     let docs = read_repo("docs/macos.md");
     assert!(docs.contains("install-hooks --agent claude-code --apply"));

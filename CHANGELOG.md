@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session starts, user prompts, and pre-tool events now advance shared or
   identity-only fallbacks; other events refresh exact session mappings, and
   dropped-subagent preflight no longer publishes scope (#372).
+- Both wrappers (`bin/ai-memory` and `bin/ai-memory.ps1`) now forward
+  `ANTHROPIC_OAUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` to the helper
+  container. Their API-key counterparts were already in the passthrough list,
+  so subscription-token setups (`claude setup-token`,
+  `AI_MEMORY_LLM_PROVIDER=anthropic-oauth`) silently lost their credential at
+  the container boundary. The visible symptom is that the retry `status`
+  itself recommends — `llm-test --provider anthropic-oauth` — fails with a
+  missing-token error, because `llm-test` runs client-side in the helper
+  rather than on the server ([#379]).
 
 ## [1.24.0] - 2026-08-04
 
