@@ -8,7 +8,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BIN=${AI_MEMORY_ACCEPTANCE_BIN:-"$ROOT/target/debug/ai-memory"}
 KEEP=${AI_MEMORY_ACCEPTANCE_KEEP:-0}
 DETERMINISTIC_ONLY=${AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY:-0}
-HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi kiro grok antigravity"}
+HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi command-code kiro grok antigravity"}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-workstream-acceptance.XXXXXX")
 DATA="$TMP/data"
 REPO="$TMP/repo"
@@ -322,6 +322,40 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
     printf '{"type":"context.append_message","time":%s,"message":{"role":"assistant","content":[{"type":"text","text":"%s reply"}],"toolCalls":[]}}\n' \
       "$(date +%s)000" "$sentinel" >>"$wire"
     ;;
+  command-code)
+    printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    session_id=""
+    previous_arg=""
+    for arg in "$@"; do
+      if [ "$previous_arg" = --session ]; then
+        session_id=$arg
+      fi
+      previous_arg=$arg
+    done
+    if [ -z "$session_id" ]; then
+      if command -v uuidgen >/dev/null 2>&1; then
+        session_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+      elif [ -r /proc/sys/kernel/random/uuid ]; then
+        session_id=$(cat /proc/sys/kernel/random/uuid)
+      else
+        printf 'command-code fake mode needs uuidgen or /proc/sys/kernel/random/uuid\n' >&2
+        exit 1
+      fi
+    fi
+    store="$HOME/.commandcode/projects/opaque_fixture_slug"
+    mkdir -p "$store"
+    stream="$store/$session_id.jsonl"
+    if [ ! -f "$stream" ]; then
+      printf '{"type":"session","version":3,"id":"%s","timestamp":"2026-08-07T17:00:00Z","cwd":"%s"}\n' \
+        "$session_id" "$PWD" >"$stream"
+    fi
+    sentinel=${AI_MEMORY_ACCEPTANCE_SENTINEL:-AMWS-FAKE-COMMAND-CODE}
+    now=$(date +%s)
+    printf '{"type":"message","id":"u-%s","parentId":null,"timestamp":"2026-08-07T17:00:01Z","message":{"role":"user","content":[{"type":"text","text":"%s"}],"meta":{"source":"user"}}}\n' \
+      "$now" "$sentinel" >>"$stream"
+    printf '{"type":"message","id":"a-%s","parentId":"u-%s","timestamp":"2026-08-07T17:00:02Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private reasoning","signature":"private signature"},{"type":"text","text":"%s reply"}],"meta":{"source":"model"}}}\n' \
+      "$now" "$now" "$sentinel" >>"$stream"
+    ;;
   grok)
     printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
     # Honor the wrapper-owned `--session-id <id>` (fresh) and `--resume <id>`
@@ -493,16 +527,24 @@ grep -q 'session was found for this directory' \
 AUTO_HOME="$CONFIG/auto-home"
 AUTO_CODEX_HOME="$AUTO_HOME/.codex"
 AUTO_CLAUDE_HOME="$AUTO_HOME/.claude"
+AUTO_COMMAND_CODE_HOME="$AUTO_HOME/.commandcode"
 AUTO_BIN="$AUTO_HOME/bin"
 mkdir -p "$AUTO_CODEX_HOME/sessions/2026/01/01" \
-  "$AUTO_CLAUDE_HOME/projects/fixture" "$AUTO_BIN"
+  "$AUTO_CLAUDE_HOME/projects/fixture" \
+  "$AUTO_COMMAND_CODE_HOME/projects/opaque_fixture_slug" "$AUTO_BIN"
 ln -s "$FAKE" "$AUTO_BIN/codex"
 ln -s "$FAKE" "$AUTO_BIN/claude"
+ln -s "$FAKE" "$AUTO_BIN/command-code"
 printf '{"sessionId":"auto-claude-old","cwd":"%s"}\n' "$REPO" \
   >"$AUTO_CLAUDE_HOME/projects/fixture/auto-claude-old.jsonl"
 sleep 1
 printf '{"type":"session_meta","payload":{"id":"auto-codex-new","cwd":"%s"}}\n' \
   "$REPO" >"$AUTO_CODEX_HOME/sessions/2026/01/01/rollout-auto.jsonl"
+sleep 1
+AUTO_COMMAND_CODE_ID="7c1d5698-204a-4c0f-ae9c-43db7fc4e41d"
+printf '{"type":"session","version":3,"id":"%s","timestamp":"2026-08-07T17:00:00Z","cwd":"%s"}\n' \
+  "$AUTO_COMMAND_CODE_ID" "$REPO" \
+  >"$AUTO_COMMAND_CODE_HOME/projects/opaque_fixture_slug/$AUTO_COMMAND_CODE_ID.jsonl"
 (
   cd "$REPO"
   HOME="$AUTO_HOME" CODEX_HOME="$AUTO_CODEX_HOME" \
@@ -513,11 +555,11 @@ printf '{"type":"session_meta","payload":{"id":"auto-codex-new","cwd":"%s"}}\n' 
       >"$LOGS/edge-auto-newest.log" 2>&1
 )
 diff -u \
-  <(printf '%s\n' resume auto-codex-new --dangerously-bypass-approvals-and-sandbox) \
+  <(printf '%s\n' --session "$AUTO_COMMAND_CODE_ID" --yolo) \
   "$TMP/auto-newest-argv.log"
 
-# Establish Claude after Codex, then verify bare run follows the managed
-# workstream's current Claude link instead of the newer but obsolete Codex file.
+# Establish Claude after Command Code, then verify bare run follows the managed
+# workstream's current Claude link instead of newer but obsolete native files.
 (
   cd "$REPO"
   HOME="$AUTO_HOME" CLAUDE_CONFIG_DIR="$AUTO_CLAUDE_HOME" \
@@ -690,6 +732,66 @@ kimi_current_id=$(sqlite3 "$DATA/db/memory.sqlite" \
   "SELECT native_session_id FROM workstream_native_sessions WHERE workstream_id = x'${kimi_ws_hex}' AND agent_kind = 'kimi-code' AND is_current = 1;")
 [ "$kimi_current_id" = "$kimi_recovered_id" ] || {
   printf 'orphan recovery did not repoint the kimi workstream\n' >&2
+  exit 1
+}
+
+# Command Code v3 fixture: the fake creates an exact UUID transcript under an
+# opaque project slug, then accepts the same `--session <uuid>` selector on the
+# returning leg. HOME isolates the documented user store from real sessions.
+COMMAND_CODE_FAKE_HOME="$CONFIG/command-code-fake"
+mkdir -p "$COMMAND_CODE_FAKE_HOME"
+(
+  cd "$REPO"
+  HOME="$COMMAND_CODE_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=command-code \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/command-code-first-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-COMMAND-CODE-ONE" \
+    "$BIN" --data-dir "$DATA" run --new edge-command-code --executable "$FAKE" \
+      --yolo command-code >"$LOGS/edge-command-code-first.log" 2>&1
+)
+diff -u <(printf '%s\n' --yolo) "$TMP/command-code-first-argv.log"
+command_code_session_file=$(find "$COMMAND_CODE_FAKE_HOME/.commandcode/projects" \
+  -mindepth 2 -maxdepth 2 -name '*.jsonl' ! -name '*.checkpoints.jsonl' -print -quit)
+[ -n "$command_code_session_file" ] || {
+  printf 'fake command-code did not create a native session transcript\n' >&2
+  exit 1
+}
+command_code_session_id=$(basename "$command_code_session_file" .jsonl)
+command_code_ws_hex=$(sqlite3 "$DATA/db/memory.sqlite" \
+  "SELECT lower(hex(id)) FROM workstreams WHERE name = 'edge-command-code' ORDER BY selected_at DESC LIMIT 1;")
+[ "${#command_code_ws_hex}" -eq 32 ] || {
+  printf 'could not resolve the edge-command-code workstream id\n' >&2
+  exit 1
+}
+command_code_ws_id="${command_code_ws_hex:0:8}-${command_code_ws_hex:8:4}-${command_code_ws_hex:12:4}-${command_code_ws_hex:16:4}-${command_code_ws_hex:20:12}"
+command_code_first_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$command_code_ws_id" --limit 100 --json "AMWS-FAKE-COMMAND-CODE-ONE")
+jq -e --arg id "$command_code_session_id" \
+  '[.[] | select(.agent == "command-code" and .role == "assistant" and (.content | contains("AMWS-FAKE-COMMAND-CODE-ONE")) and .native_session_id == $id)] | length == 1' \
+  <<<"$command_code_first_hits" >/dev/null || {
+  printf 'command-code transcript sentinel was not imported\n' >&2
+  tail -80 "$LOGS/edge-command-code-first.log" >&2
+  exit 1
+}
+(
+  cd "$REPO"
+  HOME="$COMMAND_CODE_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=command-code \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/command-code-second-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-COMMAND-CODE-TWO" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-command-code --executable "$FAKE" \
+      cmdc >"$LOGS/edge-command-code-second.log" 2>&1
+)
+diff -u <(printf '%s\n' --session "$command_code_session_id") \
+  "$TMP/command-code-second-argv.log"
+command_code_second_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$command_code_ws_id" --limit 100 --json "AMWS-FAKE-COMMAND-CODE")
+jq -e \
+  '([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-COMMAND-CODE-ONE")))] | length == 1)
+   and ([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-COMMAND-CODE-TWO")))] | length == 1)' \
+  <<<"$command_code_second_hits" >/dev/null || {
+  printf 'command-code incremental import duplicated or missed a sentinel\n' >&2
+  tail -80 "$LOGS/edge-command-code-second.log" >&2
   exit 1
 }
 
@@ -1085,6 +1187,7 @@ harnesses=()
 for requested_harness in "${requested_harnesses[@]}"; do
   case "$requested_harness" in
     kimi-code | kimi-cli) harness=kimi ;;
+    commandcode | cmdc | cmd) harness=command-code ;;
     kiro | kiro-cli)
       printf 'skipping kiro in the scripted real-harness phase: noninteractive Kiro uses a different session store; run the documented interactive Kiro acceptance separately\n' >&2
       continue
@@ -1118,6 +1221,8 @@ OMP_EXTENSION="$CONFIG/omp/ai-memory.ts"
 OMP_AGENT_DIR="$CONFIG/omp/agent"
 CRUSH_DATA_DIR="$CONFIG/crush/data"
 KIMI_ACCEPTANCE_HOME="$CONFIG/kimi-home"
+COMMAND_CODE_ACCEPTANCE_HOME="$CONFIG/command-code-home"
+COMMAND_CODE_SETTINGS="$COMMAND_CODE_ACCEPTANCE_HOME/.commandcode/settings.json"
 GROK_ACCEPTANCE_HOME="$CONFIG/grok-home"
 ANTIGRAVITY_ACCEPTANCE_HOME="$CONFIG/antigravity-home"
 ANTIGRAVITY_HOOKS="$ANTIGRAVITY_ACCEPTANCE_HOME/.gemini/config/hooks.json"
@@ -1125,6 +1230,7 @@ mkdir -p "$(dirname "$CLAUDE_SETTINGS")" "$(dirname "$CODEX_HOOKS")" \
   "$(dirname "$OPENCODE_PLUGIN")" "$(dirname "$PI_EXTENSION")" \
   "$(dirname "$OMP_EXTENSION")" "$OMP_AGENT_DIR" "$OPENCODE_DATA_HOME/opencode" \
   "$CRUSH_DATA_DIR" "$KIMI_ACCEPTANCE_HOME" "$GROK_ACCEPTANCE_HOME" \
+  "$(dirname "$COMMAND_CODE_SETTINGS")" \
   "$(dirname "$ANTIGRAVITY_HOOKS")" \
   "$ANTIGRAVITY_ACCEPTANCE_HOME/.gemini/antigravity-cli"
 
@@ -1181,6 +1287,16 @@ for relative in credentials/kimi-code.json oauth/kimi-code device_id; do
   fi
 done
 
+# Command Code resolves its documented user config, credentials, hooks, and
+# session catalog through HOME/USERPROFILE. Copy only login/model preferences;
+# the acceptance HOME receives a fresh session store and hook file.
+for relative in auth.json config.json; do
+  if [ -f "$HOME/.commandcode/$relative" ]; then
+    cp "$HOME/.commandcode/$relative" \
+      "$COMMAND_CODE_ACCEPTANCE_HOME/.commandcode/$relative"
+  fi
+done
+
 # Grok resolves everything below $GROK_HOME. Seed the isolated home with the
 # operator's login state and settings only; native sessions, logs, and caches
 # remain isolated.
@@ -1233,6 +1349,7 @@ install_hook opencode "$OPENCODE_PLUGIN"
 install_hook pi "$PI_EXTENSION"
 install_hook omp "$OMP_EXTENSION"
 install_hook kimi-code "$KIMI_ACCEPTANCE_HOME/config.toml"
+install_hook command-code "$COMMAND_CODE_SETTINGS"
 install_hook antigravity-cli "$ANTIGRAVITY_HOOKS"
 
 agent_wire_name() {
@@ -1240,6 +1357,7 @@ agent_wire_name() {
     claude) printf 'claude-code\n' ;;
     opencode) printf 'open-code\n' ;;
     kimi) printf 'kimi-code\n' ;;
+    command-code) printf 'command-code\n' ;;
     antigravity) printf 'antigravity-cli\n' ;;
     *) printf '%s\n' "$1" ;;
   esac
@@ -1305,6 +1423,10 @@ run_harness() {
       native_args=(-p "$prompt")
       [ -z "${AI_MEMORY_ACCEPTANCE_KIMI_MODEL:-}" ] || native_args=(-p -m "$AI_MEMORY_ACCEPTANCE_KIMI_MODEL" "$prompt")
       ;;
+    command-code)
+      native_args=(-p --no-auto-update "$prompt")
+      [ -z "${AI_MEMORY_ACCEPTANCE_COMMAND_CODE_MODEL:-}" ] || native_args=(-p --no-auto-update -m "$AI_MEMORY_ACCEPTANCE_COMMAND_CODE_MODEL" "$prompt")
+      ;;
     grok)
       native_args=(-p "$prompt")
       [ -z "${AI_MEMORY_ACCEPTANCE_GROK_MODEL:-}" ] || native_args=(-p -m "$AI_MEMORY_ACCEPTANCE_GROK_MODEL" "$prompt")
@@ -1340,6 +1462,10 @@ run_harness() {
       >"$log" 2>&1
   elif [ "$harness" = kimi ]; then
     (cd "$REPO" && KIMI_CODE_HOME="$KIMI_ACCEPTANCE_HOME" \
+      "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
+      >"$log" 2>&1
+  elif [ "$harness" = command-code ]; then
+    (cd "$REPO" && HOME="$COMMAND_CODE_ACCEPTANCE_HOME" \
       "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
       >"$log" 2>&1
   elif [ "$harness" = grok ]; then

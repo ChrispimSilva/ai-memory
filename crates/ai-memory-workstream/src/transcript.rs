@@ -412,6 +412,13 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
+            ManagedHarness::CommandCode => parse_command_code(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
             ManagedHarness::Kiro => parse_kiro(
                 &value,
                 native_session_id,
@@ -947,6 +954,234 @@ fn parse_kimi(
         }
         _ => {}
     }
+}
+
+/// Command Code v3 session record. The stable documentation guarantees an
+/// append-only tree; the record-level allowlist was checked against the
+/// integrity-matched published 1.14.1 bundle and a sanitized live fixture.
+/// Parent ids are retained so a consumer can distinguish branch changes
+/// without importing hidden reasoning or provider metadata.
+fn parse_command_code(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let record_type = value.get("type").and_then(Value::as_str);
+    let parent_id = match value.get("parentId") {
+        Some(Value::String(parent)) => Some(parent.as_str()),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            losses.push("Command Code malformed parent ids were intentionally excluded".into());
+            return;
+        }
+    };
+    if matches!(record_type, Some("compaction") | Some("branch_summary")) {
+        let Some(summary) = value.get("summary").and_then(Value::as_str) else {
+            losses.push("Command Code malformed summaries were intentionally excluded".into());
+            return;
+        };
+        let (kind, summary_type) = if record_type == Some("compaction") {
+            (WorkstreamEventKind::Compaction, "compaction")
+        } else {
+            (WorkstreamEventKind::Message, "branch-summary")
+        };
+        push_event(
+            events,
+            AgentKind::CommandCode,
+            session,
+            record_id,
+            0,
+            kind,
+            Some("assistant"),
+            summary,
+            timestamp(value),
+            json!({"parent_id": parent_id, "summary_type": summary_type}),
+        );
+        return;
+    }
+    if record_type != Some("message") {
+        return;
+    }
+    let Some(message) = value.get("message").and_then(Value::as_object) else {
+        losses.push("Command Code malformed message records were intentionally excluded".into());
+        return;
+    };
+    let Some(role) = message.get("role").and_then(Value::as_str) else {
+        losses.push("Command Code messages without a role were intentionally excluded".into());
+        return;
+    };
+    let source = message
+        .get("meta")
+        .and_then(|meta| meta.get("source"))
+        .and_then(Value::as_str);
+    if message
+        .get("meta")
+        .and_then(|meta| meta.get("isMeta"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        losses.push("Command Code synthetic/meta messages were intentionally excluded".into());
+        return;
+    }
+    if !matches!(
+        (role, source),
+        ("user", Some("user")) | ("assistant", Some("model"))
+    ) {
+        losses
+            .push("Command Code non-user/model message records were intentionally excluded".into());
+        return;
+    }
+    let Some(parts) = message.get("content").and_then(Value::as_array) else {
+        losses.push(
+            "Command Code messages without content blocks were intentionally excluded".into(),
+        );
+        return;
+    };
+    let occurred_at = timestamp(value);
+    for (index, part) in parts.iter().enumerate() {
+        match (role, part.get("type").and_then(Value::as_str)) {
+            ("user", Some("text")) => {
+                let Some(text) = part.get("text").and_then(Value::as_str) else {
+                    losses.push(
+                        "Command Code malformed text blocks were intentionally excluded".into(),
+                    );
+                    continue;
+                };
+                push_event(
+                    events,
+                    AgentKind::CommandCode,
+                    session,
+                    record_id,
+                    index,
+                    WorkstreamEventKind::Message,
+                    Some("user"),
+                    text,
+                    occurred_at.clone(),
+                    json!({"parent_id": parent_id}),
+                );
+            }
+            ("assistant", Some("text")) => {
+                let Some(text) = part.get("text").and_then(Value::as_str) else {
+                    losses.push(
+                        "Command Code malformed text blocks were intentionally excluded".into(),
+                    );
+                    continue;
+                };
+                push_event(
+                    events,
+                    AgentKind::CommandCode,
+                    session,
+                    record_id,
+                    index,
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    text,
+                    occurred_at.clone(),
+                    json!({"parent_id": parent_id}),
+                );
+            }
+            ("assistant", Some("thinking")) => {
+                losses.push("Command Code hidden reasoning was intentionally excluded".into());
+            }
+            ("assistant", Some("tool_use")) => {
+                let (Some(tool_id), Some(name), Some(input)) = (
+                    part.get("id").and_then(Value::as_str),
+                    part.get("name").and_then(Value::as_str),
+                    part.get("input").filter(|value| value.is_object()),
+                ) else {
+                    losses.push(
+                        "Command Code malformed tool calls were intentionally excluded".into(),
+                    );
+                    continue;
+                };
+                push_event(
+                    events,
+                    AgentKind::CommandCode,
+                    session,
+                    record_id,
+                    index,
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    &format!("{name}: {}", compact_json(input)),
+                    occurred_at.clone(),
+                    json!({"tool": name, "tool_use_id": tool_id, "parent_id": parent_id}),
+                );
+            }
+            ("user", Some("tool_result")) => {
+                parse_command_code_tool_result(
+                    part,
+                    session,
+                    record_id,
+                    index,
+                    parent_id,
+                    occurred_at.clone(),
+                    events,
+                    losses,
+                );
+            }
+            (_, Some(_)) | (_, None) => losses
+                .push("Command Code unsupported content blocks were intentionally excluded".into()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_command_code_tool_result(
+    part: &Value,
+    session: &str,
+    record_id: &str,
+    block: usize,
+    parent_id: Option<&str>,
+    occurred_at: Option<String>,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let Some(tool_use_id) = part.get("tool_use_id").and_then(Value::as_str) else {
+        losses.push("Command Code malformed tool results were intentionally excluded".into());
+        return;
+    };
+    let Some(parts) = part.get("content").and_then(Value::as_array) else {
+        losses.push("Command Code malformed tool results were intentionally excluded".into());
+        return;
+    };
+    let mut texts = Vec::new();
+    for item in parts {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    texts.push(text);
+                } else {
+                    losses.push(
+                        "Command Code malformed tool-result text was intentionally excluded".into(),
+                    );
+                }
+            }
+            Some("image") => {
+                losses.push("Command Code image tool results were intentionally excluded".into());
+            }
+            _ => losses.push(
+                "Command Code unsupported tool-result content was intentionally excluded".into(),
+            ),
+        }
+    }
+    push_event(
+        events,
+        AgentKind::CommandCode,
+        session,
+        record_id,
+        block,
+        WorkstreamEventKind::ToolResult,
+        Some("tool"),
+        &texts.join("\n"),
+        occurred_at,
+        json!({
+            "tool_use_id": tool_use_id,
+            "parent_id": parent_id,
+            "is_error": part.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+        }),
+    );
 }
 
 /// One event per text part of a kimi message; `think` reasoning and media
@@ -1987,6 +2222,27 @@ fn locate_session_file(
             }
         }
     }
+    if harness == ManagedHarness::CommandCode {
+        // The project bucket is a one-way cwd slug. Enumerate only that level,
+        // then probe the exact UUID filename and validate its self-describing
+        // header before returning it.
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        if let Ok(buckets) = fs::read_dir(root) {
+            for bucket in buckets.take(MAX_SCAN_FILES) {
+                let bucket = bucket?;
+                if !bucket.file_type()?.is_dir() {
+                    continue;
+                }
+                let candidate = bucket.path().join(format!("{id}.jsonl"));
+                if session_path_matches(harness, &candidate, id, cwd)? {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+        return Ok(None);
+    }
     if harness == ManagedHarness::Kiro {
         // The store is flat and shared by every checkout. Require both the
         // UUID file name and its sibling metadata to identify this checkout;
@@ -2072,6 +2328,15 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| Uuid::parse_str(stem).is_ok());
     }
+    if harness == ManagedHarness::CommandCode {
+        // Sidecars such as `<id>.checkpoints.jsonl` do not have a UUID file
+        // stem and are excluded from discovery and import.
+        return path.extension().is_some_and(|ext| ext == "jsonl")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| Uuid::parse_str(stem).is_ok());
+    }
     if harness == ManagedHarness::KiroV3 {
         return path.file_name().and_then(|name| name.to_str()) == Some("messages.jsonl")
             && path
@@ -2100,6 +2365,9 @@ fn temporary_transcript(path: &Path) -> bool {
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::Kimi {
         return kimi_session_header(path);
+    }
+    if harness == ManagedHarness::CommandCode {
+        return command_code_session_header(path);
     }
     if harness == ManagedHarness::Kiro {
         return kiro_session_header(path);
@@ -2139,6 +2407,7 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             ManagedHarness::OpenCode
             | ManagedHarness::Crush
             | ManagedHarness::Kimi
+            | ManagedHarness::CommandCode
             | ManagedHarness::Kiro
             | ManagedHarness::KiroV3
             | ManagedHarness::Grok
@@ -2149,6 +2418,49 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
         }
     }
     Ok(None)
+}
+
+/// Command Code v3 transcripts are self-describing on their first line. Fail
+/// closed on an unknown version, malformed UUID/timestamp/path, or a header id
+/// that disagrees with the transcript filename.
+fn command_code_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    if Uuid::parse_str(stem).is_err() {
+        return Ok(None);
+    }
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = String::new();
+    let read =
+        std::io::Read::take(&mut reader, (MAX_EVENT_BYTES + 1) as u64).read_line(&mut line)?;
+    if read == 0 || read > MAX_EVENT_BYTES {
+        return Ok(None);
+    }
+    let Ok(header) = serde_json::from_str::<Value>(&line) else {
+        return Ok(None);
+    };
+    if header.get("type").and_then(Value::as_str) != Some("session")
+        || header.get("version").and_then(Value::as_u64) != Some(3)
+    {
+        return Ok(None);
+    }
+    let (Some(id), Some(timestamp), Some(cwd)) = (
+        header.get("id").and_then(Value::as_str),
+        header.get("timestamp").and_then(Value::as_str),
+        header.get("cwd").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    let cwd = PathBuf::from(cwd);
+    if id != stem
+        || Uuid::parse_str(id).is_err()
+        || timestamp.parse::<jiff::Timestamp>().is_err()
+        || !cwd.is_absolute()
+    {
+        return Ok(None);
+    }
+    Ok(Some((id.to_string(), cwd)))
 }
 
 fn session_header_for_cwd(
@@ -2616,6 +2928,7 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Crush => home.join(".crush"),
         ManagedHarness::Omp => home.join(".omp/agent/sessions"),
         ManagedHarness::Kimi => home.join(".kimi-code/sessions"),
+        ManagedHarness::CommandCode => home.join(".commandcode/projects"),
         ManagedHarness::Kiro => home.join(".kiro/sessions/cli"),
         ManagedHarness::KiroV3 => home.join(".kiro/sessions"),
         ManagedHarness::Grok => home.join(".grok/sessions"),
@@ -2840,6 +3153,7 @@ mod tests {
                     ManagedHarness::OpenCode
                     | ManagedHarness::Crush
                     | ManagedHarness::Kimi
+                    | ManagedHarness::CommandCode
                     | ManagedHarness::Kiro
                     | ManagedHarness::KiroV3
                     | ManagedHarness::Grok
@@ -2868,6 +3182,203 @@ mod tests {
                 harness.as_str()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn command_code_v3_discovery_requires_exact_uuid_header_and_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let root = temp.path().join("command-code-projects");
+        let bucket = root.join("opaque-project-slug");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&bucket).unwrap();
+
+        let matching = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41d";
+        let wrong_checkout = "2cce5126-f57d-4ddd-8f66-e5bb409f60db";
+        let future_schema = "bb40bd9b-d60a-4a87-91c6-57d12c3d3002";
+        fs::write(
+            bucket.join(format!("{matching}.jsonl")),
+            format!(
+                "{}\n",
+                json!({"type":"session","version":3,"id":matching,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+            ),
+        )
+        .unwrap();
+        fs::write(
+            bucket.join(format!("{wrong_checkout}.jsonl")),
+            format!(
+                "{}\n",
+                json!({"type":"session","version":3,"id":wrong_checkout,"timestamp":"2026-08-07T17:00:00Z","cwd":other})
+            ),
+        )
+        .unwrap();
+        fs::write(
+            bucket.join(format!("{future_schema}.jsonl")),
+            format!(
+                "{}\n",
+                json!({"type":"session","version":4,"id":future_schema,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+            ),
+        )
+        .unwrap();
+        fs::write(
+            bucket.join(format!("{matching}.checkpoints.jsonl")),
+            "{\"prompt\":\"private checkpoint\"}\n",
+        )
+        .unwrap();
+
+        let sessions = list_native_sessions(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&root),
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, matching);
+        assert!(
+            native_session_exists(
+                ManagedHarness::CommandCode,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                matching,
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::CommandCode,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                wrong_checkout,
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::CommandCode,
+                temp.path(),
+                &cwd,
+                Some(&root),
+                future_schema,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn command_code_v3_exports_only_visible_allowlisted_blocks_incrementally() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41d";
+        let path = temp.path().join(format!("{session}.jsonl"));
+        let records = [
+            json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd}),
+            json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-07T17:00:01Z","message":{"role":"user","content":[{"type":"text","text":"visible user"}],"meta":{"source":"user"}}}),
+            json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-08-07T17:00:02Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private reasoning","signature":"private signature"},{"type":"text","text":"visible assistant"},{"type":"tool_use","id":"tool-1","name":"read_directory","input":{"path":"src"}}],"meta":{"source":"model"}},"model":"private model","usage":{"costUsd":99}}),
+            json!({"type":"message","id":"t1","parentId":"a1","timestamp":"2026-08-07T17:00:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":true,"content":[{"type":"text","text":"visible result"},{"type":"image","source":{"type":"base64","data":"private image"}}]}],"meta":{"source":"user"}}}),
+            json!({"type":"compaction","id":"c1","parentId":"t1","timestamp":"2026-08-07T17:00:04Z","summary":"visible compacted context","firstKeptEntryId":"u1","tokensBefore":1000,"details":"private details"}),
+            json!({"type":"branch_summary","id":"b1","parentId":"u1","timestamp":"2026-08-07T17:00:05Z","fromId":"c1","summary":"visible abandoned-branch summary","details":"private details"}),
+            json!({"type":"message","id":"injected","parentId":"b1","timestamp":"2026-08-07T17:00:06Z","message":{"role":"user","content":[{"type":"text","text":"harness context"}],"meta":{"source":"hook"}}}),
+        ];
+        fs::write(
+            &path,
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let first = export_jsonl(ManagedHarness::CommandCode, &path, session, None).unwrap();
+        assert_eq!(first.events.len(), 6);
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| (event.kind, event.role.as_deref(), event.content.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (WorkstreamEventKind::Message, Some("user"), "visible user"),
+                (
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    "visible assistant",
+                ),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    "read_directory: {\"path\":\"src\"}",
+                ),
+                (
+                    WorkstreamEventKind::ToolResult,
+                    Some("tool"),
+                    "visible result",
+                ),
+                (
+                    WorkstreamEventKind::Compaction,
+                    Some("assistant"),
+                    "visible compacted context",
+                ),
+                (
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    "visible abandoned-branch summary",
+                ),
+            ]
+        );
+        assert_eq!(first.events[1].metadata["parent_id"], "u1");
+        assert_eq!(first.events[2].metadata["tool_use_id"], "tool-1");
+        assert_eq!(first.events[3].metadata["parent_id"], "a1");
+        assert_eq!(first.events[3].metadata["is_error"], true);
+        assert_eq!(first.events[4].metadata["summary_type"], "compaction");
+        assert_eq!(first.events[5].metadata["summary_type"], "branch-summary");
+        assert!(
+            first
+                .losses
+                .iter()
+                .any(|loss| loss.contains("hidden reasoning"))
+        );
+        assert!(
+            first
+                .losses
+                .iter()
+                .any(|loss| loss.contains("image tool results"))
+        );
+        assert!(
+            first
+                .losses
+                .iter()
+                .any(|loss| loss.contains("non-user/model"))
+        );
+        assert!(first.events.iter().all(|event| {
+            !event.content.contains("private") && !event.content.contains("harness context")
+        }));
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"message","id":"a2","parentId":"u1","timestamp":"2026-08-07T17:00:07Z","message":{"role":"assistant","content":[{"type":"text","text":"visible alternate branch"}],"meta":{"source":"model"}}})
+        )
+        .unwrap();
+        let second = export_jsonl(
+            ManagedHarness::CommandCode,
+            &path,
+            session,
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].content, "visible alternate branch");
+        assert_eq!(second.events[0].metadata["parent_id"], "u1");
     }
 
     #[tokio::test]

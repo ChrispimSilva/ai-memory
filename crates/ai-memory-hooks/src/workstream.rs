@@ -136,6 +136,7 @@ async fn prepare_run(
             | AgentKind::Crush
             | AgentKind::Omp
             | AgentKind::KimiCode
+            | AgentKind::CommandCode
             | AgentKind::KiroCli
             | AgentKind::Grok
             | AgentKind::AntigravityCli
@@ -145,13 +146,15 @@ async fn prepare_run(
             "managed run requires a supported command-line harness",
         );
     }
-    const AUTO_AGENTS: [AgentKind; 6] = [
+    const AUTO_AGENTS: [AgentKind; 8] = [
         AgentKind::ClaudeCode,
         AgentKind::Codex,
         AgentKind::OpenCode,
         AgentKind::Pi,
         AgentKind::Crush,
         AgentKind::KimiCode,
+        AgentKind::CommandCode,
+        AgentKind::KiroCli,
     ];
     if request.automatic_harness
         && (!AUTO_AGENTS.contains(&request.agent)
@@ -898,7 +901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_is_accepted_explicitly_but_not_in_the_automatic_pool() {
+    async fn kiro_is_accepted_as_an_explicit_and_automatic_harness() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let state = test_state(&store, temp.path());
@@ -925,6 +928,19 @@ mod tests {
         let body = to_bytes(explicit.into_body(), 64 * 1024).await.unwrap();
         let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(prepared.resolved_agent, Some(AgentKind::KiroCli));
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: prepared.run_id,
+                native_session_id: Some("7c1d5698-204a-4c0f-ae9c-43db7fc4e41d".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
 
         let automatic = prepare_run(
             State(state),
@@ -944,7 +960,70 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(automatic.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(automatic.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn command_code_is_accepted_as_an_explicit_and_automatic_harness() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+
+        let explicit = prepare_run(
+            State(state.clone()),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::CommandCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "explicit".into(),
+            }),
+        )
+        .await;
+        assert_eq!(explicit.status(), StatusCode::OK);
+        let body = to_bytes(explicit.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prepared.resolved_agent, Some(AgentKind::CommandCode));
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: prepared.run_id,
+                native_session_id: Some("2cce5126-f57d-4ddd-8f66-e5bb409f60db".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+
+        let automatic = prepare_run(
+            State(state),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::CommandCode,
+                automatic_harness: true,
+                available_agents: vec![AgentKind::CommandCode, AgentKind::ClaudeCode],
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "automatic".into(),
+            }),
+        )
+        .await;
+        assert_eq!(automatic.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -19,15 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writing v3 sessions to default `~/.kiro` despite custom `KIRO_HOME`: only a
   resume proven to live in that fallback drops the override for its child
   process. The optional deterministic acceptance runner now covers fresh,
-  resume, and import round trips for both engines (#356).
+  resume, and import round trips for both engines. The server automatic-harness
+  validator now accepts the Kiro candidate pool advertised by the client,
+  preventing bare `ai-memory run` from rejecting a discovered Kiro session
+  before launch (#356).
 - Added first-party Command Code MCP and stable lifecycle-hook support.
   `install-mcp --client command-code` merges the documented user-scope HTTP
   entry; `install-hooks --agent command-code` preserves existing settings and
   registers only `SessionStart`, `PreToolUse`, `PostToolUse`, and `Stop` with
   native session attribution, capture exclusions, and startup handoff
-  injection. Experimental Mods and managed resume remain acceptance-gated,
-  and the turn-only Stop boundary is documented with the manual finalizer
-  workflow (#373).
+  injection. `ai-memory run command-code` now adds v3 checkout-scoped
+  transcript discovery, exact `--session <uuid>` resume, automatic harness
+  selection, native `--yolo` translation, and a visible-event allowlist that
+  retains branch parent ids and summaries while excluding hidden reasoning,
+  images, custom/Mod records, and provider metadata. Deterministic acceptance
+  covers fresh, resume, and incremental-import round trips. Experimental unsandboxed Mods remain
+  excluded, and the turn-only Stop boundary is documented with the manual
+  finalizer workflow (#373).
 - `ai-memory finalize-session --session-id <uuid>` targets exactly one open
   session instead of "the latest open one for this agent+scope". Agents with
   no true SessionEnd hook (Kiro CLI, Codex, Antigravity CLI) rely on
