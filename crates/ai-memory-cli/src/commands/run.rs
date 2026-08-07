@@ -38,13 +38,14 @@ const PREPARE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const IMPORT_BATCH_EVENTS: usize = 400;
 const IMPORT_BATCH_BYTES: usize = 1024 * 1024;
 const ADOPTION_CANDIDATE_LIMIT: usize = 8;
-const AUTO_HARNESSES: [ManagedHarness; 8] = [
+const AUTO_HARNESSES: [ManagedHarness; 9] = [
     ManagedHarness::Claude,
     ManagedHarness::Codex,
     ManagedHarness::OpenCode,
     ManagedHarness::Pi,
     ManagedHarness::Crush,
     ManagedHarness::Kimi,
+    ManagedHarness::CommandCode,
     ManagedHarness::Kiro,
     ManagedHarness::KiroV3,
 ];
@@ -707,7 +708,7 @@ fn filter_usable_auto_sessions(
 
 fn no_auto_session_error() -> anyhow::Error {
     anyhow!(
-        "no Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, or Kiro CLI session was found for this directory; start one explicitly with `ai-memory run claude`, `ai-memory run codex`, `ai-memory run opencode`, `ai-memory run pi`, `ai-memory run crush`, `ai-memory run kimi`, or `ai-memory run kiro`"
+        "no Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, or Kiro CLI session was found for this directory; start one explicitly with `ai-memory run claude`, `ai-memory run codex`, `ai-memory run opencode`, `ai-memory run pi`, `ai-memory run crush`, `ai-memory run kimi`, `ai-memory run command-code`, or `ai-memory run kiro`"
     )
 }
 
@@ -1350,6 +1351,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Crush => ManagedHarness::Crush,
         RunHarnessChoice::Omp => ManagedHarness::Omp,
         RunHarnessChoice::Kimi => ManagedHarness::Kimi,
+        RunHarnessChoice::CommandCode => ManagedHarness::CommandCode,
         RunHarnessChoice::Kiro => ManagedHarness::Kiro,
         RunHarnessChoice::Grok => ManagedHarness::Grok,
         RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
@@ -1373,6 +1375,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Pi => Some(ManagedHarness::Pi),
         AgentKind::Crush => Some(ManagedHarness::Crush),
         AgentKind::KimiCode => Some(ManagedHarness::Kimi),
+        AgentKind::CommandCode => Some(ManagedHarness::CommandCode),
         AgentKind::KiroCli => Some(ManagedHarness::Kiro),
         AgentKind::Grok => Some(ManagedHarness::Grok),
         AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
@@ -1786,6 +1789,34 @@ mod tests {
             args.native_args,
             ["--model", "kimi-for-coding"].map(OsString::from).to_vec()
         );
+    }
+
+    #[test]
+    fn command_code_aliases_select_the_managed_adapter() {
+        for name in ["command-code", "commandcode", "cmdc", "cmd"] {
+            let cli = Cli::try_parse_from([
+                OsStr::new("ai-memory"),
+                OsStr::new("run"),
+                OsStr::new(name),
+                OsStr::new("--print"),
+                OsStr::new("continue here"),
+            ])
+            .unwrap();
+            let CliCommand::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            assert!(
+                matches!(
+                    args.harness,
+                    Some(crate::cli::RunHarnessChoice::CommandCode)
+                ),
+                "{name}"
+            );
+            assert_eq!(
+                args.native_args,
+                ["--print", "continue here"].map(OsString::from).to_vec()
+            );
+        }
     }
 
     #[test]

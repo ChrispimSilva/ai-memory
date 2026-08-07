@@ -24,6 +24,8 @@ pub enum ManagedHarness {
     Omp,
     /// Moonshot AI Kimi Code.
     Kimi,
+    /// Command Code CLI.
+    CommandCode,
     /// Amazon Kiro CLI (v2 engine).
     Kiro,
     /// Amazon Kiro CLI (v3 engine).
@@ -46,6 +48,7 @@ impl ManagedHarness {
             "crush" => Some(Self::Crush),
             "omp" | "oh-my-pi" => Some(Self::Omp),
             "kimi" | "kimi-code" | "kimi-cli" => Some(Self::Kimi),
+            "command-code" | "commandcode" | "cmdc" | "cmd" => Some(Self::CommandCode),
             "kiro" | "kiro-cli" => Some(Self::Kiro),
             "grok" | "grok-build" => Some(Self::Grok),
             "antigravity" | "antigravity-cli" | "agy" => Some(Self::Antigravity),
@@ -64,6 +67,7 @@ impl ManagedHarness {
             Self::Crush => AgentKind::Crush,
             Self::Omp => AgentKind::Omp,
             Self::Kimi => AgentKind::KimiCode,
+            Self::CommandCode => AgentKind::CommandCode,
             Self::Kiro | Self::KiroV3 => AgentKind::KiroCli,
             Self::Grok => AgentKind::Grok,
             Self::Antigravity => AgentKind::AntigravityCli,
@@ -81,6 +85,13 @@ impl ManagedHarness {
             Self::Crush => "crush",
             Self::Omp => "omp",
             Self::Kimi => "kimi",
+            Self::CommandCode => {
+                if cfg!(windows) {
+                    "cmdc"
+                } else {
+                    "command-code"
+                }
+            }
             Self::Kiro | Self::KiroV3 => "kiro-cli",
             Self::Grok => "grok",
             Self::Antigravity => "agy",
@@ -98,6 +109,7 @@ impl ManagedHarness {
             Self::Crush => "crush",
             Self::Omp => "omp",
             Self::Kimi => "kimi",
+            Self::CommandCode => "command-code",
             Self::Kiro => "kiro",
             Self::KiroV3 => "kiro-v3",
             Self::Grok => "grok",
@@ -278,6 +290,15 @@ pub fn build_launch_plan(
                     expected = Some(id.to_string());
                 }
             }
+            ManagedHarness::CommandCode => {
+                // Command Code assigns UUIDs to fresh sessions. Use its exact
+                // session selector for a linked resume; a fresh session is
+                // discovered from the versioned transcript header after exit.
+                if let Some(id) = linked_session_id {
+                    args.extend([OsString::from("--session"), OsString::from(id)]);
+                    expected = Some(id.to_string());
+                }
+            }
             ManagedHarness::Kiro | ManagedHarness::KiroV3 => {
                 // Both engines assign ids to fresh sessions. A linked session
                 // can be selected exactly after its engine-specific store has
@@ -333,6 +354,7 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         ManagedHarness::Crush => Some("--yolo"),
         ManagedHarness::Omp => None,
         ManagedHarness::Kimi => Some("--yolo"),
+        ManagedHarness::CommandCode => Some("--yolo"),
         ManagedHarness::Kiro => {
             if kiro_selects_non_default_engine(args) {
                 None
@@ -352,6 +374,7 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         // `--always-approve`; either spelling satisfies the request.
         let present: &[&str] = match harness {
             ManagedHarness::Kimi => &["--yolo", "-y", "--yes", "--auto-approve", "--auto"],
+            ManagedHarness::CommandCode => &["--yolo", "--dangerously-skip-permissions"],
             // A narrower native trust set is an explicit user choice and must
             // never be widened by the wrapper.
             ManagedHarness::Kiro => &["--trust-all-tools", "-a", "--trust-tools"],
@@ -381,6 +404,7 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
         ManagedHarness::Crush => first_arg_is(args, "run"),
         ManagedHarness::Pi | ManagedHarness::Omp => has_flag(args, &["--print", "-p"]),
         ManagedHarness::Kimi => has_flag(args, &["--prompt", "-p"]),
+        ManagedHarness::CommandCode => has_flag(args, &["--print", "-p"]),
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => has_flag(args, &["--no-interactive"]),
         ManagedHarness::Grok => {
             has_flag(args, &["--single", "-p", "--prompt-file", "--prompt-json"])
@@ -405,6 +429,9 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
     if has_flag(args, version_flags)
         || has_flag(args, &["--no-session", "--no-session-persistence"])
     {
+        return LaunchMode::Passthrough;
+    }
+    if harness == ManagedHarness::CommandCode && has_flag(args, &["--list-models", "--ide-setup"]) {
         return LaunchMode::Passthrough;
     }
     if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
@@ -554,6 +581,22 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "__plugin_run_node",
         ]
         .as_slice(),
+        ManagedHarness::CommandCode => [
+            "info",
+            "status",
+            "help",
+            "whoami",
+            "update",
+            "feedback",
+            "taste",
+            "learn-taste",
+            "mcp",
+            "skills",
+            "mods",
+            "login",
+            "logout",
+        ]
+        .as_slice(),
         // Every root command except `chat` in kiro-cli 2.16.2. Bare and
         // flags-only invocations open chat and remain session-bearing.
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => [
@@ -683,6 +726,18 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
                 "-C",
             ],
         ),
+        ManagedHarness::CommandCode => has_flag(
+            args,
+            &[
+                "--session",
+                "--resume",
+                "--sessions",
+                "-r",
+                "--continue",
+                "-c",
+                "--fork-session",
+            ],
+        ),
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => has_flag(
             args,
             &["--resume", "-r", "--resume-id", "--resume-picker", "--list"],
@@ -731,6 +786,8 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         // A bare `--session`/`--resume` opens the picker: `flag_value`
         // returns `None` when no value follows, as intended.
         ManagedHarness::Kimi => flag_value(args, &["--session", "-S", "--resume", "-r"]),
+        ManagedHarness::CommandCode => flag_value(args, &["--session", "--resume", "-r"])
+            .filter(|value| Uuid::parse_str(value).is_ok()),
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => flag_value(args, &["--resume-id"]),
         ManagedHarness::Grok => flag_value(args, &["--resume", "-r", "--session-id", "-s"]),
         // A bare `--continue` names no conversation: the id is only known
@@ -838,6 +895,10 @@ fn environment_session_dir_with(
         ManagedHarness::Omp => value("PI_CODING_AGENT_DIR").map(|dir| dir.join("sessions")),
         // Sessions live under `<KIMI_CODE_HOME>/sessions/<bucket>/<id>/`.
         ManagedHarness::Kimi => value("KIMI_CODE_HOME").map(|dir| dir.join("sessions")),
+        // Command Code documents no session-root override. Its user store is
+        // rooted below HOME and remains isolated when the wrapper runs with a
+        // configured host home.
+        ManagedHarness::CommandCode => None,
         ManagedHarness::Kiro => value("KIRO_HOME").map(|dir| dir.join("sessions/cli")),
         ManagedHarness::KiroV3 => value("KIRO_HOME").map(|dir| dir.join("sessions")),
         // Sessions live under `<GROK_HOME>/sessions/<encoded-cwd>/<id>/`.
@@ -993,6 +1054,10 @@ mod tests {
             ManagedHarness::OpenCode,
             &[OsString::from("run"), OsString::from("continue here")]
         ));
+        assert!(!allows_native_session_adoption(
+            ManagedHarness::CommandCode,
+            &[OsString::from("--print"), OsString::from("continue here")]
+        ));
     }
 
     #[test]
@@ -1078,6 +1143,7 @@ mod tests {
             (ManagedHarness::Crush, Some("--yolo")),
             (ManagedHarness::Omp, None),
             (ManagedHarness::Kimi, Some("--yolo")),
+            (ManagedHarness::CommandCode, Some("--yolo")),
             (ManagedHarness::Grok, Some("--yolo")),
             (
                 ManagedHarness::Antigravity,
@@ -1094,6 +1160,79 @@ mod tests {
                 harness.as_str()
             );
         }
+    }
+
+    #[test]
+    fn command_code_resumes_exactly_and_preserves_native_arguments() {
+        let fresh = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--model"), OsString::from("model-id")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(strings(&fresh.args), ["--model", "model-id"]);
+        assert_eq!(fresh.expected_session_id, None);
+
+        let id = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41d";
+        let resumed = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--model"), OsString::from("model-id")],
+            Some(id),
+        )
+        .unwrap();
+        assert_eq!(
+            strings(&resumed.args),
+            ["--model", "model-id", "--session", id]
+        );
+        assert_eq!(resumed.expected_session_id.as_deref(), Some(id));
+    }
+
+    #[test]
+    fn command_code_explicit_selectors_and_utilities_are_not_overridden() {
+        let id = "2cce5126-f57d-4ddd-8f66-e5bb409f60db";
+        let exact = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--session"), OsString::from(id)],
+            Some("7c1d5698-204a-4c0f-ae9c-43db7fc4e41d"),
+        )
+        .unwrap();
+        assert_eq!(strings(&exact.args), ["--session", id]);
+        assert_eq!(exact.expected_session_id.as_deref(), Some(id));
+
+        let named = build_launch_plan(
+            ManagedHarness::CommandCode,
+            None,
+            vec![OsString::from("--resume=auth refactor")],
+            Some("7c1d5698-204a-4c0f-ae9c-43db7fc4e41d"),
+        )
+        .unwrap();
+        assert_eq!(strings(&named.args), ["--resume=auth refactor"]);
+        assert_eq!(named.expected_session_id, None);
+
+        for args in [
+            vec![OsString::from("mcp"), OsString::from("list")],
+            vec![OsString::from("--no-session")],
+            vec![OsString::from("--list-models")],
+        ] {
+            let plan = build_launch_plan(ManagedHarness::CommandCode, None, args.clone(), Some(id))
+                .unwrap();
+            assert_eq!(plan.args, args);
+            assert_eq!(plan.mode, LaunchMode::Passthrough);
+        }
+    }
+
+    #[test]
+    fn command_code_yolo_recognizes_only_equivalent_dangerous_modes() {
+        let mut alias = vec![OsString::from("--dangerously-skip-permissions")];
+        apply_yolo(ManagedHarness::CommandCode, &mut alias);
+        assert_eq!(strings(&alias), ["--dangerously-skip-permissions"]);
+
+        let mut narrower = vec![OsString::from("--auto-accept")];
+        apply_yolo(ManagedHarness::CommandCode, &mut narrower);
+        assert_eq!(strings(&narrower), ["--auto-accept", "--yolo"]);
     }
 
     #[test]

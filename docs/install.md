@@ -777,18 +777,25 @@ ai-memory finalize-session --agent command-code
 ai-memory finalize-session --agent command-code --session-id <uuid>
 ```
 
-ai-memory does not install Command Code Mods. Mods are currently documented
-as experimental, run unsandboxed, and do not provide the same stable native
-session identity at every callback. Managed `ai-memory run command-code`
-support is also withheld. Command Code documents append-only JSONL transcripts
-under `~/.commandcode/projects/<project-slug>/`, native `--continue`,
-`--resume`, and `--session` selectors, `--yolo`, and the Windows `cmdc` alias.
-It does not document the JSONL record schema needed for bounded visible-event
-import. A logged-in acceptance run must still supply sanitized structural
-fixtures and validate checkout matching, incremental import, resume identity,
-normal-exit finalization, and native Windows behavior before ai-memory manages
-those sessions. Direct `cmd`, `cmdc`, or `command-code` launches remain
-unchanged.
+ai-memory does not install Command Code Mods. Mods run arbitrary unsandboxed
+code and are not needed for the stable hook or managed-session paths.
+
+Managed sessions are opt-in:
+
+```bash
+ai-memory run command-code
+ai-memory run command-code --yolo --model <model-id>
+```
+
+The aliases `commandcode`, `cmdc`, and `cmd` select the same adapter. The
+default executable is `command-code` on Unix and `cmdc` on native Windows.
+Fresh sessions keep Command Code's native UUID; returning sessions use exact
+`--session <uuid>`. The read-only adapter accepts only the observed v3 header,
+requires its UUID filename and canonical `cwd` to match the checkout, excludes
+checkpoint/prompt sidecars, hidden reasoning, images, and provider metadata,
+and preserves `parentId` on visible events for branch provenance. An unknown
+future transcript version fails closed until its schema is audited. Direct
+`cmd`, `cmdc`, or `command-code` launches remain unchanged.
 
 ### Kiro CLI
 
@@ -1459,7 +1466,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | Subcommand | Pattern | What it does |
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
-| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Kiro CLI v2/v3, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
+| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
