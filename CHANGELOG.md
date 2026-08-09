@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Podman's `.Host.Security.*` keys are consulted when that probe comes back
   empty. `bootstrap` is now covered as well: it only reads host files, but an
   unmapped UID blocks reads just as hard, and it degraded silently to "no
-  `.git` found" before dying (#385).
+  `.git` found" before dying (#388).
 
 ## [1.25.0] - 2026-08-07
 
