@@ -214,6 +214,8 @@ pub enum AgentKind {
     KiroCli,
     /// Command Code CLI.
     CommandCode,
+    /// Swival CLI (local-first Python coding agent).
+    Swival,
     /// Hermes Agent (Nous Research).
     Hermes,
     /// Anything else (manual capture, future agents).
@@ -226,7 +228,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -244,6 +246,7 @@ impl AgentKind {
         Self::KimiCode,
         Self::KiroCli,
         Self::CommandCode,
+        Self::Swival,
         Self::Hermes,
         Self::Other,
     ];
@@ -269,6 +272,7 @@ impl AgentKind {
             Self::KimiCode => "kimi-code",
             Self::KiroCli => "kiro-cli",
             Self::CommandCode => "command-code",
+            Self::Swival => "swival",
             Self::Hermes => "hermes",
             Self::Other => "other",
         }
@@ -297,6 +301,7 @@ impl AgentKind {
             "kimi-code" | "kimi" => Self::KimiCode,
             "kiro-cli" | "kiro" => Self::KiroCli,
             "command-code" | "commandcode" | "cmdc" | "cmd" => Self::CommandCode,
+            "swival" => Self::Swival,
             "hermes" | "hermes-agent" => Self::Hermes,
             _ => Self::Other,
         }
@@ -327,7 +332,13 @@ impl AgentKind {
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
             self,
-            Self::Crush | Self::Grok | Self::Zero | Self::KimiCode | Self::Hermes | Self::Other
+            Self::Crush
+                | Self::Grok
+                | Self::Zero
+                | Self::KimiCode
+                | Self::Hermes
+                | Self::Swival
+                | Self::Other
         )
     }
 
@@ -483,6 +494,28 @@ mod tests {
         );
         assert!(AgentKind::KiroCli.session_start_injects_handoff());
         assert!(!AgentKind::KiroCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_swival_round_trips_without_hook_stdout_handoff() {
+        assert_eq!(AgentKind::Swival.as_str(), "swival");
+        assert_eq!(AgentKind::from_wire("swival"), AgentKind::Swival);
+        // serde uses rename_all = "kebab-case" → "swival".
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Swival).unwrap(),
+            "\"swival\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"swival\"").unwrap(),
+            AgentKind::Swival
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("swival-2"), AgentKind::Other);
+        // Swival captures lifecycle-hook stdout but never injects it into the
+        // model context, so the session-start handoff must be recovered via
+        // the MCP memory_handoff_accept tool instead.
+        assert!(!AgentKind::Swival.session_start_injects_handoff());
+        assert!(!AgentKind::Swival.user_prompt_injects_handoff());
     }
 
     #[test]

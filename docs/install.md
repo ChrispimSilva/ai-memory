@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, Swival CLI, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -1053,20 +1053,35 @@ docker run --rm akitaonrails/ai-memory:latest \
 docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client zed             --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client swival          --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-hooks --agent swival         --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374"
 ```
 
-Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and OpenClaw support both
+Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, OpenClaw, and Swival support both
 `install-mcp` and `install-hooks`. Grok's `install-mcp --client grok` writes
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
 captures lifecycle events.
+`install-mcp --client swival` merges `.swival/mcp.json` in the current
+directory (Swival's documented default lookup); `install-hooks --agent swival`
+merges the single `lifecycle_command` into `~/.config/swival/config.toml` (or
+a project `swival.toml` via `--config-file`). Swival runs only
+`startup`/`exit` lifecycle events with positional args and no shell, so the
+installed command prefixes `env AI_MEMORY_HOOK_URL=…`.
 Grok ignores `SessionStart` stdout, so handoffs must be accepted through MCP with
 `memory_handoff_accept` when resuming. Claude Desktop, VS Code Copilot, and Zed
 are MCP-only here, so you'll need to nudge the model to call
 `memory_query` / `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
-for Grok's (and Zero's) no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
+for Grok's (and Zero's, and Swival's) no-stdout SessionStart behavior
+(Antigravity CLI uses `PreInvocation`).
 
 ---
 
@@ -1104,7 +1119,7 @@ docker run --rm akitaonrails/ai-memory:latest \
 ```
 
 The curl script installer supports
-`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi`
+`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi|swival`
 and `--to <dir>`; `--help` prints the full flag list. OpenCode,
 OpenClaw, OMP / Oh My Pi, and Pi do not need script extraction because
 `install-hooks` generates TypeScript plugin/extension files for them

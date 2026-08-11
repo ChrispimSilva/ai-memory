@@ -40,7 +40,7 @@ use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
     build_claude_code_payload, build_devin_payload, build_grok_payload,
-    hook_script_for_current_platform,
+    build_swival_lifecycle_command, hook_script_for_current_platform, println_swival_handoff_note,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -159,6 +159,9 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         AgentChoice::KiroCliV3 => {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
+        // Swival hooks are a single lifecycle_command, not a staged script
+        // bundle — emit_swival prints the TOML directly.
+        AgentChoice::Swival => emit_swival(&emit_root, &args)?,
         AgentChoice::OpenCode
         | AgentChoice::Pi
         | AgentChoice::Omp
@@ -312,6 +315,35 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     );
     println!();
     println!("{serialized}");
+    Ok(())
+}
+
+/// Print Swival's lifecycle_command pointing at the staged script (issue #385).
+/// Swival has a single `lifecycle_command` invoked as `<cmd> startup|exit <base_dir>`
+/// with `cwd = base_dir`; like the other setup-agent emitters this renders the
+/// TOML without writing any config file.
+fn emit_swival(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
+    let script = emit_root.join("lifecycle.sh");
+    let command =
+        build_swival_lifecycle_command(&script, &args.server_url, args.auth_token.as_deref(), None);
+    println!("# Swival CLI — merge into ~/.config/swival/config.toml");
+    println!("# (or a project swival.toml, which Swival prefers over the global file),");
+    println!("# or re-run `ai-memory install-hooks --agent swival --apply` to merge");
+    println!("# it in place. Swival invokes the hook as:");
+    println!("#     <command> startup <base_dir>   /   <command> exit <base_dir>");
+    println!("# Hook script (must be reachable from the host that runs Swival):");
+    println!("#   {}", script.display());
+    println!("# AI-memory server: {}", args.server_url);
+    if args.auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in lifecycle_command below.");
+        println!("#       Treat ~/.config/swival/config.toml as sensitive (chmod 600).");
+    }
+    println!("# Tip: also run `ai-memory install-mcp --client swival --auth-token <...>`");
+    println!("#      to register the MCP endpoint in .swival/mcp.json.");
+    println!();
+    println_swival_handoff_note();
+    println!();
+    println!("lifecycle_command = {}", toml_edit::value(command));
     Ok(())
 }
 

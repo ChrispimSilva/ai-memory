@@ -140,6 +140,7 @@ async fn prepare_run(
             | AgentKind::KiroCli
             | AgentKind::Grok
             | AgentKind::AntigravityCli
+            | AgentKind::Swival
     ) {
         return error(
             StatusCode::BAD_REQUEST,
@@ -1146,6 +1147,56 @@ mod tests {
                 agent: AgentKind::AntigravityCli,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::AntigravityCli],
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "automatic".into(),
+            }),
+        )
+        .await;
+        assert_eq!(automatic.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn swival_is_accepted_explicitly_but_not_in_the_automatic_pool() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+
+        let explicit = prepare_run(
+            State(state.clone()),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Swival,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "explicit".into(),
+            }),
+        )
+        .await;
+        assert_eq!(explicit.status(), StatusCode::OK);
+        let body = to_bytes(explicit.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prepared.resolved_agent, Some(AgentKind::Swival));
+
+        let automatic = prepare_run(
+            State(state),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Swival,
+                automatic_harness: true,
+                available_agents: vec![AgentKind::Swival],
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "automatic".into(),

@@ -77,6 +77,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::KiroCli => render_kiro_cli(&args)?,
         McpClient::CommandCode => render_command_code(&args)?,
+        McpClient::Swival => render_swival(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
     };
@@ -212,6 +213,12 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .join("settings")
             .join("mcp.json"),
         McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
+        // Swival reads the project-scoped `.swival/mcp.json` under the
+        // current base dir by default (its own documented default lookup).
+        McpClient::Swival => std::env::current_dir()
+            .context("could not resolve current dir for .swival/mcp.json default")?
+            .join(".swival")
+            .join("mcp.json"),
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -464,7 +471,8 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::Devin
         | McpClient::KimiCode
         | McpClient::KiroCli
-        | McpClient::CommandCode => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::CommandCode
+        | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses.
@@ -686,6 +694,15 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::CommandCode => {
             entry.insert("transport".into(), json!("http"));
             entry.insert("enabled".into(), json!(true));
+            entry.insert("url".into(), json!(server_url));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::Swival => {
+            // Swival .swival/mcp.json entry: `type: "http"` + `url` +
+            // optional headers (documented format).
+            entry.insert("type".into(), json!("http"));
             entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
@@ -1179,6 +1196,21 @@ fn render_command_code(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_swival(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Swival CLI — merge into .swival/mcp.json in the project root
+         # (Swival's documented default lookup; project-scoped by design), or
+         # re-run with --apply to merge it in place preserving other servers.
+         # A `[mcp_servers.ai-memory]` table in swival.toml is the TOML
+         # alternative and wins by name when both exist.
+         # Pair with `ai-memory install-hooks --agent swival` for lifecycle
+         # capture; Swival captures hook stdout but never injects it, so
+         # handoffs are recovered via the MCP `memory_handoff_accept` tool.
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# VS Code GitHub Copilot (agent mode) — write to one of:\n\
@@ -1612,6 +1644,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
         }
@@ -1708,6 +1741,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
         }

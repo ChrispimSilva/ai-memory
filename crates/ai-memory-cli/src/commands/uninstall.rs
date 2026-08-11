@@ -42,6 +42,8 @@ enum RewriteOp {
     ZeroHooksJson,
     /// Kimi Code `[[hooks]]` rules inside config.toml.
     KimiCodeHooksToml,
+    /// Swival `lifecycle_command` key inside config.toml.
+    SwivalHooksToml,
     /// Kiro CLI v2 agent-config hooks with exact generated command signatures.
     KiroCliV2HooksJson,
     /// Kiro CLI v3 standalone hooks with exact generated names and commands.
@@ -291,6 +293,19 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             );
         }
 
+        let swival = install_hooks::swival_config_path(None)?;
+        if swival.exists() {
+            let content = std::fs::read_to_string(&swival)
+                .with_context(|| format!("reading {}", swival.display()))?;
+            let removal = strip_swival_lifecycle_command(&content)?;
+            push_rewrite(
+                &mut plan,
+                swival,
+                removal.removed_events,
+                RewriteOp::SwivalHooksToml,
+            );
+        }
+
         let plugin = install_hooks::opencode_plugin_path()?;
         push_generated_delete(&mut plan, plugin, DeleteKind::OpenCodePlugin);
 
@@ -524,6 +539,9 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
                         }
                         RewriteOp::ZeroHooksJson => strip_zero_hooks(&out)?.new_content,
                         RewriteOp::KimiCodeHooksToml => strip_kimi_code_hooks(&out)?.new_content,
+                        RewriteOp::SwivalHooksToml => {
+                            strip_swival_lifecycle_command(&out)?.new_content
+                        }
                         RewriteOp::KiroCliV2HooksJson => strip_kiro_cli_v2_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV3HooksJson => strip_kiro_cli_v3_hooks(&out)?.new_content,
                         RewriteOp::McpJson(client) => {
@@ -994,6 +1012,33 @@ fn strip_kimi_code_hooks(content: &str) -> Result<HookRemoval> {
     })
 }
 
+/// Remove ai-memory's `lifecycle_command` from a Swival config TOML.
+/// Other keys (inference config, MCP tables, audit settings) survive
+/// untouched. The command is ours when it embeds the lifecycle.sh script
+/// (with or without the `env AI_MEMORY_HOOK_URL=…` prefix) or references
+/// the `ai-memory` binary.
+fn strip_swival_lifecycle_command(content: &str) -> Result<HookRemoval> {
+    let mut removed = Vec::new();
+    let new_content = mutate_toml(content, |doc| {
+        let Some(value) = doc.get("lifecycle_command") else {
+            return Ok(());
+        };
+        let ours = value
+            .as_str()
+            .is_some_and(|cmd| cmd.contains("lifecycle.sh") || hook_command_is_ours(cmd));
+        if !ours {
+            return Ok(());
+        }
+        removed.push("swival.lifecycle_command".to_string());
+        doc.remove("lifecycle_command");
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events: removed,
+    })
+}
+
 fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
@@ -1080,6 +1125,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::Swival
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),

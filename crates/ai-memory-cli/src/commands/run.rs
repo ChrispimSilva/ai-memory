@@ -1355,6 +1355,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Kiro => ManagedHarness::Kiro,
         RunHarnessChoice::Grok => ManagedHarness::Grok,
         RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
+        RunHarnessChoice::Swival => ManagedHarness::Swival,
     }
 }
 
@@ -1379,6 +1380,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::KiroCli => Some(ManagedHarness::Kiro),
         AgentKind::Grok => Some(ManagedHarness::Grok),
         AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
+        AgentKind::Swival => Some(ManagedHarness::Swival),
         _ => None,
     }
 }

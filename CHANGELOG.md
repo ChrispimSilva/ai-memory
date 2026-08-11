@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added first-party Swival CLI support. `AgentKind::Swival` persists sessions
+  under the `swival` wire value (new V48 migration) and never claims startup
+  handoff injection because Swival captures lifecycle-hook stdout without
+  putting it into the model context. `install-hooks --agent swival` renders
+  / merges the single `lifecycle_command` (an `env AI_MEMORY_HOOK_URL=…`
+  prefix plus the shim path, which survives Swival's no-shell
+  `shlex.split` + `subprocess` exec) into `~/.config/swival/config.toml` or a
+  project `swival.toml`; the shim maps `startup`/`exit <base_dir>` positional
+  args to `session-start`/`session-end` hook events and recovers project
+  scope from the cwd marker. `install-mcp --client swival` merges the
+  documented `.swival/mcp.json` HTTP entry, `setup-agent --agent swival`
+  emits the hook command, and `uninstall` strips both. Handoffs are recovered
+  via the MCP `memory_handoff_accept` tool because Swival discards hook
+  stdout ([#385]).
+- Added `ai-memory run swival` managed workstream support. The new
+  `ManagedHarness::Swival` adapter discovers, lists, and checks native
+  sessions against the project-scoped `.swival/HISTORY.md` rollup (or the
+  `--cache-dir` store) under the fixed native id `HISTORY`, injects no
+  resume selector (Swival has none and resumes implicitly by cwd), maps
+  `--yolo` to Swival's own `--files all --commands all`, and passes utility
+  subcommands (`--init-config`, `--logout`, `--list-profiles`, `--version`,
+  `skills`, `--serve`, `--acp`) through untouched. HISTORY.md is an
+  undecodable rolling rollup, so the visible-event ledger comes from
+  lifecycle-hook capture and transcript export fails with an explanatory
+  message (mirroring Antigravity). The server's managed-run allowlist
+  accepts `AgentKind::Swival` explicitly but keeps Swival out of the
+  no-argument automatic pool ([#385]).
+
 ## [1.25.0] - 2026-08-07
 
 ### Added

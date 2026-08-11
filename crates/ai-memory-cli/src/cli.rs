@@ -214,7 +214,7 @@ pub struct RunArgs {
 }
 
 /// Harnesses supported by managed workstreams.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum RunHarnessChoice {
     /// Anthropic Claude Code (`claude`).
     #[value(alias = "claude-code")]
@@ -251,6 +251,11 @@ pub enum RunHarnessChoice {
     /// Google Antigravity CLI (`agy`).
     #[value(name = "antigravity", alias = "antigravity-cli", alias = "agy")]
     Antigravity,
+    /// Swival CLI (local-first Python coding agent). Sessions resume
+    /// implicitly from the project `.swival/` store and the visible-event
+    /// ledger comes from lifecycle-hook capture, so `ai-memory run swival`
+    /// launches `swival` with its native arguments passed through.
+    Swival,
 }
 
 /// Arguments for `show`.
@@ -1034,6 +1039,13 @@ pub enum AgentChoice {
     /// `~/.commandcode/settings.json`.
     #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
     CommandCode,
+    /// Swival CLI (local-first Python coding agent) — lifecycle hooks via
+    /// `lifecycle_command` in `swival.toml` (project) or
+    /// `~/.config/swival/config.toml` (global). NOTE: Swival captures hook
+    /// stdout but never injects it into the model context, so capture works
+    /// but handoff injection does not — recover the prior session's handoff
+    /// via the MCP `memory_handoff_accept` tool.
+    Swival,
 }
 
 impl AgentChoice {
@@ -1061,6 +1073,7 @@ impl AgentChoice {
             Self::KimiCode => AgentKind::KimiCode,
             Self::KiroCli | Self::KiroCliV3 => AgentKind::KiroCli,
             Self::CommandCode => AgentKind::CommandCode,
+            Self::Swival => AgentKind::Swival,
         }
     }
 
@@ -1171,6 +1184,14 @@ pub enum McpClient {
     /// Command Code CLI — `~/.commandcode/mcp.json`.
     #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
     CommandCode,
+    /// Swival CLI — `.swival/mcp.json` in the project root (standard
+    /// `mcpServers` map) or a `[mcp_servers.<name>]` table in
+    /// `swival.toml` / `~/.config/swival/config.toml`. HTTP transport
+    /// against ai-memory's `/mcp` endpoint. Pair with
+    /// `install-hooks --agent swival` for lifecycle capture; Swival
+    /// captures hook stdout but never injects it, so handoffs are
+    /// recovered via MCP `memory_handoff_accept`.
+    Swival,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -2292,6 +2313,48 @@ mod tests {
             };
             assert_eq!(args.agent, AgentChoice::CommandCode);
         }
+    }
+
+    #[test]
+    fn swival_mcp_and_hook_agents_parse() {
+        let mcp = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "swival",
+            "--server-url",
+            "http://memory.example:49374",
+        ])
+        .unwrap_or_else(|error| panic!("failed to parse MCP client swival: {error}"));
+        let Command::InstallMcp(args) = mcp.command else {
+            panic!("expected install-mcp for swival");
+        };
+        assert_eq!(args.client, McpClient::Swival);
+
+        let hooks = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "swival",
+            "--server-url",
+            "http://memory.example:49374",
+        ])
+        .unwrap_or_else(|error| panic!("failed to parse hook agent swival: {error}"));
+        let Command::InstallHooks(args) = hooks.command else {
+            panic!("expected install-hooks for swival");
+        };
+        assert_eq!(args.agent, AgentChoice::Swival);
+        assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Swival);
+    }
+
+    #[test]
+    fn run_swival_harness_parses() {
+        let cli = Cli::try_parse_from(["ai-memory", "run", "swival", "--yolo", "refactor auth"])
+            .unwrap_or_else(|error| panic!("failed to parse run swival: {error}"));
+        let Command::Run(args) = cli.command else {
+            panic!("expected run for swival");
+        };
+        assert_eq!(args.harness, Some(RunHarnessChoice::Swival));
     }
 
     #[test]

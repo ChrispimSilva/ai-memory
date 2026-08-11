@@ -130,6 +130,15 @@ pub async fn export_transcript(
             "antigravity conversations expose no decodable transcript; this session's events come from hook capture"
         ));
     }
+    if harness == ManagedHarness::Swival {
+        // `.swival/HISTORY.md` is a human-readable session rollup, not a
+        // structured event log, and its shape is not versioned. The
+        // visible-event ledger for this harness comes from lifecycle-hook
+        // capture instead; only session identity is read from the store.
+        return Err(anyhow!(
+            "swival HISTORY.md exposes no decodable transcript; this session's events come from hook capture"
+        ));
+    }
     let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
         .ok_or_else(|| anyhow!("native transcript for {native_session_id} was not found"))?;
     export_jsonl(harness, &path, native_session_id, source_cursor)
@@ -149,6 +158,9 @@ pub async fn discover_native_session(
     }
     if harness == ManagedHarness::Crush {
         return discover_crush(cwd, session_dir, started_at);
+    }
+    if harness == ManagedHarness::Swival {
+        return discover_swival(cwd, session_dir, started_at);
     }
     let mut candidates = collect_session_files(harness, home, session_dir)?;
     candidates.sort_by(|left, right| {
@@ -187,6 +199,9 @@ pub async fn list_native_sessions(
     }
     if harness == ManagedHarness::Crush {
         return list_crush_sessions(cwd, session_dir, limit);
+    }
+    if harness == ManagedHarness::Swival {
+        return list_swival_sessions(cwd, session_dir, limit);
     }
 
     let mut files = collect_session_files(harness, home, session_dir)?;
@@ -240,6 +255,9 @@ pub fn native_session_exists(
     if harness == ManagedHarness::Crush {
         return Ok(crush_updated(cwd, session_dir, native_session_id)?.is_some());
     }
+    if harness == ManagedHarness::Swival {
+        return Ok(swival_updated(cwd, session_dir, native_session_id)?.is_some());
+    }
     Ok(locate_session_file(harness, home, cwd, session_dir, native_session_id)?.is_some())
 }
 
@@ -281,6 +299,11 @@ pub async fn wait_for_transcript_flush(
     session_dir: Option<&Path>,
     native_session_id: &str,
 ) -> Result<()> {
+    if harness == ManagedHarness::Swival {
+        // HISTORY.md is never decoded, so there is no buffered transcript to
+        // settle before the ledger import (which comes from hook capture).
+        return Ok(());
+    }
     let mut previous = None;
     for _ in 0..10 {
         let current = if harness == ManagedHarness::OpenCode {
@@ -440,7 +463,10 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
-            ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Antigravity => {
+            ManagedHarness::OpenCode
+            | ManagedHarness::Crush
+            | ManagedHarness::Antigravity
+            | ManagedHarness::Swival => {
                 return Err(anyhow!(
                     "{} transcripts must use their SQLite adapter",
                     harness.as_str()
@@ -2411,7 +2437,8 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             | ManagedHarness::Kiro
             | ManagedHarness::KiroV3
             | ManagedHarness::Grok
-            | ManagedHarness::Antigravity => (None, None),
+            | ManagedHarness::Antigravity
+            | ManagedHarness::Swival => (None, None),
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
             return Ok(Some((id.to_string(), PathBuf::from(cwd))));
@@ -2880,6 +2907,70 @@ fn crush_db(cwd: &Path, session_dir: Option<&Path>) -> PathBuf {
     session_dir.unwrap_or(&cwd.join(".crush")).join("crush.db")
 }
 
+/// Resolve Swival's per-project store root: `--cache-dir` when given, else
+/// `cwd/.swival`. All session state (HISTORY.md, continue.md, memory/,
+/// cache.db, mcp.json) lives under this one directory.
+fn swival_root(cwd: &Path, session_dir: Option<&Path>) -> PathBuf {
+    session_dir.unwrap_or(&cwd.join(".swival")).to_path_buf()
+}
+
+/// The session rollup file. The fixed `HISTORY` stem doubles as the native
+/// session id: Swival keeps exactly one current rollup per checkout.
+fn swival_history_path(cwd: &Path, session_dir: Option<&Path>) -> PathBuf {
+    swival_root(cwd, session_dir).join("HISTORY.md")
+}
+
+fn discover_swival(
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    started_at: SystemTime,
+) -> Result<Option<String>> {
+    Ok(list_swival_sessions(cwd, session_dir, 1)?
+        .into_iter()
+        .find(|candidate| candidate.updated_at + Duration::from_secs(2) >= started_at)
+        .map(|candidate| candidate.native_session_id))
+}
+
+fn list_swival_sessions(
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    limit: usize,
+) -> Result<Vec<NativeSessionCandidate>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let history = swival_history_path(cwd, session_dir);
+    if !history.is_file() {
+        return Ok(Vec::new());
+    }
+    let Some(updated_at) = modified(&history) else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![NativeSessionCandidate {
+        native_session_id: "HISTORY".to_owned(),
+        updated_at,
+    }])
+}
+
+fn swival_updated(
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<Option<i64>> {
+    if native_session_id != "HISTORY" {
+        return Ok(None);
+    }
+    let history = swival_history_path(cwd, session_dir);
+    if !history.is_file() {
+        return Ok(None);
+    }
+    Ok(modified(&history).map(|time| {
+        time.duration_since(UNIX_EPOCH)
+            .ok()
+            .map_or(0, |duration| duration.as_millis() as i64)
+    }))
+}
+
 fn native_timestamp(value: i64) -> Option<SystemTime> {
     let value = u64::try_from(value).ok()?;
     if value < 100_000_000_000 {
@@ -2933,6 +3024,10 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::KiroV3 => home.join(".kiro/sessions"),
         ManagedHarness::Grok => home.join(".grok/sessions"),
         ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
+        // Swival's store is project-scoped (`.swival/` under the checkout),
+        // so every public entry point resolves it from `cwd` and this arm is
+        // unreachable; kept for match exhaustiveness.
+        ManagedHarness::Swival => home.join(".swival"),
     }
 }
 
@@ -3157,7 +3252,8 @@ mod tests {
                     | ManagedHarness::Kiro
                     | ManagedHarness::KiroV3
                     | ManagedHarness::Grok
-                    | ManagedHarness::Antigravity => {
+                    | ManagedHarness::Antigravity
+                    | ManagedHarness::Swival => {
                         unreachable!()
                     }
                 },
@@ -4579,6 +4675,88 @@ mod tests {
             temp.path(),
             None,
             "a0d5ac62-2501-4780-b783-76d159c56cb3",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("hook capture"), "{error}");
+    }
+
+    /// Swival's store is project-scoped (`.swival/` under the checkout) and
+    /// the rollup stem doubles as the native session id. Discovery, listing,
+    /// and existence all read the same HISTORY.md file.
+    #[tokio::test]
+    async fn swival_lists_and_resolves_its_project_history_rollup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cwd = temp.path().join("checkout");
+        fs::create_dir_all(cwd.join(".swival")).unwrap();
+        fs::write(cwd.join(".swival/HISTORY.md"), "# Session\n").unwrap();
+
+        let sessions = list_native_sessions(ManagedHarness::Swival, temp.path(), &cwd, None, 8)
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, "HISTORY");
+        assert!(
+            native_session_exists(ManagedHarness::Swival, temp.path(), &cwd, None, "HISTORY")
+                .unwrap()
+        );
+        assert!(
+            !native_session_exists(ManagedHarness::Swival, temp.path(), &cwd, None, "OTHER")
+                .unwrap()
+        );
+        // Other checkouts stay invisible — the store is resolved from cwd.
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join(".swival")).unwrap();
+        fs::write(elsewhere.join(".swival/HISTORY.md"), "# Session\n").unwrap();
+        let none = list_native_sessions(ManagedHarness::Swival, temp.path(), &elsewhere, None, 8)
+            .await
+            .unwrap();
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].native_session_id, "HISTORY");
+    }
+
+    #[tokio::test]
+    async fn swival_missing_store_lists_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cwd = temp.path().join("checkout");
+        fs::create_dir_all(&cwd).unwrap();
+        let sessions = list_native_sessions(ManagedHarness::Swival, temp.path(), &cwd, None, 8)
+            .await
+            .unwrap();
+        assert!(sessions.is_empty());
+        assert!(
+            !native_session_exists(ManagedHarness::Swival, temp.path(), &cwd, None, "HISTORY")
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn swival_discover_requires_a_freshly_touched_rollup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cwd = temp.path().join("checkout");
+        fs::create_dir_all(cwd.join(".swival")).unwrap();
+        fs::write(cwd.join(".swival/HISTORY.md"), "# Session\n").unwrap();
+        let started = SystemTime::now();
+        let discovered =
+            discover_native_session(ManagedHarness::Swival, temp.path(), &cwd, None, started)
+                .await
+                .unwrap();
+        assert_eq!(discovered.as_deref(), Some("HISTORY"));
+    }
+
+    /// The rollup is not versioned, so the ledger for this harness comes from
+    /// hook capture. The failure has to say so.
+    #[tokio::test]
+    async fn swival_transcript_export_explains_why_it_is_unavailable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let error = export_transcript(
+            ManagedHarness::Swival,
+            temp.path(),
+            temp.path(),
+            None,
+            "HISTORY",
             None,
         )
         .await
