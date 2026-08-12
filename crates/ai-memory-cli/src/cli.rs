@@ -1171,6 +1171,10 @@ pub enum McpClient {
     /// Command Code CLI — `~/.commandcode/mcp.json`.
     #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
     CommandCode,
+    /// Swival CLI — project-scoped `.swival/mcp.json` using native HTTP.
+    /// This integration is MCP-only; Swival's lifecycle callback does not
+    /// expose a stable session identifier for reliable capture correlation.
+    Swival,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),
@@ -2292,6 +2296,23 @@ mod tests {
             };
             assert_eq!(args.agent, AgentChoice::CommandCode);
         }
+    }
+
+    #[test]
+    fn swival_mcp_client_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "swival",
+            "--server-url",
+            "http://memory.example:49374",
+        ])
+        .unwrap_or_else(|error| panic!("failed to parse MCP client swival: {error}"));
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp for swival");
+        };
+        assert_eq!(args.client, McpClient::Swival);
     }
 
     #[test]

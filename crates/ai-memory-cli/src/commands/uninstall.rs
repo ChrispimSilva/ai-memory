@@ -339,6 +339,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             KimiCode,
             KiroCli,
             CommandCode,
+            Swival,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -1080,6 +1081,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::Swival
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
@@ -2134,6 +2136,23 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["mcpServers"].get("ai-memory").is_none());
         assert!(v["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn strip_mcp_swival_root_servers_preserves_siblings() {
+        let content = r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp"},"other":{"command":"other-mcp"}}}"#;
+        let (out, removed) = strip_mcp_json_client(
+            content,
+            McpClient::Swival,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(value["mcpServers"].get("ai-memory").is_none());
+        assert_eq!(value["mcpServers"]["other"]["command"], "other-mcp");
     }
 
     #[test]

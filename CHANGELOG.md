@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added MCP-only Swival CLI support. `install-mcp --client swival --apply`
+  merges ai-memory's native HTTP entry into the project-root
+  `.swival/mcp.json`, and `uninstall` removes only the matching ai-memory
+  entry while preserving sibling servers. Lifecycle capture and managed
+  workstreams remain unsupported because Swival's callback contract does not
+  expose a stable session identifier (#385).
+
 ### Fixed
 - The `bin/ai-memory` wrapper now detects rootless mode and SELinux under
   podman, so host-file commands stop failing with `Permission denied (os error

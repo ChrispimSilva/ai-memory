@@ -799,6 +799,12 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
         )),
         McpClient::ClaudeDesktop => Ok(None),
         // MCP-only client: no AgentChoice counterpart routes here.
+        McpClient::Swival => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
+        // MCP-only client: no AgentChoice counterpart routes here.
         // Reachable only if a future install_hooks flow targets VS
         // Code Copilot directly.
         McpClient::VsCodeCopilot => Ok(infer_json_mcp_config(
