@@ -144,29 +144,6 @@ PS_ANTIGRAVITY_STATIC=$(grep -q 'function Test-AiMemoryAntigravityInitialInvocat
     && printf 'ok' || printf 'missing')
 assert_eq "powershell antigravity hook has invocation guard" "ok" "$PS_ANTIGRAVITY_STATIC"
 
-# --- swival lifecycle shim (issue #385) --------------------------------
-# Swival invokes `lifecycle_command startup|exit <base_dir>` with cwd =
-# base_dir and no stdin; the shim maps those positional args to hook events,
-# resolves marker scope from base_dir, and MUST never fetch /handoff (Swival
-# discards hook stdout, so accepting would throw the context away).
-rm -f "$FAKE_CURL_LOG"
-SW_OUTPUT=$(PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
-    AI_MEMORY_HOOK_URL='http://memory.test' sh hooks/swival/lifecycle.sh startup "$TMP/a/b/c")
-assert_eq "swival startup returns empty hook output" "{}" "$SW_OUTPUT"
-assert_eq "swival startup posts session-start without fetching handoff" "1" \
-    "$(wc -l <"$FAKE_CURL_LOG" | tr -d ' ')"
-assert_eq "swival startup posts session-start event" "yes" \
-    "$(grep -q 'hook?event=session-start&agent=swival&cwd=' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
-assert_eq "swival startup never fetches handoff" "no" \
-    "$(grep -q '/handoff' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
-
-rm -f "$FAKE_CURL_LOG"
-SW_EXIT=$(PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
-    AI_MEMORY_HOOK_URL='http://memory.test' sh hooks/swival/lifecycle.sh exit "$TMP/a/b/c")
-assert_eq "swival exit returns empty hook output" "{}" "$SW_EXIT"
-assert_eq "swival exit posts session-end event" "yes" \
-    "$(grep -q 'hook?event=session-end&agent=swival&cwd=' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
-
 # --- json_string -------------------------------------------------------
 JSON_INPUT='quoted "thing" \ path
 next line'

@@ -30,9 +30,8 @@ use crate::commands::render_shared::{
     build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
     build_devin_payload_with_data_dir, build_grok_payload_with_data_dir,
     build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value, build_profile_payload_for_agent,
-    build_swival_lifecycle_command, hook_script_for_claude_code, hook_script_for_current_platform,
-    kimi_code_hook_commands, local_hook_policy_v1_supported, println_swival_handoff_note,
-    ts_capture_policy_v1, ts_string_literal,
+    hook_script_for_claude_code, hook_script_for_current_platform, kimi_code_hook_commands,
+    local_hook_policy_v1_supported, ts_capture_policy_v1, ts_string_literal,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -359,7 +358,6 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
                 apply_to_kiro_cli_v3_hooks(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
-            AgentChoice::Swival => apply_to_swival_config(&server_url, auth, &args),
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -463,7 +461,6 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
             render_kiro_cli_v3(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
-        AgentChoice::Swival => render_swival(&server_url, auth, strategy, &args),
     }
 }
 
@@ -520,7 +517,6 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
             AgentChoice::KiroCli => return None,
             AgentChoice::KiroCliV3 => kiro_cli_v3_hooks_path().ok()?,
-            AgentChoice::Swival => swival_config_path(args.config_file.as_deref()).ok()?,
         }
     };
     std::fs::read_to_string(path).ok()
@@ -802,6 +798,7 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             "url",
         )),
         McpClient::ClaudeDesktop => Ok(None),
+        // MCP-only client: no AgentChoice counterpart routes here.
         McpClient::Swival => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
@@ -874,7 +871,6 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // mcp.json the installer can scrape.
         AgentChoice::Pi => None,
         AgentChoice::KiroCli | AgentChoice::KiroCliV3 => Some(McpClient::KiroCli),
-        AgentChoice::Swival => Some(McpClient::Swival),
     }
 }
 
@@ -4060,104 +4056,6 @@ fn render_zero(
     println!("#       via the MCP `memory_handoff_accept` tool.");
     println!();
     println!("{serialized}");
-    Ok(())
-}
-
-/// `~/.config/swival/config.toml` — Swival's user-level config (issue #385).
-/// Swival merges CLI args over the project `swival.toml` over the global
-/// config, so the global file is the safe default target and a project
-/// `swival.toml` can be targeted with `--config-file`.
-pub(crate) fn swival_config_path(config_file: Option<&Path>) -> anyhow::Result<std::path::PathBuf> {
-    match config_file {
-        Some(p) => Ok(p.to_path_buf()),
-        None => Ok(home_dir()
-            .context("could not locate $HOME for ~/.config/swival/config.toml")?
-            .join(".config")
-            .join("swival")
-            .join("config.toml")),
-    }
-}
-
-/// Print Swival's hook config as a TOML merge (dry-run counterpart of
-/// [`apply_to_swival_config`]).
-fn render_swival(
-    server_url: &str,
-    auth_token: Option<&str>,
-    project_strategy: Option<&str>,
-    args: &InstallHooksArgs,
-) -> Result<()> {
-    let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-    let script = hooks_dir.join("lifecycle.sh");
-    if !script.exists() {
-        eprintln!(
-            "# warning: {} not present on this filesystem. \
-             If this command is running inside docker against a \
-             host path, you can ignore this; otherwise extract \
-             the scripts first with `ai-memory setup-agent`.",
-            script.display()
-        );
-    }
-    let config_path = swival_config_path(args.config_file.as_deref())?;
-    let command = build_swival_lifecycle_command(&script, server_url, auth_token, project_strategy);
-    println!(
-        "# Swival hook config — merge into {}",
-        config_path.display()
-    );
-    println!("# (a project `swival.toml` overrides this global file;");
-    println!("#  pass --config-file to target one explicitly), or re-run");
-    println!("# with --apply to merge it in place.");
-    println!("# Hook script: {}", script.display());
-    println!("# AI-memory server URL: {server_url}");
-    if auth_token.is_some() {
-        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in lifecycle_command below.");
-        println!(
-            "#       Treat {} as sensitive (chmod 600).",
-            config_path.display()
-        );
-    }
-    println_swival_handoff_note();
-    println!();
-    println!("lifecycle_command = {}", toml_edit::value(command));
-    Ok(())
-}
-
-/// Merge ai-memory's lifecycle hook into Swival's config TOML (issue #385).
-/// Swival has exactly one hook entry — `lifecycle_command` — so this is a
-/// plain key set (no reserved-name ownership dance); other keys in the file
-/// survive untouched.
-fn apply_to_swival_config(
-    server_url: &str,
-    auth_token: Option<&str>,
-    args: &InstallHooksArgs,
-) -> Result<()> {
-    let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-    let staged = stage_hook_scripts(&hooks_dir, "swival")?;
-    let command_dir = staged_command_dir(&staged, "swival");
-    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
-    let command = build_swival_lifecycle_command(
-        &command_dir.join("lifecycle.sh"),
-        server_url,
-        auth_token,
-        strategy,
-    );
-    let path = swival_config_path(args.config_file.as_deref())?;
-    let outcome = apply_atomic(&path, |existing| {
-        mutate_toml(existing, |doc| {
-            doc["lifecycle_command"] = toml_edit::value(command.clone());
-            Ok(())
-        })
-    })?;
-    println!(
-        "✓ {} {} ({})",
-        outcome.verb(),
-        path.display(),
-        match outcome {
-            ApplyOutcome::Created => "new file",
-            ApplyOutcome::Updated => "backup written next to it",
-            ApplyOutcome::NoOp => "already up to date",
-        }
-    );
-    println_swival_handoff_note();
     Ok(())
 }
 

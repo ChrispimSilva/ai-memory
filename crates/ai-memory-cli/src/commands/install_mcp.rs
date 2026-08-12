@@ -213,12 +213,11 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .join("settings")
             .join("mcp.json"),
         McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
-        // Swival reads the project-scoped `.swival/mcp.json` under the
-        // current base dir by default (its own documented default lookup).
-        McpClient::Swival => std::env::current_dir()
-            .context("could not resolve current dir for .swival/mcp.json default")?
-            .join(".swival")
-            .join("mcp.json"),
+        McpClient::Swival => {
+            let cwd = std::env::current_dir()
+                .context("could not resolve current dir for .swival/mcp.json default")?;
+            swival_project_root(&cwd).join(".swival").join("mcp.json")
+        }
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -237,6 +236,22 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             zed_config_path_in(&config_dir, std::env::consts::OS)
         }
     })
+}
+
+/// Match Swival's own base-dir discovery: the nearest ancestor containing
+/// `.git` or `swival.toml`, falling back to the invocation directory.
+fn swival_project_root(start: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let mut current = resolved.as_path();
+    loop {
+        if current.join(".git").exists() || current.join("swival.toml").exists() {
+            return current.to_path_buf();
+        }
+        let Some(parent) = current.parent() else {
+            return resolved;
+        };
+        current = parent;
+    }
 }
 
 /// Resolve Zed's user settings from the platform config root. The root is
@@ -1201,11 +1216,6 @@ fn render_swival(args: &InstallMcpArgs) -> Result<String> {
         "# Swival CLI — merge into .swival/mcp.json in the project root
          # (Swival's documented default lookup; project-scoped by design), or
          # re-run with --apply to merge it in place preserving other servers.
-         # A `[mcp_servers.ai-memory]` table in swival.toml is the TOML
-         # alternative and wins by name when both exist.
-         # Pair with `ai-memory install-hooks --agent swival` for lifecycle
-         # capture; Swival captures hook stdout but never injects it, so
-         # handoffs are recovered via the MCP `memory_handoff_accept` tool.
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
@@ -1670,6 +1680,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::KiroCli,
             McpClient::CommandCode,
+            McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
         ] {
@@ -1709,6 +1720,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::KiroCli,
             McpClient::CommandCode,
+            McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
         ] {
@@ -2335,6 +2347,61 @@ mod tests {
             first_content, second_content,
             "second apply must produce identical bytes"
         );
+    }
+
+    #[test]
+    fn swival_entry_and_apply_match_upstream_json_schema() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join(".swival").join("mcp.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other":{"command":"other-mcp"}}}"#,
+        )
+        .unwrap();
+
+        let mut args = args_with_token(McpClient::Swival);
+        args.config_file = Some(config_path.clone());
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second, "Swival MCP apply must be idempotent");
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["mcpServers"]["ai-memory"]["type"], "http");
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["url"],
+            "http://127.0.0.1:49374/mcp"
+        );
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert_eq!(
+            value["mcpServers"]["other"]["command"], "other-mcp",
+            "apply must preserve sibling servers"
+        );
+    }
+
+    #[test]
+    fn swival_project_root_matches_git_toml_and_fallback_rules() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_root = tmp.path().join("git-project");
+        let git_nested = git_root.join("a").join("b");
+        fs::create_dir_all(git_root.join(".git")).unwrap();
+        fs::create_dir_all(&git_nested).unwrap();
+        assert_eq!(swival_project_root(&git_nested), git_root);
+
+        let toml_root = tmp.path().join("toml-project");
+        let toml_nested = toml_root.join("src");
+        fs::create_dir_all(&toml_nested).unwrap();
+        fs::write(toml_root.join("swival.toml"), "").unwrap();
+        assert_eq!(swival_project_root(&toml_nested), toml_root);
+
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(swival_project_root(&plain), plain);
     }
 
     #[test]

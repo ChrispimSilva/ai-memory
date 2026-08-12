@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, Swival CLI, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -32,6 +32,12 @@ path (docker + Claude Code). This page covers everything else:
 
 The Docker image is published for `linux/amd64` and `linux/arm64`; Apple
 Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
+
+> **Podman.** The `bin/ai-memory` wrapper works with rootless podman, either
+> through the `podman-docker` `docker` shim or by pointing it at podman
+> directly with `AI_MEMORY_DOCKER=podman`. See
+> [SELinux-enforcing hosts](#selinux-enforcing-hosts) for how it detects the
+> engine's rootless and SELinux state.
 
 ---
 
@@ -1053,35 +1059,20 @@ docker run --rm akitaonrails/ai-memory:latest \
 docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client zed             --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
-
-docker run --rm akitaonrails/ai-memory:latest \
-    install-mcp --client swival          --auth-token "$TOKEN" \
-    --server-url "http://homelab:49374/mcp"
-
-docker run --rm akitaonrails/ai-memory:latest \
-    install-hooks --agent swival         --auth-token "$TOKEN" \
-    --server-url "http://homelab:49374"
 ```
 
-Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, OpenClaw, and Swival support both
+Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and OpenClaw support both
 `install-mcp` and `install-hooks`. Grok's `install-mcp --client grok` writes
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
 captures lifecycle events.
-`install-mcp --client swival` merges `.swival/mcp.json` in the current
-directory (Swival's documented default lookup); `install-hooks --agent swival`
-merges the single `lifecycle_command` into `~/.config/swival/config.toml` (or
-a project `swival.toml` via `--config-file`). Swival runs only
-`startup`/`exit` lifecycle events with positional args and no shell, so the
-installed command prefixes `env AI_MEMORY_HOOK_URL=…`.
 Grok ignores `SessionStart` stdout, so handoffs must be accepted through MCP with
 `memory_handoff_accept` when resuming. Claude Desktop, VS Code Copilot, and Zed
 are MCP-only here, so you'll need to nudge the model to call
 `memory_query` / `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
-for Grok's (and Zero's, and Swival's) no-stdout SessionStart behavior
-(Antigravity CLI uses `PreInvocation`).
+for Grok's (and Zero's) no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
 
 ---
 
@@ -1119,7 +1110,7 @@ docker run --rm akitaonrails/ai-memory:latest \
 ```
 
 The curl script installer supports
-`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi|swival`
+`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi`
 and `--to <dir>`; `--help` prints the full flag list. OpenCode,
 OpenClaw, OMP / Oh My Pi, and Pi do not need script extraction because
 `install-hooks` generates TypeScript plugin/extension files for them
@@ -1732,14 +1723,32 @@ URL as the generated agent config.
 #### SELinux-enforcing hosts
 
 On SELinux-enforcing Linux systems such as Fedora, RHEL, and openSUSE, normal
-home-directory labels can prevent the helper container from writing agent
+home-directory labels can prevent the helper container from reaching agent
 config even when its UID and GID match the host user. The wrapper checks both
-the host enforcement mode and Docker's advertised security options. For the
-short-lived helper commands that write host files (`install-*`, `setup-agent`,
-`uninstall`, and `backup`), it adds `--security-opt label=disable`; thin-client
-commands remain confined. This relaxes SELinux label confinement only for that
-trusted helper invocation. It does not modify the long-lived ai-memory server,
-which uses a Docker-managed named volume.
+the host enforcement mode and the engine's advertised security options. For the
+short-lived helper commands that touch host files (`install-*`, `setup-agent`,
+`uninstall`, `backup`, `restore`, and `bootstrap`), it adds `--security-opt
+label=disable`; thin-client commands remain confined when they use the named
+data volume and implicit configuration. An explicit `--config` path or a valid
+host-backed `AI_MEMORY_DATA_DIR` also activates the host-file treatment. This
+relaxes SELinux label confinement only for that trusted helper invocation. It
+does not modify the long-lived ai-memory server, which uses an engine-managed
+named volume.
+
+`bootstrap` is in that list even though it only *reads* host files: an
+unmapped UID and a confined label block reads just as hard, and the failure is
+misleading — it degrades silently to `no .git found at /work; bootstrapping
+from README/docs/rules only` before dying with `Permission denied (os error
+13)`.
+
+The two engines report these facts under different keys. Docker answers
+`docker info --format '{{.SecurityOptions}}'`; podman has no such field and
+fails that template, so the wrapper falls back to podman's
+`{{.Host.Security.Rootless}}` and `{{.Host.Security.SELinuxEnabled}}` when the
+Docker probe comes back empty. Rootless engines additionally need `-u 0:0`,
+because only container UID 0 maps back to the invoking host user — on rootless
+podman with SELinux enforcing, both adjustments are required and neither alone
+lets the write land.
 
 Do not add `:z` or `:Z` to the wrapper's whole `$HOME` bind. Docker's
 [bind-mount documentation](https://docs.docker.com/engine/storage/bind-mounts/#configure-the-selinux-label)

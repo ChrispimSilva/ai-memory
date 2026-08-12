@@ -34,8 +34,6 @@ pub enum ManagedHarness {
     Grok,
     /// Google Antigravity CLI (`agy`).
     Antigravity,
-    /// Swival CLI (local-first Python coding agent).
-    Swival,
 }
 
 impl ManagedHarness {
@@ -54,7 +52,6 @@ impl ManagedHarness {
             "kiro" | "kiro-cli" => Some(Self::Kiro),
             "grok" | "grok-build" => Some(Self::Grok),
             "antigravity" | "antigravity-cli" | "agy" => Some(Self::Antigravity),
-            "swival" => Some(Self::Swival),
             _ => None,
         }
     }
@@ -74,7 +71,6 @@ impl ManagedHarness {
             Self::Kiro | Self::KiroV3 => AgentKind::KiroCli,
             Self::Grok => AgentKind::Grok,
             Self::Antigravity => AgentKind::AntigravityCli,
-            Self::Swival => AgentKind::Swival,
         }
     }
 
@@ -99,7 +95,6 @@ impl ManagedHarness {
             Self::Kiro | Self::KiroV3 => "kiro-cli",
             Self::Grok => "grok",
             Self::Antigravity => "agy",
-            Self::Swival => "swival",
         }
     }
 
@@ -119,7 +114,6 @@ impl ManagedHarness {
             Self::KiroV3 => "kiro-v3",
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
-            Self::Swival => "swival",
         }
     }
 }
@@ -207,9 +201,6 @@ pub fn build_launch_plan(
     let session_dir = match harness {
         ManagedHarness::Pi | ManagedHarness::Omp => flag_path(&args, &["--session-dir"]),
         ManagedHarness::Crush => flag_path(&args, &["--data-dir", "-D"]),
-        // `--cache-dir` relocates the whole `.swival` store (HISTORY.md,
-        // continue.md, memory/, cache.db), so it is the session root.
-        ManagedHarness::Swival => flag_path(&args, &["--cache-dir"]),
         _ => None,
     }
     .or_else(|| environment_session_dir(harness));
@@ -339,10 +330,6 @@ pub fn build_launch_plan(
                     expected = Some(id.to_string());
                 }
             }
-            // Swival resumes implicitly from `.swival/HISTORY.md` + continue.md
-            // in the project directory and exposes no session selector, so
-            // nothing is injected; fresh sessions are discovered post-exit.
-            ManagedHarness::Swival => {}
         }
     }
 
@@ -378,8 +365,6 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         ManagedHarness::KiroV3 => None,
         ManagedHarness::Grok => Some("--yolo"),
         ManagedHarness::Antigravity => Some("--dangerously-skip-permissions"),
-        // Swival's own shorthand for `--files all --commands all`.
-        ManagedHarness::Swival => Some("--yolo"),
     };
     if let Some(flag) = flag {
         // Kimi's `--yolo` has hidden aliases (`--yes`, `--auto-approve`) and
@@ -428,11 +413,6 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
         // / `-i` is NOT: it seeds a prompt and then keeps the session open, so
         // it stays adoptable.
         ManagedHarness::Antigravity => has_flag(args, &["--print", "-p", "--prompt"]),
-        // A positional TASK (or reviewer/stdin mode) makes Swival run
-        // one-shot; only a request-free invocation keeps the interactive
-        // REPL. Flag values are indistinguishable from a task, so any
-        // argument fails closed toward the noninteractive side.
-        ManagedHarness::Swival => !args.is_empty(),
     }
 }
 
@@ -452,20 +432,6 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
         return LaunchMode::Passthrough;
     }
     if harness == ManagedHarness::CommandCode && has_flag(args, &["--list-models", "--ide-setup"]) {
-        return LaunchMode::Passthrough;
-    }
-    if harness == ManagedHarness::Swival
-        && has_flag(
-            args,
-            &[
-                "--init-config",
-                "--logout",
-                "--list-profiles",
-                "--serve",
-                "--acp",
-            ],
-        )
-    {
         return LaunchMode::Passthrough;
     }
     if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
@@ -700,7 +666,6 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "update",
         ]
         .as_slice(),
-        ManagedHarness::Swival => ["skills"].as_slice(),
     };
     let first = if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3) {
         kiro_root_subcommand(args)
@@ -796,9 +761,6 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
         // naming one; that is still an explicit user choice, so nothing may be
         // injected over it.
         ManagedHarness::Antigravity => has_flag(args, &["--conversation", "--continue", "-c"]),
-        // Swival exposes no resume/continue selector; it resumes implicitly
-        // from the project's `.swival/` store by cwd.
-        ManagedHarness::Swival => false,
     }
 }
 
@@ -831,7 +793,6 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         // A bare `--continue` names no conversation: the id is only known
         // after the fact, from the conversation store.
         ManagedHarness::Antigravity => flag_value(args, &["--conversation"]),
-        ManagedHarness::Swival => None,
     }
 }
 
@@ -944,9 +905,6 @@ fn environment_session_dir_with(
         ManagedHarness::Grok => value("GROK_HOME").map(|dir| dir.join("sessions")),
         // `agy` exposes no environment override for its conversation store.
         ManagedHarness::Antigravity => None,
-        // Swival's store is project-scoped under `.swival/` (the `--cache-dir`
-        // flag is the only relocation knob); no environment override exists.
-        ManagedHarness::Swival => None,
     }
 }
 
@@ -1849,112 +1807,6 @@ mod tests {
             plan.expected_session_id.as_deref(),
             Some("a0d5ac62-2501-4780-b783-76d159c56cb3")
         );
-    }
-
-    #[test]
-    fn swival_names_parse_to_one_variant() {
-        assert_eq!(
-            ManagedHarness::from_name("swival"),
-            Some(ManagedHarness::Swival)
-        );
-        assert_eq!(ManagedHarness::Swival.executable(), "swival");
-        assert_eq!(ManagedHarness::Swival.as_str(), "swival");
-        assert_eq!(ManagedHarness::Swival.agent_kind(), AgentKind::Swival);
-    }
-
-    /// Swival resumes implicitly from `.swival/` by cwd and exposes no
-    /// session selector, so neither a fresh nor a linked launch may rewrite
-    /// argv or claim an expected session id.
-    #[test]
-    fn swival_launch_never_injects_a_selector() {
-        for (linked, native) in [
-            (
-                None,
-                vec![OsString::from("--profile"), OsString::from("default")],
-            ),
-            (
-                Some("HISTORY"),
-                vec![OsString::from("--model"), OsString::from("code-35b")],
-            ),
-        ] {
-            let plan =
-                build_launch_plan(ManagedHarness::Swival, None, native.clone(), linked).unwrap();
-            assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
-            assert_eq!(plan.expected_session_id, None);
-            assert_eq!(plan.mode, LaunchMode::Session);
-            assert_eq!(plan.session_dir, None);
-        }
-    }
-
-    #[test]
-    fn swival_cache_dir_flag_relocates_the_session_store() {
-        let plan = build_launch_plan(
-            ManagedHarness::Swival,
-            None,
-            vec![
-                OsString::from("--cache-dir"),
-                OsString::from("/stores/swival"),
-            ],
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            plan.session_dir.as_deref(),
-            Some(std::path::Path::new("/stores/swival"))
-        );
-    }
-
-    #[test]
-    fn swival_yolo_maps_to_its_own_flag() {
-        let mut args = Vec::new();
-        apply_yolo(ManagedHarness::Swival, &mut args);
-        assert_eq!(strings(&args), ["--yolo"]);
-        // The user's own `--yolo` (or its `--files all` expansion) is not
-        // duplicated.
-        let mut explicit = vec![OsString::from("--yolo")];
-        apply_yolo(ManagedHarness::Swival, &mut explicit);
-        assert_eq!(strings(&explicit), ["--yolo"]);
-    }
-
-    #[test]
-    fn swival_utility_subcommands_are_passthrough() {
-        for native in [
-            vec![OsString::from("--init-config")],
-            vec![OsString::from("--logout")],
-            vec![OsString::from("--list-profiles")],
-            vec![OsString::from("--serve")],
-            vec![OsString::from("--acp")],
-            vec![OsString::from("skills"), OsString::from("list")],
-            vec![OsString::from("--version")],
-        ] {
-            assert_eq!(
-                build_launch_plan(ManagedHarness::Swival, None, native.clone(), None)
-                    .unwrap()
-                    .mode,
-                LaunchMode::Passthrough,
-                "{native:?} must be passthrough"
-            );
-        }
-    }
-
-    #[test]
-    fn swival_oneshot_task_is_noninteractive_but_session_bearing() {
-        // A positional TASK runs one-shot, so the adoption prompt must not
-        // appear, yet the run is still a session (not a utility).
-        let plan = build_launch_plan(
-            ManagedHarness::Swival,
-            None,
-            vec![OsString::from("refactor auth")],
-            None,
-        )
-        .unwrap();
-        assert_eq!(plan.mode, LaunchMode::Session);
-        assert!(!allows_native_session_adoption(
-            ManagedHarness::Swival,
-            &plan.args
-        ));
-        // A request-free launch keeps the interactive REPL and is adoptable.
-        assert!(allows_native_session_adoption(ManagedHarness::Swival, &[]));
     }
 
     #[test]

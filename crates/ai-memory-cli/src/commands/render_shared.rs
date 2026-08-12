@@ -1233,11 +1233,14 @@ fn hook_command(
 ) -> String {
     match context.platform {
         HookCommandPlatform::Posix => {
-            format!(
-                "{}{}",
-                env_var_prefix(server_url, auth_token, context.project_strategy),
-                shell_quote(&script.to_string_lossy())
-            )
+            let mut prefix = format!("AI_MEMORY_HOOK_URL={} ", shell_quote(server_url));
+            if let Some(t) = auth_token {
+                prefix.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(t)));
+            }
+            if let Some(s) = context.project_strategy {
+                prefix.push_str(&format!("AI_MEMORY_PROJECT_STRATEGY={} ", shell_quote(s)));
+            }
+            format!("{prefix}{}", shell_quote(&script.to_string_lossy()))
         }
         HookCommandPlatform::Windows => {
             // Hook runners launch this child with redirected streams. Force
@@ -1268,11 +1271,14 @@ fn hook_command(
         }
         HookCommandPlatform::WindowsBash => {
             let bash_path = to_git_bash_path(&script.to_string_lossy());
-            let inner = format!(
-                "{}{}",
-                env_var_prefix(server_url, auth_token, context.project_strategy),
-                shell_quote(&bash_path)
-            );
+            let mut inner = format!("AI_MEMORY_HOOK_URL={} ", shell_quote(server_url));
+            if let Some(t) = auth_token {
+                inner.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(t)));
+            }
+            if let Some(s) = context.project_strategy {
+                inner.push_str(&format!("AI_MEMORY_PROJECT_STRATEGY={} ", shell_quote(s)));
+            }
+            inner.push_str(&shell_quote(&bash_path));
             format!("bash -c {}", shell_quote(&inner))
         }
         HookCommandPlatform::WindowsNative => {
@@ -1463,66 +1469,15 @@ fn to_git_bash_path(path: &str) -> String {
 /// command path. Leaves only conservative shell-safe characters unquoted;
 /// wraps everything else in single quotes and escapes embedded `'` via
 /// `'\''`.
-pub(crate) fn shell_quote(s: &str) -> String {
+fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| {
         c.is_ascii_alphanumeric()
             || matches!(c, '-' | '_' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ',')
     }) {
-        s.to_string()
-    } else {
-        let escaped = s.replace('\'', "'\\''");
-        format!("'{escaped}'")
+        return s.to_string();
     }
-}
-
-/// Build the `AI_MEMORY_HOOK_URL=… [AI_MEMORY_AUTH_TOKEN=…]` env-var prefix
-/// that POSIX hook commands pass the server URL and auth to the shim without
-/// a config file. Shared by the POSIX shell commands, the WindowsBash
-/// bridge, and Swival's no-shell `env`-prefixed lifecycle command (issue
-/// #385).
-fn env_var_prefix(
-    server_url: &str,
-    auth_token: Option<&str>,
-    project_strategy: Option<&str>,
-) -> String {
-    let mut prefix = format!("AI_MEMORY_HOOK_URL={} ", shell_quote(server_url));
-    if let Some(t) = auth_token {
-        prefix.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(t)));
-    }
-    if let Some(s) = project_strategy {
-        prefix.push_str(&format!("AI_MEMORY_PROJECT_STRATEGY={} ", shell_quote(s)));
-    }
-    prefix
-}
-
-/// Print Swival's standard stdout-capture note (issue #385): Swival keeps
-/// lifecycle-hook stdout out of the model context, so capture works but
-/// handoff injection does not and handoffs are recovered via MCP.
-pub(crate) fn println_swival_handoff_note() {
-    println!("# NOTE: Swival captures hook stdout but never injects it into the model");
-    println!("#       context — capture works, but handoff injection does not. Recover");
-    println!("#       a prior session's handoff via the MCP `memory_handoff_accept` tool.");
-}
-
-/// Build Swival's `lifecycle_command` string (issue #385).
-///
-/// Swival invokes the hook as `shlex.split(command) + [event, base_dir]`
-/// with `cwd = base_dir` and its own `SWIVAL_*` env — no shell, no stdin.
-/// The `env VAR=… <script>` prefix survives that exec line because `env`
-/// is a real binary, which is how the hook learns the server URL / auth
-/// token (the `AI_MEMORY_HOOK_URL=… <script>` prefix used by Claude
-/// Code/Grok would be passed to the kernel as the program name and fail).
-pub(crate) fn build_swival_lifecycle_command(
-    script: &Path,
-    server_url: &str,
-    auth_token: Option<&str>,
-    project_strategy: Option<&str>,
-) -> String {
-    format!(
-        "env {}{}",
-        env_var_prefix(server_url, auth_token, project_strategy),
-        shell_quote(&script.to_string_lossy())
-    )
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }
 
 fn powershell_quote(s: &str) -> String {
@@ -2834,45 +2789,6 @@ $payload = [Console]::In.ReadToEnd()
         assert!(
             cmd.contains(r#"--project-strategy "repo-root""#),
             "windows-native must pass the strategy flag (double-quoted): {cmd}"
-        );
-    }
-
-    #[test]
-    fn swival_lifecycle_command_env_prefix_survives_shlex_split() {
-        // `env` is a real binary: the VAR=val prefix survives Python's
-        // shlex.split + subprocess exec (a plain `AI_MEMORY_HOOK_URL=…`
-        // prefix would be passed to exec as the program name and fail).
-        // shell_quote leaves ASCII-safe values unquoted — a URL and plain
-        // path are exec-able as-is; a secret with shell metacharacters
-        // (here `!`) must come back single-quoted.
-        let cmd = build_swival_lifecycle_command(
-            Path::new("/host/hooks/swival/lifecycle.sh"),
-            "http://127.0.0.1:49374",
-            Some("tok!secret"),
-            Some("repo-root"),
-        );
-        assert_eq!(
-            cmd,
-            "env AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 \
-             AI_MEMORY_AUTH_TOKEN='tok!secret' AI_MEMORY_PROJECT_STRATEGY=repo-root \
-             /host/hooks/swival/lifecycle.sh"
-        );
-        // shlex.split strips the single quotes and yields exactly the
-        // `env` + VAR=val + script tokens — pinned by the full-string
-        // equality above; no shell is involved in the exec.
-    }
-
-    #[test]
-    fn swival_lifecycle_command_omits_optional_parts() {
-        let cmd = build_swival_lifecycle_command(
-            Path::new("/x/lifecycle.sh"),
-            "http://127.0.0.1:49374",
-            None,
-            None,
-        );
-        assert_eq!(
-            cmd,
-            "env AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /x/lifecycle.sh"
         );
     }
 

@@ -2,7 +2,7 @@
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
 between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
-CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, and Swival CLI. Direct agent launches
+CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
@@ -42,7 +42,7 @@ file, and the current checkout remain authoritative.
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh]
-              [claude|codex|opencode|pi|crush|omp|kimi|command-code|kiro|grok|antigravity|swival]
+              [claude|codex|opencode|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
 
@@ -130,7 +130,7 @@ takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
 another harness merely because that file has a later timestamp. Kiro's v2 and
 v3 candidates share one server agent identity, but the selected native engine
-flavor remains exact. OMP, Grok, Antigravity, and Swival remain available explicitly
+flavor remains exact. OMP, Grok, and Antigravity remain available explicitly
 but are not in the automatic pool.
 
 Bare mode accepts wrapper options but not harness-native arguments or
@@ -238,7 +238,6 @@ is labelled completed evidence and must never be replayed as a pending call.
 | OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
-| Swival CLI | native default creation | none (resumes implicitly by cwd) | `<checkout>/.swival/HISTORY.md` (or `--cache-dir`) metadata plus lifecycle-hook capture |
 
 Command Code v3 transcripts are self-describing and append-only. The adapter
 requires the UUID filename, header id, and canonical header `cwd` to agree
@@ -277,9 +276,8 @@ the harness's native dangerous mode. The translation is Claude Code
 `--dangerously-bypass-approvals-and-sandbox`, OpenCode `--auto`, Pi `--approve`,
 Crush `--yolo`, Kimi Code `--yolo`, Command Code `--yolo`, Kiro CLI v2
 `--trust-all-tools`, Grok Build CLI `--yolo` (equivalent to its
-`--always-approve` option), Antigravity CLI
-`--dangerously-skip-permissions`, and Swival CLI `--yolo`
-(its own shorthand for `--files all --commands all`). Kiro v3 replaced the trust-all flag with
+`--always-approve` option), and Antigravity CLI
+`--dangerously-skip-permissions`. Kiro v3 replaced the trust-all flag with
 `permissions.yaml`, so ai-memory prints a notice and adds no unverified flag.
 OMP currently needs no added flag. ai-memory does not add a duplicate when the
 translated native flag is already present.
@@ -405,22 +403,6 @@ ledger for this harness comes from lifecycle-hook capture, and transcript export
 fails with a message saying so. The managed launcher accepts `antigravity`,
 `antigravity-cli`, and `agy`. The native contract was verified against
 Antigravity CLI v1.1.7. Antigravity is not part of the no-argument
-auto-detection set; name it explicitly.
-
-Swival keeps its whole store in `<checkout>/.swival/` (relocatable with
-`--cache-dir`), and the fixed rollup stem `HISTORY.md` doubles as the native
-session id. Discovery and listing therefore read one file under the current
-checkout, and other checkouts never leak into the chooser. Swival accepts no
-caller-chosen id and has no resume selector, so a fresh launch injects nothing
-and the session is linked by the hooks or discovered after exit. `--yolo` maps
-to Swival's own `--files all --commands all` shorthand, and utility invocations
-(`--init-config`, `--logout`, `--list-profiles`, `--version`, `skills`,
-`--serve`, `--acp`) pass through untouched. HISTORY.md is a rolling
-transcript-free rollup, so ai-memory does not decode conversation text: the
-visible-event ledger for this harness comes from lifecycle-hook capture, and
-transcript export fails with a message saying so. A positional task makes the
-launch non-interactive; an empty invocation starts Swival's REPL. The managed
-launcher accepts `swival`. Swival is not part of the no-argument
 auto-detection set; name it explicitly.
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
