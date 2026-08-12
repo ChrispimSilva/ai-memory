@@ -43,8 +43,8 @@ pub use decay::{
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary, PurgeSummary,
-    ReorgSummary,
+    DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, LifecycleOnlyEndOutcome,
+    MoveSummary, PurgeSummary, ReorgSummary,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AutoImproveCandidateSession, BriefPageBody, BriefingPage,
@@ -5020,7 +5020,11 @@ mod tests {
         let first_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
         let accepted = store
             .writer
-            .accept_startup_context(Some(acceptance(first_handoff, None)), Some(run.run_id))
+            .accept_startup_context(
+                Some(acceptance(first_handoff, None)),
+                Some(run.run_id),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5042,7 +5046,11 @@ mod tests {
         let second_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
         let rejected = store
             .writer
-            .accept_startup_context(Some(acceptance(second_handoff, None)), Some(run.run_id))
+            .accept_startup_context(
+                Some(acceptance(second_handoff, None)),
+                Some(run.run_id),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5107,6 +5115,7 @@ mod tests {
             .accept_startup_context(
                 Some(acceptance(selected_auto, Some("/repo/api/src".into()))),
                 Some(run.run_id),
+                None,
             )
             .await
             .unwrap();

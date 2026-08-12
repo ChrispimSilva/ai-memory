@@ -618,11 +618,10 @@ where
         if agent_kind.session_start_injects_handoff() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
-            let native_session_qs = canonical_session_id
-                .as_deref()
-                .map_or_else(String::new, |session_id| {
-                    format!("&session_id={}", url_encode(session_id))
-                });
+            let native_session_qs = canonical_session_id.as_deref().map_or_else(
+                || session_qs.clone(),
+                |session_id| format!("&session_id={}", url_encode(session_id)),
+            );
             let handoff_url = format!(
                 "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
                 args.agent
@@ -1139,6 +1138,57 @@ mod tests {
             query_param(&entries[0].url, "cwd").is_some(),
             "{}",
             entries[0].url
+        );
+    }
+
+    #[tokio::test]
+    async fn devin_generated_session_id_reaches_startup_handoff_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "DEVIN-HANDOFF").await;
+        let mut args = devin_hook_args("session-start");
+        args.server_url = base;
+        let mut stdout = Vec::new();
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "source": "startup"
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded
+                .iter()
+                .any(|request| request.starts_with("POST /hook")),
+            "session start must be posted: {recorded:?}"
+        );
+        let get = recorded
+            .iter()
+            .find(|request| request.starts_with("GET /handoff?"))
+            .expect("startup handoff must be fetched");
+        let request_param = |request: &str| {
+            request
+                .split_whitespace()
+                .nth(1)
+                .and_then(|target| query_param(target, "session_id"))
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            request_param(get).as_deref(),
+            stored_session_id(&data_dir, AgentKind::Devin).as_deref(),
+            "the destructive startup claim must use the generated receiver id: {recorded:?}"
         );
     }
 

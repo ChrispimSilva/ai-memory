@@ -7483,8 +7483,8 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             "Devin session-start.sh must fetch handoff"
         );
         assert!(
-            script_content.contains("$SERVER/handoff?agent=devin${QS}"),
-            "Devin session-start.sh must use the registered /handoff endpoint with agent=devin"
+            script_content.contains("$SERVER/handoff?agent=devin${QS}${SID_QS}"),
+            "Devin session-start.sh must bind the handoff claim to its generated session id"
         );
         assert!(
             !script_content.contains("/handoff/latest"),
@@ -7498,6 +7498,27 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             script_content.contains("else\n    printf '{}\\n'\nfi"),
             "Devin session-start.sh must print {{}} only when no handoff is available"
         );
+    }
+
+    #[test]
+    fn startup_handoff_scripts_forward_native_session_ids() {
+        let hooks_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("hooks");
+        for agent in ["claude-code", "codex", "opencode", "cursor", "gemini-cli"] {
+            let script = fs::read_to_string(hooks_root.join(agent).join("session-start.sh"))
+                .unwrap()
+                .replace("\r\n", "\n");
+            assert!(
+                script.contains("SESSION_ID=$(ai_memory_extract_session_id \"$PAYLOAD\")"),
+                "{agent} must extract the native receiver session id"
+            );
+            assert!(
+                script.contains("${SESSION_QS}"),
+                "{agent} must forward the native receiver session id to /handoff"
+            );
+        }
     }
 
     #[test]

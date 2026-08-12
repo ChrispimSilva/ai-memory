@@ -35,6 +35,19 @@ pub enum IngestObservationOutcome {
     AlreadyComplete,
 }
 
+/// Result of conditionally ending a session whose persisted observations are
+/// all lifecycle boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleOnlyEndOutcome {
+    /// The session was still boundary-only inside the writer transaction.
+    Ended {
+        /// Startup handoff returned to the open pool, when one was claimed.
+        reopened_handoff: Option<HandoffId>,
+    },
+    /// Substantive work arrived before the atomic end check.
+    Substantive,
+}
+
 /// Summary returned by [`purge_project`] and exposed via
 /// [`crate::writer::WriterHandle::purge_project`].
 #[derive(Debug, Default, Clone)]
@@ -852,6 +865,38 @@ fn refresh_incoming_links_for_path(
 /// Begin (or re-affirm) a session row keyed on the caller-supplied id.
 /// Idempotent: a second call with the same id leaves the row untouched.
 pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult<()> {
+    begin_session_row(conn, session)
+}
+
+pub(crate) fn begin_session_in_transaction(
+    tx: &Transaction<'_>,
+    session: &NewSession,
+) -> StoreResult<()> {
+    begin_session_row(tx, session)?;
+    let matches_receiver: bool = tx.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM sessions \
+             WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+               AND agent_kind = ?4 AND actor_user IS ?5 \
+         )",
+        params![
+            session.id.as_bytes(),
+            session.workspace_id.as_bytes(),
+            session.project_id.as_bytes(),
+            session.agent_kind.as_str(),
+            session.actor_user.as_deref(),
+        ],
+        |row| row.get(0),
+    )?;
+    if !matches_receiver {
+        return Err(StoreError::InvalidState(
+            "startup receiver id belongs to a different scope, agent, or operator".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()> {
     validate_identity_storage_key(session.actor_user.as_deref(), "session owner")?;
     let now = Timestamp::now().as_microsecond();
     let agent = session.agent_kind.as_str();
@@ -885,6 +930,68 @@ pub fn end_session(
     summary_page_id: Option<&PageId>,
 ) -> StoreResult<()> {
     end_session_row(conn, session_id, summary_page_id)
+}
+
+/// Atomically end a lifecycle-only session and return its startup handoff to
+/// the open pool.
+///
+/// Only a handoff claimed by this exact receiver session is reopened. The
+/// compare-and-set protects a baton that has moved to any other state, while
+/// clearing all acceptance metadata makes a later claim indistinguishable
+/// from the original open row.
+pub fn end_lifecycle_only_session(
+    conn: &mut Connection,
+    session_id: &SessionId,
+) -> StoreResult<LifecycleOnlyEndOutcome> {
+    let tx = conn.transaction()?;
+    let has_substantive_observation: bool = tx.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM observations \
+             WHERE session_id = ?1 AND kind NOT IN ('session-start', 'session-end') \
+         )",
+        params![session_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    if has_substantive_observation {
+        return Ok(LifecycleOnlyEndOutcome::Substantive);
+    }
+    end_session_row(&tx, session_id, None)?;
+    let reopened: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = tx
+        .query_row(
+            "UPDATE handoffs \
+             SET state = 'open', accepted_by = NULL, accepted_at = NULL, \
+                 accepted_by_session = NULL, accepted_by_user = NULL \
+             WHERE id = ( \
+                 SELECT id FROM handoffs \
+                 WHERE state = 'accepted' AND accepted_by_session = ?1 \
+                 ORDER BY accepted_at DESC, created_at DESC LIMIT 1 \
+             ) AND state = 'accepted' AND accepted_by_session = ?1 \
+             RETURNING id, workspace_id, project_id",
+            params![session_id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let reopened = reopened
+        .map(|(id, workspace_id, project_id)| -> StoreResult<HandoffId> {
+            let handoff_id = HandoffId::from_slice(&id)?;
+            let workspace_id = WorkspaceId::from_slice(&workspace_id)?;
+            let project_id = ProjectId::from_slice(&project_id)?;
+            audit(
+                &tx,
+                "release_lifecycle_only_handoff",
+                Some(workspace_id.as_bytes()),
+                Some(project_id.as_bytes()),
+                None,
+                None,
+                Timestamp::now().as_microsecond(),
+            )?;
+            Ok(handoff_id)
+        })
+        .transpose()?;
+    tx.commit()?;
+    Ok(LifecycleOnlyEndOutcome::Ended {
+        reopened_handoff: reopened,
+    })
 }
 
 fn end_session_row(
@@ -1712,6 +1819,51 @@ pub(crate) fn accept_handoff_in_transaction(
     let now = Timestamp::now().as_microsecond();
     let agent = accepting_agent.as_str();
     let session: Option<&[u8]> = accepting_session.as_ref().map(|s| &s.as_bytes()[..]);
+    if let Some(accepting_session) = accepting_session {
+        let receiver: Option<(bool, bool)> = tx
+            .query_row(
+                "SELECT workspace_id = ?2 AND project_id = ?3 AND agent_kind = ?4, \
+                        ended_at IS NULL \
+                 FROM sessions WHERE id = ?1",
+                params![
+                    accepting_session.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    accepting_agent.as_str(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((matching_scope_and_agent, open)) = receiver else {
+            return Err(StoreError::InvalidState(
+                "handoff receiver session does not exist".into(),
+            ));
+        };
+        if !matching_scope_and_agent {
+            return Err(StoreError::InvalidState(
+                "handoff receiver session does not match the accepting scope and agent".into(),
+            ));
+        }
+        if !open {
+            return Err(StoreError::InvalidState(
+                "an ended session cannot accept a handoff".into(),
+            ));
+        }
+        let already_claimed: bool = tx.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM handoffs \
+                 WHERE state = 'accepted' AND accepted_by_session = ?1 \
+             )",
+            params![accepting_session.as_bytes()],
+            |row| row.get(0),
+        )?;
+        if already_claimed {
+            // SessionStart can be retried. One receiver must never consume a
+            // second baton, or an empty end could return only one and strand
+            // the first accepted row.
+            return Ok(false);
+        }
+    }
     let metadata = tx
         .query_row(
             "SELECT from_session_id IS NOT NULL, cwd, created_at, owner_user \
@@ -3514,6 +3666,179 @@ pub(crate) mod tests {
         // guard.)
         let second = accept_handoff(&mut conn, &handoff_acceptance(id, ws, proj));
         assert!(second.is_ok(), "double-accept must not error");
+    }
+
+    #[test]
+    fn lifecycle_only_receiver_releases_its_handoff_and_cannot_reclaim_after_end() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let receiver = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let new_handoff = || NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: Some("/repo".into()),
+            summary: "real pending work".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        };
+        let handoff_id = insert_handoff(&mut conn, &new_handoff()).unwrap();
+        let mut claim = handoff_acceptance(handoff_id, ws, proj);
+        claim.accepting_session = Some(receiver);
+        assert!(accept_handoff(&mut conn, &claim).unwrap());
+        let second_handoff = insert_handoff(&mut conn, &new_handoff()).unwrap();
+        let mut duplicate_start = handoff_acceptance(second_handoff, ws, proj);
+        duplicate_start.accepting_session = Some(receiver);
+        assert!(
+            !accept_handoff(&mut conn, &duplicate_start).unwrap(),
+            "a repeated SessionStart must not consume a second handoff"
+        );
+
+        assert_eq!(
+            end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
+            LifecycleOnlyEndOutcome::Ended {
+                reopened_handoff: Some(handoff_id)
+            }
+        );
+        let (state, accepted_by, accepted_at, accepted_session): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<Vec<u8>>,
+        ) = conn
+            .query_row(
+                "SELECT state, accepted_by, accepted_at, accepted_by_session \
+                 FROM handoffs WHERE id = ?1",
+                params![handoff_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "open");
+        assert!(accepted_by.is_none());
+        assert!(accepted_at.is_none());
+        assert!(accepted_session.is_none());
+        let (ended_at, summary_page): (Option<i64>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT ended_at, summary_page_id FROM sessions WHERE id = ?1",
+                params![receiver.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(ended_at.is_some());
+        assert!(summary_page.is_none());
+        assert_eq!(audit_row_for(&conn, "release_lifecycle_only_handoff").0, 1);
+        let second_state: String = conn
+            .query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                params![second_handoff.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_state, "open");
+
+        let next_handoff = insert_handoff(&mut conn, &new_handoff()).unwrap();
+        let mut stale_claim = handoff_acceptance(next_handoff, ws, proj);
+        stale_claim.accepting_session = Some(receiver);
+        let error = accept_handoff(&mut conn, &stale_claim)
+            .expect_err("an out-of-order startup fetch must not bind to an ended session");
+        assert!(matches!(error, StoreError::InvalidState(_)));
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                params![next_handoff.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "open");
+    }
+
+    #[test]
+    fn lifecycle_only_end_compare_and_set_yields_to_substantive_observation() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let receiver = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let handoff_id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "continue".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut claim = handoff_acceptance(handoff_id, ws, proj);
+        claim.accepting_session = Some(receiver);
+        assert!(accept_handoff(&mut conn, &claim).unwrap());
+        insert_observation(
+            &mut conn,
+            &NewObservation {
+                session_id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::PreToolUse,
+                extension: None,
+                source_event: None,
+                title: "Read".into(),
+                body: "README.md".into(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
+            LifecycleOnlyEndOutcome::Substantive
+        );
+        let ended_at: Option<i64> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![receiver.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ended_at.is_none());
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                params![handoff_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "accepted");
     }
 
     #[test]

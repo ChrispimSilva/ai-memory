@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expose a stable session identifier (#385).
 
 ### Fixed
+- Lifecycle-only sessions containing only `SessionStart` / `SessionEnd` now
+  close without generating an empty session page, fallback handoff, or LLM
+  consolidation job. Startup handoff claims are bound to the native receiver
+  session when clients expose one; if that receiver exits without substantive
+  work, the same transaction that ends it returns the accepted handoff to the
+  open pool. Tool-bearing zero-prompt sessions remain substantive. Shipped
+  Claude Code, Codex, OpenCode, Command Code, Kiro, Antigravity, Devin, Cursor,
+  Gemini CLI, and Kimi Code delivery paths forward their available session ids
+  so an empty receiver cannot permanently consume real work (#386).
 - The `bin/ai-memory` wrapper now detects rootless mode and SELinux under
   podman, so host-file commands stop failing with `Permission denied (os error
   13)` on podman-based distros. Both the `-u 0:0` remap and `--security-opt

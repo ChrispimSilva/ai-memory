@@ -25,8 +25,8 @@ use crate::auto_improve::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
-    self, DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary,
-    PurgeSummary, ReorgSummary,
+    self, DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome,
+    LifecycleOnlyEndOutcome, MoveSummary, PurgeSummary, ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -110,6 +110,10 @@ pub(crate) enum WriteCmd {
         summary_page_id: Option<PageId>,
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
+    },
+    EndLifecycleOnlySession {
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
     },
     SweepHollowProjects {
         min_age_days: u32,
@@ -378,6 +382,7 @@ pub(crate) enum WriteCmd {
     AcceptStartupContext {
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
+        receiving_session: Option<NewSession>,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
@@ -568,6 +573,24 @@ impl WriterHandle {
             session_id,
             summary_page_id,
             handoff,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically end a lifecycle-only session and reopen the handoff claimed
+    /// by that exact receiver, if one exists.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL/state errors.
+    pub async fn end_lifecycle_only_session(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<LifecycleOnlyEndOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndLifecycleOnlySession {
+            session_id,
             reply: tx,
         })
         .await?;
@@ -1510,11 +1533,13 @@ impl WriterHandle {
         &self,
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
+        receiving_session: Option<NewSession>,
     ) -> StoreResult<StartupContextAcceptance> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
             handoff,
             managed_run_id,
+            receiving_session,
             reply: tx,
         })
         .await?;
@@ -1676,6 +1701,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &handoff,
                 );
                 send_or_warn(reply, result, "end_session_with_handoff");
+            }
+            WriteCmd::EndLifecycleOnlySession { session_id, reply } => {
+                let result = ops::end_lifecycle_only_session(&mut conn, &session_id);
+                send_or_warn(reply, result, "end_lifecycle_only_session");
             }
             WriteCmd::SweepHollowProjects {
                 min_age_days,
@@ -2074,10 +2103,25 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::AcceptStartupContext {
                 handoff,
                 managed_run_id,
+                receiving_session,
                 reply,
             } => {
                 let result = (|| {
                     let tx = conn.transaction()?;
+                    if let Some(session) = &receiving_session {
+                        let matching_acceptance = handoff.as_ref().is_some_and(|acceptance| {
+                            acceptance.accepting_session == Some(session.id)
+                                && acceptance.workspace_id == session.workspace_id
+                                && acceptance.project_id == session.project_id
+                                && acceptance.accepting_agent == session.agent_kind
+                        });
+                        if !matching_acceptance {
+                            return Err(StoreError::InvalidState(
+                                "startup receiver session does not match its handoff claim".into(),
+                            ));
+                        }
+                        ops::begin_session_in_transaction(&tx, session)?;
+                    }
                     let managed_context_accepted = match managed_run_id {
                         Some(run_id) => {
                             crate::workstream::claim_context_in_transaction(&tx, run_id)?
