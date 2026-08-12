@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.0] - 2026-08-12
+
 ### Added
 - Added MCP-only Swival CLI support. `install-mcp --client swival --apply`
   merges ai-memory's native HTTP entry into the project-root
@@ -3126,7 +3128,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.25.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.26.0...HEAD
+[1.26.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.26.0
 [1.25.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.25.0
 [1.24.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.24.0
 [1.23.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.23.0
