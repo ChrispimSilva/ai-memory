@@ -547,8 +547,9 @@ The rendered hooks config looks like:
 - Antigravity CLI does not expose a true session-end hook. `Stop` records a
   stop observation only because it marks the end of one execution loop, not
   the conversation. After the final turn, run
-  `ai-memory finalize-session --agent antigravity-cli` to create the final
-  summary and automatic handoff and to queue opt-in SessionEnd consolidation.
+  `ai-memory finalize-session --agent antigravity-cli` to close the session and,
+  when it contains substantive events, create the final summary and automatic
+  handoff and queue opt-in SessionEnd consolidation.
 - `memory_handoff_begin` always creates an explicit manual handoff with no
   `from_session_id` and `from_agent = other`; it is project-wide for cwd
   matching but belongs to the creating operator by default. Pass `shared=true`

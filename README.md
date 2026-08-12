@@ -849,7 +849,11 @@ rule-based output. Add an LLM provider
 when you want LLM consolidation (on PreCompact, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
-Session end always writes a rule-based summary page + handoff either way.
+Substantive session ends always write a rule-based summary page + handoff either
+way. A session containing only `SessionStart` / `SessionEnd` boundaries is
+closed without a page, handoff, or provider job. When that empty session had
+accepted startup context, its session-bound handoff is returned to the open
+pool for the next receiver instead of being lost.
 When the session-end opt-in is enabled, provider work is durably queued after
 those deterministic writes and handled by one bounded server worker, so hook
 drain latency does not cancel it. Failed jobs retry with backoff and survive a

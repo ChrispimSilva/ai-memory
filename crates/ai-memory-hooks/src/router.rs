@@ -1183,9 +1183,9 @@ async fn fetch_and_accept_handoff(
     // session, so resolving it twice was harmless); the handoff is single-use
     // and had no second chance.
     let managed = fetch_managed_context(state, &query, agent).await?;
-    // `/handoff` has no session_id in the request — `per_session` mode
-    // therefore falls back to the single slot (graceful degradation),
-    // while `per_actor` keys by `user` alone.
+    // Keep the active-project key compatible with MCP transports: the native
+    // session id is carried separately below to bind a destructive handoff
+    // claim to its exact receiver.
     let actor_key = ai_memory_core::ActorKey {
         user: actor.as_ref().map(IdentityKey::storage_key),
         session_id: None,
@@ -1276,6 +1276,26 @@ async fn fetch_and_accept_handoff(
         }
         None => (None, None),
     };
+    let accepting_session = query
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(resolve_native_session_id);
+    let receiving_session = if handoff.is_some() {
+        match accepting_session {
+            Some(id) => Some(NewSession {
+                id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: agent,
+                cwd: query.cwd.as_deref().map(std::path::PathBuf::from),
+                actor_user: owner_stamp_for_event(state, actor.as_ref()).await,
+            }),
+            None => None,
+        }
+    } else {
+        None
+    };
     let acceptance = if handoff.is_some() || managed.is_some() {
         state
             .writer
@@ -1287,12 +1307,13 @@ async fn fetch_and_accept_handoff(
                         workspace_id: ws,
                         project_id: proj,
                         accepting_agent: agent,
-                        accepting_session: None,
+                        accepting_session,
                         accepting_user: actor.as_ref().map(IdentityKey::storage_key),
                         owner_filter,
                         receiving_cwd: query.cwd.clone(),
                     }),
                 managed.as_ref().map(|managed| managed.run_id),
+                receiving_session,
             )
             .await?
     } else {
@@ -2206,7 +2227,10 @@ async fn process(
                     Ok(None) => debug!("wiki clean during SessionEnd recovery"),
                     Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
                 }
-                enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
+                let observations = state.reader.observations_for_session(session_id).await?;
+                if !is_lifecycle_only_session(&observations) {
+                    enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
+                }
                 if let Some(key) = env.ingest_key {
                     let completed = state
                         .writer
@@ -2437,10 +2461,45 @@ async fn process(
         warn!(error = %e, "PreCompact/PostCompaction consolidation failed; continuing");
     }
 
-    // On SessionEnd, synthesize the summary page, end the session, and
-    // auto-create a handoff so the next agent can pick up.
+    // On SessionEnd, close boundary-only sessions without generated artifacts.
+    // Substantive sessions synthesize the summary page and auto-handoff below.
     if matches!(env.event, HookEvent::SessionEnd) {
-        let observations = state.reader.observations_for_session(session_id).await?;
+        let mut observations = state.reader.observations_for_session(session_id).await?;
+        if is_lifecycle_only_session(&observations) {
+            let outcome = state.writer.end_lifecycle_only_session(session_id).await?;
+            match outcome {
+                ai_memory_store::LifecycleOnlyEndOutcome::Ended { reopened_handoff } => {
+                    let commit_msg = format!(
+                        "lifecycle-only session {}",
+                        short_id(&session_id.to_string()),
+                    );
+                    match state.wiki.commit_all(&commit_msg) {
+                        Ok(Some(oid)) => debug!(commit = %oid, "lifecycle-only log auto-commit"),
+                        Ok(None) => debug!("wiki clean after lifecycle-only SessionEnd"),
+                        Err(e) => warn!(error = %e, "lifecycle-only log auto-commit failed"),
+                    }
+                    info!(
+                        session = %session_id,
+                        reopened_handoff = ?reopened_handoff,
+                        "lifecycle-only session ended without summary, handoff, or consolidation",
+                    );
+                    if let Some(key) = ingest_key {
+                        state.writer.complete_observation_ingest(proj, key).await?;
+                    }
+                    return Ok(());
+                }
+                ai_memory_store::LifecycleOnlyEndOutcome::Substantive => {
+                    observations = state.reader.observations_for_session(session_id).await?;
+                    debug!(
+                        session = %session_id,
+                        "substantive work raced lifecycle-only SessionEnd; using normal end path",
+                    );
+                    // The writer observed substantive work, so the refreshed
+                    // set cannot still satisfy the lifecycle-only predicate.
+                    debug_assert!(!is_lifecycle_only_session(&observations));
+                }
+            }
+        }
         let new_page = synthesize_session_page(ws, proj, session_id, &observations);
         let page_id = state
             .wiki
@@ -2609,19 +2668,29 @@ fn parse_session_owner(owner: Option<String>) -> anyhow::Result<Option<IdentityK
 
 fn resolve_session_id(env: &HookEnvelope) -> anyhow::Result<SessionId> {
     if let Some(raw) = &env.session_id {
-        // Accept either a UUID (canonical) or any string, hashing the
-        // latter to a deterministic UUID v5 so each agent's session id
-        // maps cleanly into our schema.
-        if let Ok(id) = SessionId::from_str(raw) {
-            return Ok(id);
-        }
-        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes());
-        return Ok(SessionId(uuid));
+        return Ok(resolve_native_session_id(raw));
     }
     if matches!(env.event, HookEvent::SessionStart) {
         return Ok(SessionId::new());
     }
     anyhow::bail!("hook payload missing session_id and event is not session-start")
+}
+
+fn resolve_native_session_id(raw: &str) -> SessionId {
+    // Accept either a UUID (canonical) or any string, hashing the latter to a
+    // deterministic UUID v5 so hook POSTs and startup GETs share one key.
+    SessionId::from_str(raw)
+        .unwrap_or_else(|_| SessionId(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
+}
+
+fn is_lifecycle_only_session(observations: &[ai_memory_core::Observation]) -> bool {
+    !observations.is_empty()
+        && observations.iter().all(|observation| {
+            matches!(
+                observation.kind,
+                ObservationKind::SessionStart | ObservationKind::SessionEnd
+            )
+        })
 }
 
 fn build_auto_handoff(
@@ -5952,11 +6021,8 @@ mod tests {
         );
     }
 
-    /// SessionEnd must always write the heuristic `sessions/<id>.md` page,
-    /// even with `consolidate_on_session_end` enabled but no LLM provider:
-    /// the opt-in LLM pass is additive and guarded by a present
-    /// `consolidator`, so flag-on + no-provider degrades to today's
-    /// deterministic behavior (issue #40 — no regression).
+    /// A substantive SessionEnd must write the heuristic `sessions/<id>.md`
+    /// page even with `consolidate_on_session_end` enabled but no LLM provider.
     #[tokio::test]
     async fn session_end_writes_heuristic_page_even_with_consolidate_flag_on() {
         let tmp = TempDir::new().unwrap();
@@ -5964,7 +6030,7 @@ mod tests {
         state.consolidate_on_session_end = true; // flag on; consolidator stays None
 
         let sid = "11111111-1111-1111-1111-111111111111";
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt-submit", "session-end"] {
             let env = HookEnvelope::from_query_and_body(
                 HookQuery {
                     event: event.into(),
@@ -5987,6 +6053,154 @@ mod tests {
                 .any(|p| p.path.as_str().starts_with("sessions/")),
             "SessionEnd must write a heuristic sessions/<id>.md page regardless of the flag; got {:?}",
             pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_only_session_ends_without_page_handoff_or_consolidation() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm,
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.consolidate_on_session_end = true;
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+        let sid = "12121212-1212-1212-1212-121212121212";
+        let fire = |event: &str, key: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ingest_key: key.map(str::to_string),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid }),
+            )
+        };
+
+        process(&state, fire("session-start", None), None, Vec::new())
+            .await
+            .unwrap();
+        process(
+            &state,
+            fire("session-end", Some("boundary-end")),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("session-end", Some("boundary-end")),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let pages = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .all(|page| !page.path.as_str().starts_with("sessions/"))
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            Some(sid.parse().unwrap())
+        );
+        let now = Timestamp::now().as_microsecond();
+        assert!(
+            state
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "lifecycle-only sessions must not enter provider recovery"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sid.parse().unwrap())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the completed keyed replay must not append another boundary event"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_bearing_session_without_prompt_still_writes_page_and_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "13131313-1313-1313-1313-131313131313";
+        for event in ["session-start", "pre-tool-use", "session-end"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "README.md"}
+                }),
+            );
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+
+        let pages = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|page| page.path.as_str().starts_with("sessions/"))
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "tool activity is substantive even without a user prompt"
         );
     }
 
@@ -6212,7 +6426,7 @@ mod tests {
         let state = make_state(&tmp).await;
         let run_id = ManagedRunId::new().to_string();
         let managed_session = SessionId::new();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             let envelope = HookEnvelope::from_query_and_body(
                 HookQuery {
                     event: event.into(),
@@ -6246,7 +6460,7 @@ mod tests {
         );
 
         let direct_session = SessionId::new();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             let envelope = HookEnvelope::from_query_and_body(
                 HookQuery {
                     event: event.into(),
@@ -6571,7 +6785,7 @@ mod tests {
         .await;
         let cwd = tmp.path().to_string_lossy().into_owned();
         let session = SessionId::new().to_string();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             process(
                 &state,
                 session_envelope(event, &session, &cwd),
@@ -6605,7 +6819,7 @@ mod tests {
         let default_state = make_state(&default_tmp).await;
         let default_cwd = default_tmp.path().to_string_lossy().into_owned();
         let default_session = SessionId::new().to_string();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             process(
                 &default_state,
                 session_envelope(event, &default_session, &default_cwd),
@@ -6650,7 +6864,7 @@ mod tests {
         );
         let cwd = tmp.path().to_string_lossy().into_owned();
         let session = SessionId::new().to_string();
-        for event in ["session-start", "session-end"] {
+        for event in ["session-start", "user-prompt", "session-end"] {
             process(
                 &state,
                 session_envelope(event, &session, &cwd),
@@ -6694,7 +6908,7 @@ mod tests {
             .await;
             let cwd = tmp.path().to_string_lossy().into_owned();
             let session = SessionId::new().to_string();
-            let items = ["session-start", "session-end"]
+            let items = ["session-start", "user-prompt", "session-end"]
                 .into_iter()
                 .map(|event| HookBatchItem {
                     url: format!(
@@ -7850,6 +8064,89 @@ mod tests {
                 .state,
             ai_memory_core::HandoffState::Accepted
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_only_receiver_returns_its_startup_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let handoff_id = state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "REAL-WORK-MARKER".into(),
+                open_questions: vec!["what remains?".into()],
+                next_steps: vec!["continue the real work".into()],
+                files_touched: vec!["src/main.rs".into()],
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let query = |session_id: &str| HandoffQuery {
+            agent: Some("codex".into()),
+            cwd: Some(cwd.clone()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            project_strategy: None,
+            briefing: None,
+            briefing_budget: None,
+            managed_run: None,
+            session_id: Some(session_id.into()),
+        };
+        let empty_sid = "empty-native-session";
+        let rendered = fetch_and_accept_handoff(&state, query(empty_sid), None, Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rendered.contains("REAL-WORK-MARKER"));
+        let accepted = state
+            .reader
+            .handoff_by_id(handoff_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted.accepted_by_session,
+            Some(resolve_native_session_id(empty_sid))
+        );
+
+        for event in ["session-start", "session-end"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    cwd: Some(cwd.clone()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": empty_sid, "cwd": cwd }),
+            );
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+
+        let reopened = state
+            .reader
+            .handoff_by_id(handoff_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.state, ai_memory_core::HandoffState::Open);
+        assert!(reopened.accepted_by.is_none());
+        assert!(reopened.accepted_at.is_none());
+        assert!(reopened.accepted_by_session.is_none());
+        let next =
+            fetch_and_accept_handoff(&state, query("next-substantive-session"), None, Vec::new())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(next.contains("REAL-WORK-MARKER"));
     }
 
     #[tokio::test]
