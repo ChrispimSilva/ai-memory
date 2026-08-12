@@ -512,6 +512,51 @@ fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
 }
 
 #[test]
+fn swival_mcp_install_and_uninstall_round_trip_from_nested_directory() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let nested = project.path().join("src").join("nested");
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let mcp = project.path().join(".swival/mcp.json");
+    write_file(&mcp, r#"{"mcpServers":{"other":{"command":"other-mcp"}}}"#);
+
+    let install = command_with_home(home.path())
+        .args(["install-mcp", "--client", "swival", "--apply"])
+        .current_dir(&nested)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(installed["mcpServers"]["ai-memory"]["type"], "http");
+    assert_eq!(
+        installed["mcpServers"]["other"]["command"], "other-mcp",
+        "install must preserve sibling servers"
+    );
+
+    let uninstall = run_uninstall(
+        &nested,
+        home.path(),
+        &["uninstall", "--apply", "--only", "mcp", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let removed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(removed["mcpServers"].get("ai-memory").is_none());
+    assert_eq!(removed["mcpServers"]["other"]["command"], "other-mcp");
+}
+
+#[test]
 fn uninstall_mcp_name_narrows_endpoint_match() {
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();
