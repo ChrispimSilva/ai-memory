@@ -406,15 +406,24 @@ USER_ARGS=(-u "$(id -u):$(id -g)")
 # (issue #107)
 RENDERS_HOST_CONFIG=0
 WRAPPER_SUBCOMMAND=""
+EXPLICIT_HOST_CONFIG=0
 WRAPPER_ARGS=("$@")
 idx=0
 while [ "${idx}" -lt "${#WRAPPER_ARGS[@]}" ]; do
   arg="${WRAPPER_ARGS[$idx]}"
   case "${arg}" in
-    --data-dir | --config)
+    --config)
+      EXPLICIT_HOST_CONFIG=1
       idx=$((idx + 2))
       ;;
-    --data-dir=* | --config=*)
+    --config=*)
+      EXPLICIT_HOST_CONFIG=1
+      idx=$((idx + 1))
+      ;;
+    --data-dir)
+      idx=$((idx + 2))
+      ;;
+    --data-dir=*)
       idx=$((idx + 1))
       ;;
     --*)
@@ -449,12 +458,23 @@ esac
 # cannot skip. So readers need the same treatment as writers.
 READS_HOST_FILES=0
 case "${WRAPPER_SUBCOMMAND}" in
-    bootstrap)
+    bootstrap | restore)
       READS_HOST_FILES=1
       ;;
 esac
+if [ "${EXPLICIT_HOST_CONFIG}" -eq 1 ]; then
+  READS_HOST_FILES=1
+fi
+# A custom data directory is a host bind at /data, so every command that opens
+# the store touches host files even when it would otherwise be a thin client.
+HOST_DATA_BIND=0
+if [ -n "${AI_MEMORY_DATA_DIR:-}" ] && [ -d "${AI_MEMORY_DATA_DIR}" ]; then
+  HOST_DATA_BIND=1
+fi
 TOUCHES_HOST_FILES=0
-if [ "${WRITES_HOST_FILES}" -eq 1 ] || [ "${READS_HOST_FILES}" -eq 1 ]; then
+if [ "${WRITES_HOST_FILES}" -eq 1 ] \
+  || [ "${READS_HOST_FILES}" -eq 1 ] \
+  || [ "${HOST_DATA_BIND}" -eq 1 ]; then
   TOUCHES_HOST_FILES=1
 fi
 
@@ -541,10 +561,10 @@ case "$(uname -s 2>/dev/null || true)" in
     # "Permission denied" in the rolling file appender.
     # Omitting -u lets the container run as its default (uid 1000)
     # which matches the volume owner. Keep the earlier rootless-Docker
-    # exception for commands that write host config: under rootless Docker,
+    # exception for commands that touch host binds: under rootless Docker,
     # UID 0 maps back to the invoking host user and is the only mapping that
-    # can write bind-mounted agent config reliably.
-    if ! { [ "${ROOTLESS_DOCKER}" -eq 1 ] && [ "${WRITES_HOST_FILES}" -eq 1 ]; }; then
+    # can access bind-mounted host files reliably.
+    if ! { [ "${ROOTLESS_DOCKER}" -eq 1 ] && [ "${TOUCHES_HOST_FILES}" -eq 1 ]; }; then
       USER_ARGS=()
     fi
     ;;
@@ -555,7 +575,7 @@ esac
 # same content the server sees. Bind-mount a host path if the user
 # overrode AI_MEMORY_DATA_DIR; otherwise use the named volume.
 DATA_ARGS=(-e "AI_MEMORY_DATA_DIR=/data")
-if [ -n "${AI_MEMORY_DATA_DIR:-}" ] && [ -d "${AI_MEMORY_DATA_DIR}" ]; then
+if [ "${HOST_DATA_BIND}" -eq 1 ]; then
   DATA_ARGS+=(-v "${AI_MEMORY_DATA_DIR}:/data")
 else
   DATA_ARGS+=(-v "${DATA_VOLUME}:/data")

@@ -1727,10 +1727,13 @@ home-directory labels can prevent the helper container from reaching agent
 config even when its UID and GID match the host user. The wrapper checks both
 the host enforcement mode and the engine's advertised security options. For the
 short-lived helper commands that touch host files (`install-*`, `setup-agent`,
-`uninstall`, `backup`, and `bootstrap`), it adds `--security-opt
-label=disable`; thin-client commands remain confined. This relaxes SELinux
-label confinement only for that trusted helper invocation. It does not modify
-the long-lived ai-memory server, which uses an engine-managed named volume.
+`uninstall`, `backup`, `restore`, and `bootstrap`), it adds `--security-opt
+label=disable`; thin-client commands remain confined when they use the named
+data volume and implicit configuration. An explicit `--config` path or a valid
+host-backed `AI_MEMORY_DATA_DIR` also activates the host-file treatment. This
+relaxes SELinux label confinement only for that trusted helper invocation. It
+does not modify the long-lived ai-memory server, which uses an engine-managed
+named volume.
 
 `bootstrap` is in that list even though it only *reads* host files: an
 unmapped UID and a confined label block reads just as hard, and the failure is

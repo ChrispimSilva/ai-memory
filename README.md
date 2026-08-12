@@ -578,7 +578,9 @@ one matching entry.
   or relabel `$HOME`; do not add `:z`/`:Z` to the whole home bind. Rootless
   engines also get `-u 0:0` for those commands. Docker and podman report
   rootless mode and SELinux support under different `info` keys; both are
-  read. See [`docs/install.md`](docs/install.md#selinux-enforcing-hosts).
+  read. The same treatment applies whenever `AI_MEMORY_DATA_DIR` selects a
+  host directory or an explicit `--config` reads a host file. See
+  [`docs/install.md`](docs/install.md#selinux-enforcing-hosts).
 - **Windows:** use the Linux path inside WSL2, or the native Windows wrapper
   from PowerShell/cmd. Local supported profiles default to host-native commands:
   Claude Code may use its supported `ai-memory.exe` exec form, while other

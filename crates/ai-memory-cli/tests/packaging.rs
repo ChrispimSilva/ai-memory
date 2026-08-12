@@ -1266,9 +1266,11 @@ fn rootless_docker_uses_root_uid_only_for_host_config_commands() {
         "install-instructions",
         "install-skills",
         // uninstall edits the same host agent-config files; backup writes
-        // its tarball to a host path — same bind mounts, same UID rule.
+        // its tarball to a host path, and restore reads one — same bind
+        // mounts, same UID rule.
         "uninstall",
         "backup",
+        "restore",
     ] {
         let args = run_wrapper_with_fake_docker(&[subcommand], rootless_info);
         assert!(
@@ -1344,6 +1346,7 @@ fn selinux_enforcing_disables_labels_only_for_host_file_commands() {
         "install-skills",
         "uninstall",
         "backup",
+        "restore",
     ] {
         let args = run_wrapper_with_fake_selinux(&[subcommand], selinux_info, "Enforcing");
         assert!(
@@ -1503,6 +1506,7 @@ fn podman_rootless_and_selinux_are_detected_without_the_docker_only_field() {
         "install-skills",
         "uninstall",
         "backup",
+        "restore",
     ] {
         let args = run_wrapper_with_fake_podman(&[subcommand], true, true, "Enforcing");
         assert!(
@@ -1567,6 +1571,56 @@ fn bootstrap_gets_host_file_treatment_because_it_reads_the_repo() {
     assert!(
         args.contains("--security-opt\nlabel=disable"),
         "the same read applies under Docker on an SELinux host; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_config_gets_host_file_treatment() {
+    let args = run_wrapper_with_fake_podman(
+        &["--config", "/tmp/config.toml", "status"],
+        true,
+        true,
+        "Enforcing",
+    );
+    assert!(
+        args.contains("-u\n0:0") && args.contains("--security-opt\nlabel=disable"),
+        "an explicit config is read through a host bind and needs both adjustments; got {args}"
+    );
+
+    let args = run_wrapper_with_fake_podman(
+        &["--config=/tmp/config.toml", "status"],
+        true,
+        true,
+        "Enforcing",
+    );
+    assert!(
+        args.contains("-u\n0:0") && args.contains("--security-opt\nlabel=disable"),
+        "the equals form of --config must receive the same treatment; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn custom_data_dir_makes_thin_commands_touch_host_files() {
+    let args = run_wrapper_with_fake_docker_env(
+        &["status"],
+        FakeInfo::Podman {
+            rootless: true,
+            selinux: true,
+        },
+        Some("Linux"),
+        None,
+        Some("Enforcing"),
+        &[("AI_MEMORY_DATA_DIR", "/tmp")],
+    );
+    assert!(
+        args.contains("-u\n0:0") && args.contains("--security-opt\nlabel=disable"),
+        "a thin command backed by a host data directory needs both adjustments; got {args}"
+    );
+    assert!(
+        args.contains("/tmp:/data"),
+        "the custom data directory must remain the /data bind; got {args}"
     );
 }
 
