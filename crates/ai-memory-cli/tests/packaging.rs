@@ -1011,6 +1011,20 @@ fn docker_wrapper_completions_preserve_helper_failure_without_partial_output() {
 // calls `docker info` *before* `docker run`, so this fake must dispatch on
 // $1: real stdout for `info` (read by the wrapper's `grep -q rootless`) vs.
 // logging argv to a file for `run` (read back by the test).
+// How the fake `docker` binary answers `docker info --format …`. The two
+// engines expose the same two facts under incompatible keys, and the wrapper
+// has to read both, so the fake has to be able to impersonate either one.
+#[cfg(unix)]
+enum FakeInfo<'a> {
+    // Docker: `{{.SecurityOptions}}` prints the security-options list.
+    Docker(&'a str),
+    // Podman, including the podman-docker `docker` shim: `.SecurityOptions`
+    // is not a field of its info report, so the template fails and the
+    // command exits non-zero with nothing on stdout. The equivalent facts
+    // live under `.Host.Security.*`.
+    Podman { rootless: bool, selinux: bool },
+}
+
 #[cfg(unix)]
 fn run_wrapper_with_fake_docker(args: &[&str], docker_info_stdout: &str) -> String {
     run_wrapper_with_fake_docker_and_uname(args, docker_info_stdout, None)
@@ -1024,7 +1038,7 @@ fn run_wrapper_with_fake_docker_and_claude_config(
 ) -> String {
     run_wrapper_with_fake_docker_env(
         args,
-        docker_info_stdout,
+        FakeInfo::Docker(docker_info_stdout),
         None,
         Some(claude_config_dir),
         None,
@@ -1038,7 +1052,14 @@ fn run_wrapper_with_fake_docker_and_forwarded_env(
     docker_info_stdout: &str,
     forwarded_env: &[(&str, &str)],
 ) -> String {
-    run_wrapper_with_fake_docker_env(args, docker_info_stdout, None, None, None, forwarded_env)
+    run_wrapper_with_fake_docker_env(
+        args,
+        FakeInfo::Docker(docker_info_stdout),
+        None,
+        None,
+        None,
+        forwarded_env,
+    )
 }
 
 // The wrapper also shells out to `id -u` / `id -g` when choosing its default
@@ -1054,7 +1075,14 @@ fn run_wrapper_with_fake_docker_and_uname(
     docker_info_stdout: &str,
     uname_stdout: Option<&str>,
 ) -> String {
-    run_wrapper_with_fake_docker_env(args, docker_info_stdout, uname_stdout, None, None, &[])
+    run_wrapper_with_fake_docker_env(
+        args,
+        FakeInfo::Docker(docker_info_stdout),
+        uname_stdout,
+        None,
+        None,
+        &[],
+    )
 }
 
 #[cfg(unix)]
@@ -1065,7 +1093,27 @@ fn run_wrapper_with_fake_selinux(
 ) -> String {
     run_wrapper_with_fake_docker_env(
         args,
-        docker_info_stdout,
+        FakeInfo::Docker(docker_info_stdout),
+        Some("Linux"),
+        None,
+        Some(selinux_mode),
+        &[],
+    )
+}
+
+// Rootless podman on an SELinux-enforcing host — the combination Fedora and
+// openSUSE ship by default, and the one where the Docker-only probe answers
+// nothing at all.
+#[cfg(unix)]
+fn run_wrapper_with_fake_podman(
+    args: &[&str],
+    rootless: bool,
+    selinux: bool,
+    selinux_mode: &str,
+) -> String {
+    run_wrapper_with_fake_docker_env(
+        args,
+        FakeInfo::Podman { rootless, selinux },
         Some("Linux"),
         None,
         Some(selinux_mode),
@@ -1076,7 +1124,7 @@ fn run_wrapper_with_fake_selinux(
 #[cfg(unix)]
 fn run_wrapper_with_fake_docker_env(
     args: &[&str],
-    docker_info_stdout: &str,
+    fake_info: FakeInfo<'_>,
     uname_stdout: Option<&str>,
     claude_config_dir: Option<&str>,
     selinux_mode: Option<&str>,
@@ -1088,14 +1136,27 @@ fn run_wrapper_with_fake_docker_env(
     let uname = tmp.path().join("uname");
     let id = tmp.path().join("id");
     let getenforce = tmp.path().join("getenforce");
+    let info_branch = match fake_info {
+        FakeInfo::Docker(stdout) => format!("  printf '%s\\n' '{stdout}'\n  exit 0\n"),
+        FakeInfo::Podman { rootless, selinux } => format!(
+            "  case \"$*\" in\n\
+            \x20   *Host.Security.Rootless*) printf '{rootless}\\n' ; exit 0 ;;\n\
+            \x20   *Host.Security.SELinuxEnabled*) printf '{selinux}\\n' ; exit 0 ;;\n\
+            \x20 esac\n\
+            \x20 printf '%s\\n' \"Error: template: info:1:2: executing \\\"info\\\" at \
+             <.SecurityOptions>: can't evaluate field SecurityOptions in \
+             type system.infoReport\" >&2\n\
+            \x20 exit 125\n"
+        ),
+    };
     std::fs::write(
         &docker,
         format!(
             "#!/usr/bin/env bash\n\
-             if [ \"$1\" = info ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\n\
+             if [ \"$1\" = info ]; then\n{}fi\n\
              if [ \"$1\" = run ]; then\n  shift\n  printf '%s\\n' \"$@\" > {}\n  exit 0\nfi\n\
              exit 0\n",
-            docker_info_stdout,
+            info_branch,
             shell_path(&docker_args)
         ),
     )
@@ -1205,9 +1266,11 @@ fn rootless_docker_uses_root_uid_only_for_host_config_commands() {
         "install-instructions",
         "install-skills",
         // uninstall edits the same host agent-config files; backup writes
-        // its tarball to a host path — same bind mounts, same UID rule.
+        // its tarball to a host path, and restore reads one — same bind
+        // mounts, same UID rule.
         "uninstall",
         "backup",
+        "restore",
     ] {
         let args = run_wrapper_with_fake_docker(&[subcommand], rootless_info);
         assert!(
@@ -1283,6 +1346,7 @@ fn selinux_enforcing_disables_labels_only_for_host_file_commands() {
         "install-skills",
         "uninstall",
         "backup",
+        "restore",
     ] {
         let args = run_wrapper_with_fake_selinux(&[subcommand], selinux_info, "Enforcing");
         assert!(
@@ -1425,6 +1489,139 @@ fn powershell_wrapper_forwards_subscription_oauth_tokens_without_putting_values_
             "PowerShell wrapper must not put the value of {name} in Docker argv"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn podman_rootless_and_selinux_are_detected_without_the_docker_only_field() {
+    // Podman answers nothing for `{{.SecurityOptions}}`, so both gates used to
+    // read as "rootful, no SELinux" and every host-file write died with
+    // Permission denied. Both adjustments are required: neither alone makes
+    // the write land.
+    for subcommand in [
+        "install-mcp",
+        "install-hooks",
+        "setup-agent",
+        "install-instructions",
+        "install-skills",
+        "uninstall",
+        "backup",
+        "restore",
+    ] {
+        let args = run_wrapper_with_fake_podman(&[subcommand], true, true, "Enforcing");
+        assert!(
+            args.contains("-u\n0:0"),
+            "{subcommand} needs the rootless UID remap under podman too; got {args}"
+        );
+        assert!(
+            args.contains("--security-opt\nlabel=disable"),
+            "{subcommand} needs the scoped SELinux exception under podman too; got {args}"
+        );
+    }
+
+    let args = run_wrapper_with_fake_podman(&["status"], true, true, "Enforcing");
+    assert!(
+        !args.contains("-u\n0:0") && !args.contains("label=disable"),
+        "thin-client commands touch only the named volume and must stay \
+         confined under podman as well; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn podman_gates_still_respect_engine_and_host_state() {
+    // The fallback reports what podman reports; it must not hard-code "yes".
+    let args = run_wrapper_with_fake_podman(&["install-mcp"], false, true, "Enforcing");
+    assert!(
+        !args.contains("-u\n0:0"),
+        "rootful podman maps the host UID directly and must keep it; got {args}"
+    );
+
+    let args = run_wrapper_with_fake_podman(&["install-mcp"], true, false, "Enforcing");
+    assert!(
+        !args.contains("label=disable"),
+        "an engine without SELinux support must not receive SELinux options; got {args}"
+    );
+
+    let args = run_wrapper_with_fake_podman(&["install-mcp"], true, true, "Permissive");
+    assert!(
+        !args.contains("label=disable"),
+        "permissive hosts do not need a label exception; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_gets_host_file_treatment_because_it_reads_the_repo() {
+    // bootstrap only reads host files, but an unmapped UID blocks reads just
+    // as hard: it degrades silently to "no .git found at /work" and then dies
+    // with Permission denied. Same gates as the writers, on both engines.
+    let args = run_wrapper_with_fake_podman(&["bootstrap"], true, true, "Enforcing");
+    assert!(
+        args.contains("-u\n0:0") && args.contains("--security-opt\nlabel=disable"),
+        "bootstrap reads the repo bind-mounted at /work and needs both \
+         adjustments; got {args}"
+    );
+
+    let args = run_wrapper_with_fake_selinux(
+        &["bootstrap"],
+        "[name=seccomp,profile=default name=selinux name=cgroupns]",
+        "Enforcing",
+    );
+    assert!(
+        args.contains("--security-opt\nlabel=disable"),
+        "the same read applies under Docker on an SELinux host; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_config_gets_host_file_treatment() {
+    let args = run_wrapper_with_fake_podman(
+        &["--config", "/tmp/config.toml", "status"],
+        true,
+        true,
+        "Enforcing",
+    );
+    assert!(
+        args.contains("-u\n0:0") && args.contains("--security-opt\nlabel=disable"),
+        "an explicit config is read through a host bind and needs both adjustments; got {args}"
+    );
+
+    let args = run_wrapper_with_fake_podman(
+        &["--config=/tmp/config.toml", "status"],
+        true,
+        true,
+        "Enforcing",
+    );
+    assert!(
+        args.contains("-u\n0:0") && args.contains("--security-opt\nlabel=disable"),
+        "the equals form of --config must receive the same treatment; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn custom_data_dir_makes_thin_commands_touch_host_files() {
+    let args = run_wrapper_with_fake_docker_env(
+        &["status"],
+        FakeInfo::Podman {
+            rootless: true,
+            selinux: true,
+        },
+        Some("Linux"),
+        None,
+        Some("Enforcing"),
+        &[("AI_MEMORY_DATA_DIR", "/tmp")],
+    );
+    assert!(
+        args.contains("-u\n0:0") && args.contains("--security-opt\nlabel=disable"),
+        "a thin command backed by a host data directory needs both adjustments; got {args}"
+    );
+    assert!(
+        args.contains("/tmp:/data"),
+        "the custom data directory must remain the /data bind; got {args}"
+    );
 }
 
 #[test]
