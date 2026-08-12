@@ -2391,17 +2391,26 @@ mod tests {
         let git_nested = git_root.join("a").join("b");
         fs::create_dir_all(git_root.join(".git")).unwrap();
         fs::create_dir_all(&git_nested).unwrap();
-        assert_eq!(swival_project_root(&git_nested), git_root);
+        assert_eq!(
+            swival_project_root(&git_nested),
+            fs::canonicalize(&git_root).unwrap()
+        );
 
         let toml_root = tmp.path().join("toml-project");
         let toml_nested = toml_root.join("src");
         fs::create_dir_all(&toml_nested).unwrap();
         fs::write(toml_root.join("swival.toml"), "").unwrap();
-        assert_eq!(swival_project_root(&toml_nested), toml_root);
+        assert_eq!(
+            swival_project_root(&toml_nested),
+            fs::canonicalize(&toml_root).unwrap()
+        );
 
         let plain = tmp.path().join("plain");
         fs::create_dir_all(&plain).unwrap();
-        assert_eq!(swival_project_root(&plain), plain);
+        assert_eq!(
+            swival_project_root(&plain),
+            fs::canonicalize(&plain).unwrap()
+        );
     }
 
     #[test]
