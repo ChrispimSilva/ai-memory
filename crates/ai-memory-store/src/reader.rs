@@ -5850,9 +5850,17 @@ impl ReaderPool {
 
             Ok(DerivedIndexStatus {
                 pages_rows: count(conn, "SELECT COUNT(*) FROM pages")?,
-                pages_fts_rows: count(conn, "SELECT COUNT(*) FROM pages_fts")?,
+                // `pages_fts` is an external-content FTS5 table, so
+                // `COUNT(*)` on it is answered from `pages` and can never
+                // diverge. The `_docsize` shadow table holds one row per
+                // indexed document, which is what makes this pair a drift
+                // check rather than a tautology. Same for `observations_fts`.
+                pages_fts_rows: count(conn, "SELECT COUNT(*) FROM pages_fts_docsize")?,
                 observations_rows: count(conn, "SELECT COUNT(*) FROM observations")?,
-                observations_fts_rows: count(conn, "SELECT COUNT(*) FROM observations_fts")?,
+                observations_fts_rows: count(
+                    conn,
+                    "SELECT COUNT(*) FROM observations_fts_docsize",
+                )?,
                 latest_pages_missing_embeddings: count(
                     conn,
                     "SELECT COUNT(*) \

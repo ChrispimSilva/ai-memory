@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The `pages_fts_rows` and `observations_fts_rows` status counters now count
+  indexed documents instead of content-table rows. Both FTS tables use external
+  content, so `SELECT COUNT(*)` against them was answered from `pages` /
+  `observations` and the `fts: N/M` health pair could never diverge, no matter
+  how far the index had drifted.
+
 ## [1.26.0] - 2026-08-12
 
 ### Added
