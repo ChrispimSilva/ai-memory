@@ -317,7 +317,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     assert_eq!(
         counts_after.pages_all as usize,
         FIXTURES.len(),
-        "soft-delete preserves the row (kept for 180d hard-delete window)",
+        "eviction preserves a tombstone for the hard-delete grace period",
     );
     let project_root = wiki.project_root(ws, proj);
     for fixture in FIXTURES {

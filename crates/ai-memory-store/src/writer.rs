@@ -979,7 +979,7 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Soft-delete the expected latest page identified by the forget sweep.
+    /// Tombstone the expected latest page identified by the forget sweep.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.

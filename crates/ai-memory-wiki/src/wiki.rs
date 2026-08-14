@@ -543,8 +543,8 @@ impl Wiki {
         .await
     }
 
-    /// Remove the authoritative file and soft-delete the expected latest page
-    /// as a decay tombstone. A stale candidate leaves both disk and store
+    /// Remove the authoritative file and tombstone the expected latest page.
+    /// A stale candidate leaves both disk and store
     /// untouched.
     ///
     /// # Errors

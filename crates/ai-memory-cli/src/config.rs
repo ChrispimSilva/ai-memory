@@ -55,7 +55,7 @@ pub struct DecaySettings {
     pub mu: f64,
     /// Default page salience.
     pub salience_default: f64,
-    /// Soft-delete threshold.
+    /// Wiki-backed eviction threshold.
     pub cold_threshold: f64,
     /// Grace period before permanently deleting an evicted version chain.
     pub hard_delete_after_days: i64,
