@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.1] - 2026-08-14
+
 ### Fixed
 - Forget-sweep decay now removes the authoritative Markdown file while
   conditionally tombstoning the selected page, preventing reconciliation from
@@ -3142,7 +3144,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.26.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.26.1...HEAD
+[1.26.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.26.1
 [1.26.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.26.0
 [1.25.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.25.0
 [1.24.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.24.0
