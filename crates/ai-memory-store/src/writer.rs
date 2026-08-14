@@ -207,14 +207,20 @@ pub(crate) enum WriteCmd {
         params: crate::decay::DecayParams,
         reply: oneshot::Sender<StoreResult<Option<(PageId, f64)>>>,
     },
-    SoftDeleteForDecay {
-        page_ids: Vec<PageId>,
-        reply: oneshot::Sender<StoreResult<usize>>,
-    },
-    HardDeleteDecayed {
+    SoftDeleteForDecayIfLatest {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
-        hard_delete_after_days: i64,
+        path: PagePath,
+        expected_latest_id: PageId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    HardDeleteDecayedPageChain {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        tombstone_id: PageId,
+        expected_latest_id: Option<PageId>,
+        cutoff_us: i64,
         reply: oneshot::Sender<StoreResult<usize>>,
     },
     HealCatchAllRepoPaths {
@@ -973,36 +979,53 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Soft-delete pages identified by the M8 forget sweep.
+    /// Soft-delete the expected latest page identified by the forget sweep.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn soft_delete_for_decay(&self, page_ids: Vec<PageId>) -> StoreResult<usize> {
+    pub async fn soft_delete_for_decay_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+    ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::SoftDeleteForDecay {
-            page_ids,
+        self.send(WriteCmd::SoftDeleteForDecayIfLatest {
+            workspace_id,
+            project_id,
+            path,
+            expected_latest_id,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Hard-delete pages in one workspace/project that were soft-deleted by
-    /// the sweep more than `hard_delete_after_days` ago.
+    /// Permanently delete one eligible decay tombstone and its ancestry chain.
+    /// The expected latest-page state is checked in the same transaction so a
+    /// page recreated at the same path cannot be removed accidentally.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn hard_delete_decayed(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hard_delete_decayed_page_chain(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
-        hard_delete_after_days: i64,
+        path: PagePath,
+        tombstone_id: PageId,
+        expected_latest_id: Option<PageId>,
+        cutoff_us: i64,
     ) -> StoreResult<usize> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::HardDeleteDecayed {
+        self.send(WriteCmd::HardDeleteDecayedPageChain {
             workspace_id,
             project_id,
-            hard_delete_after_days,
+            path,
+            tombstone_id,
+            expected_latest_id,
+            cutoff_us,
             reply: tx,
         })
         .await?;
@@ -1851,23 +1874,41 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::bump_client_activity(&mut conn, &entries);
                 send_or_warn(reply, result, "bump_client_activity");
             }
-            WriteCmd::SoftDeleteForDecay { page_ids, reply } => {
-                let result = ops::soft_delete_for_decay(&mut conn, &page_ids);
-                send_or_warn(reply, result, "soft_delete_for_decay");
-            }
-            WriteCmd::HardDeleteDecayed {
+            WriteCmd::SoftDeleteForDecayIfLatest {
                 workspace_id,
                 project_id,
-                hard_delete_after_days,
+                path,
+                expected_latest_id,
                 reply,
             } => {
-                let result = ops::hard_delete_decayed_pages(
+                let result = ops::soft_delete_for_decay_if_latest(
                     &mut conn,
                     workspace_id,
                     project_id,
-                    hard_delete_after_days,
+                    &path,
+                    expected_latest_id,
                 );
-                send_or_warn(reply, result, "hard_delete_decayed_pages");
+                send_or_warn(reply, result, "soft_delete_for_decay_if_latest");
+            }
+            WriteCmd::HardDeleteDecayedPageChain {
+                workspace_id,
+                project_id,
+                path,
+                tombstone_id,
+                expected_latest_id,
+                cutoff_us,
+                reply,
+            } => {
+                let result = ops::hard_delete_decayed_page_chain(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &path,
+                    tombstone_id,
+                    expected_latest_id,
+                    cutoff_us,
+                );
+                send_or_warn(reply, result, "hard_delete_decayed_page_chain");
             }
             WriteCmd::HealCatchAllRepoPaths { home, reply } => {
                 let result = ops::heal_catch_all_repo_paths(&mut conn, home.as_deref());

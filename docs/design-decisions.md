@@ -159,7 +159,7 @@ Three scheduled MCP operations:
 - **`memory_query`** (called by agent on demand): project-scoped FTS + lexical entity + graph retrieval, with optional vectors, RRF-fused before bounded authority and optional LLM reranking. Agentmemory's earlier triple-stream result motivated the fusion shape.
 - **`memory_lint`** (scheduled hourly + on session-end): scans for contradictions, orphan pages, broken links, stale claims, low-confidence + zero-reinforcement entries. Pure LLM with strict JSON output.
 
-Decay/forget runs as a separate `memory_forget_sweep` job: applies the retention formula; soft-deletes via `is_latest=false` + `superseded_at`; hard-deletes only after 180 days *and* zero accesses. Never silently destroys anything user-pinned.
+Decay/forget runs as a separate `memory_forget_sweep` job: applies the retention formula; removes the Markdown source while tombstoning via `is_latest=false` + `superseded_at`; then hard-deletes the tombstone's full version ancestry after the configured grace period. Lifetime access counters influence the retention score before eviction but do not block cleanup afterward. Never silently destroys anything user-pinned, and never path-deletes a newer recreation.
 
 Auto-improvement work stays separate from normal session consolidation. The
 reviewer notes and staged design are in
@@ -221,7 +221,7 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_read_page` | Read a full page body by exact path or top search hit | read-only |
 | `memory_delete_page` | Delete a single exact-path page with admission hooks | destructive |
 | `memory_feedback` | Record bounded page-quality feedback; adjust episodic retention and flag stale/wrong current versions for lint review | write |
-| `memory_forget_sweep` | Retention sweep (M8); soft-delete below cold threshold; `dry_run=true` previews | destructive |
+| `memory_forget_sweep` | Retention sweep (M8); wiki-backed eviction below cold threshold; `dry_run=true` previews | destructive |
 | `memory_lint` | Rule-based + optional LLM contradiction findings → `wiki/_lint/<date>.md` | destructive |
 | `memory_install_self_routing` | Returns the canonical slim CLAUDE.md / AGENTS.md routing block, managed Agent Skill payloads, target hints, and overwrite guidance | read-only |
 

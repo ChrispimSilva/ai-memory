@@ -732,4 +732,34 @@ mod tests {
             assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
         }
     }
+
+    #[test]
+    fn v48_to_v49_replaces_the_decay_tombstone_index_predicate() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 48).unwrap();
+
+        let before: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_pages_evicted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(before.contains("supersedes IS NULL"), "{before}");
+
+        run(&mut conn).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_pages_evicted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            after.contains("workspace_id, project_id, superseded_at"),
+            "{after}"
+        );
+        assert!(after.contains("superseded_at IS NOT NULL"), "{after}");
+        assert!(!after.contains("supersedes IS NULL"), "{after}");
+    }
 }

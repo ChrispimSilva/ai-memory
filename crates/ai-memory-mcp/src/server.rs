@@ -2280,8 +2280,8 @@ impl AiMemoryServer {
     #[tool(description = "Run the retention sweep: walk is_latest=1 \
         episodic pages, score them with the agentmemory-style retention \
         formula (salience * exp(-lambda * age) + sigma * log(1 + accesses) \
-        * exp(-mu * days_since_access)), and soft-delete those below the \
-        cold threshold. Semantic / procedural / pinned pages are exempt. \
+        * exp(-mu * days_since_access)), and evict those below the cold \
+        threshold through the wiki layer. Semantic / procedural / pinned pages are exempt. \
         Pass dry_run=true to preview.")]
     async fn memory_forget_sweep(
         &self,
