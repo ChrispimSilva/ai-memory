@@ -1129,6 +1129,13 @@ impl Wiki {
         project_id: ProjectId,
         path: PagePath,
     ) -> WikiResult<PageId> {
+        let abs = self.abs_path(workspace_id, project_id, &path);
+        if std::fs::symlink_metadata(&abs)?.file_type().is_symlink() {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "refusing to reindex symlinked page {}",
+                path.as_str()
+            ))));
+        }
         let md = self.read_page(workspace_id, project_id, &path)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
@@ -2905,6 +2912,63 @@ mod tests {
                 .await
                 .unwrap(),
             Some(page_id),
+        );
+    }
+
+    #[tokio::test]
+    async fn decay_cleanup_refuses_to_reindex_a_symlinked_recreation() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/symlink-decay.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "evicted body",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            wiki.evict_page_if_latest(ws, proj, &path, page_id, None)
+                .await
+                .unwrap()
+        );
+
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "outside secret must not be indexed").unwrap();
+        let linked = wiki.abs_path(ws, proj, &path);
+        if !create_test_symlink_file(&outside, &linked) {
+            return;
+        }
+
+        let error = wiki
+            .hard_delete_decay_tombstone(ws, proj, &path, page_id, i64::MAX)
+            .await
+            .expect_err("symlinked recreation must fail closed");
+        assert!(error.to_string().contains("symlinked page"), "{error}");
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside secret must not be indexed"
+        );
+        assert_eq!(
+            store
+                .reader
+                .decay_tombstones_before(ws, proj, i64::MAX)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "cleanup failure must leave the tombstone for a safe retry"
         );
     }
 
