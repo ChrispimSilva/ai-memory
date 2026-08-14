@@ -57,7 +57,7 @@ pub struct DecaySettings {
     pub salience_default: f64,
     /// Soft-delete threshold.
     pub cold_threshold: f64,
-    /// Delay before hard-deleting an untouched soft-deleted page.
+    /// Grace period before permanently deleting an evicted version chain.
     pub hard_delete_after_days: i64,
     /// Optional weight for the number of distinct authenticated readers.
     pub breadth_weight: f64,
@@ -175,8 +175,8 @@ pub struct Config {
     pub embedding_base_url: Option<String>,
     /// M8 retention-sweep parameters. The defaults give an ~80-day
     /// "survival floor" for unused episodic content (above the cold
-    /// threshold), followed by ~180 days of soft-delete buffer before
-    /// hard-deletion. Tune `decay.lambda` down to slow decay or
+    /// threshold), followed by ~180 days of tombstone grace before permanent
+    /// version-chain deletion. Tune `decay.lambda` down to slow decay or
     /// `decay.cold_threshold` to evict more / less aggressively.
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.

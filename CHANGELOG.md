@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Forget-sweep decay now removes the authoritative Markdown file while
+  conditionally tombstoning the selected page, preventing reconciliation from
+  resurrecting evicted content. Aged cleanup recognizes rewritten heads,
+  deletes their complete `supersedes` ancestry, ignores lifetime access counts,
+  and preserves a newer page recreated at the same path. The corrected scoped
+  tombstone index is added by a new migration rather than rewriting history
+  (#391).
 - The `pages_fts_rows` and `observations_fts_rows` status counters now count
   indexed documents instead of content-table rows. Both FTS tables use external
   content, so `SELECT COUNT(*)` against them was answered from `pages` /

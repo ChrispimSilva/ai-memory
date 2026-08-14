@@ -1442,38 +1442,52 @@ pub fn record_page_feedback(
     Ok(Some((page_id, next_salience)))
 }
 
-/// Mark a set of `is_latest=1` pages as soft-deleted by the forget
-/// sweep. Distinguished from M7 supersession by `supersedes IS NULL`.
-pub fn soft_delete_for_decay(conn: &mut Connection, page_ids: &[PageId]) -> StoreResult<usize> {
-    if page_ids.is_empty() {
-        return Ok(0);
-    }
+/// Mark the expected latest page as evicted by the forget sweep.
+///
+/// The full identity and latest-id check share one transaction so a stale
+/// sweep candidate cannot evict a page that was rewritten after selection.
+/// `superseded_at` is the decay-tombstone marker; unlike `supersedes`, it is
+/// never populated by ordinary page versioning.
+pub fn soft_delete_for_decay_if_latest(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    expected_latest_id: PageId,
+) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
-    let mut affected = 0usize;
     let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "UPDATE pages \
-             SET is_latest = 0, superseded_at = ?1 \
-             WHERE id = ?2 AND is_latest = 1",
-        )?;
-        for id in page_ids {
-            affected += stmt.execute(params![now, id.as_bytes()])?;
-        }
-    }
-    audit(
-        &tx,
-        "soft_delete_for_decay",
-        None,
-        None,
-        None,
-        // Decay sweep is a system op (scheduled / admin-triggered) — no
-        // user-attributable actor at the row level.
-        None,
-        Timestamp::now().as_microsecond(),
+    let affected = tx.execute(
+        "UPDATE pages \
+         SET is_latest = 0, superseded_at = ?1 \
+         WHERE id = ?2 \
+           AND workspace_id = ?3 \
+           AND project_id = ?4 \
+           AND path = ?5 \
+           AND is_latest = 1",
+        params![
+            now,
+            expected_latest_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            path.as_str(),
+        ],
     )?;
+    if affected != 0 {
+        audit(
+            &tx,
+            "soft_delete_for_decay",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            Some(expected_latest_id.as_bytes()),
+            // Decay is a scheduled/admin system operation rather than a
+            // user-attributable page edit.
+            None,
+            now,
+        )?;
+    }
     tx.commit()?;
-    Ok(affected)
+    Ok(affected != 0)
 }
 
 /// Delete every version of a page (by path) from the index. Used when the
@@ -1578,29 +1592,67 @@ fn delete_page_inner(
     Ok(rows > 0)
 }
 
-/// Hard-delete rows in one workspace/project that were soft-deleted by an
-/// earlier sweep at least `hard_delete_after_days` ago AND received zero
-/// subsequent accesses. Safe: M7 supersedes-chain pages have a non-null
-/// `supersedes` so they never match. Orphaned entity-index rows from those
-/// page deletions are removed in the same transaction.
-pub fn hard_delete_decayed_pages(
+/// Permanently delete one eligible decay tombstone and its ancestry chain.
+///
+/// The tombstone id, full path identity, cutoff, and current latest-page state
+/// are all rechecked in the transaction. This lets the wiki layer remove the
+/// authoritative file only when the path has no newer live page, while still
+/// allowing an old chain to be cleaned after that path was deliberately
+/// recreated. Ordinary supersession rows have `superseded_at IS NULL` and
+/// cannot become roots of this deletion.
+pub fn hard_delete_decayed_page_chain(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
-    hard_delete_after_days: i64,
+    path: &PagePath,
+    tombstone_id: PageId,
+    expected_latest_id: Option<PageId>,
+    cutoff_us: i64,
 ) -> StoreResult<usize> {
-    let cutoff = Timestamp::now().as_microsecond() - hard_delete_after_days * 86_400_000_000;
     let tx = conn.transaction()?;
+    let current_latest: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                path.as_str()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let expected_latest = expected_latest_id.map(|id| id.as_bytes().to_vec());
+    if current_latest != expected_latest {
+        return Ok(0);
+    }
     let n = tx.execute(
-        "DELETE FROM pages \
-         WHERE workspace_id = ?1 \
-           AND project_id = ?2 \
-           AND is_latest = 0 \
-           AND supersedes IS NULL \
-           AND superseded_at IS NOT NULL \
-           AND superseded_at < ?3 \
-           AND access_count = 0",
-        params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff],
+        "WITH RECURSIVE decay_chain(id) AS ( \
+             SELECT id FROM pages \
+             WHERE id = ?1 \
+               AND workspace_id = ?2 \
+               AND project_id = ?3 \
+               AND path = ?4 \
+               AND is_latest = 0 \
+               AND superseded_at IS NOT NULL \
+               AND superseded_at <= ?5 \
+             UNION \
+             SELECT parent.id \
+             FROM decay_chain c \
+             JOIN pages child ON child.id = c.id \
+             JOIN pages parent ON parent.id = child.supersedes \
+             WHERE parent.workspace_id = ?2 \
+               AND parent.project_id = ?3 \
+               AND parent.path = ?4 \
+         ) \
+         DELETE FROM pages WHERE id IN (SELECT id FROM decay_chain)",
+        params![
+            tombstone_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            path.as_str(),
+            cutoff_us,
+        ],
     )?;
     if n > 0 {
         tx.execute(
@@ -1610,6 +1662,15 @@ pub fn hard_delete_decayed_pages(
                    SELECT 1 FROM entity_page_links l WHERE l.entity_id = entities.id \
                )",
             params![workspace_id.as_bytes(), project_id.as_bytes()],
+        )?;
+        audit(
+            &tx,
+            "hard_delete_decayed",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            Some(tombstone_id.as_bytes()),
+            None,
+            Timestamp::now().as_microsecond(),
         )?;
     }
     tx.commit()?;

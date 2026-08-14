@@ -1134,7 +1134,7 @@ async fn run_scheduled_sweep_tick(
         {
             Ok(report) => {
                 outcome.candidates_evaluated += report.candidates_evaluated;
-                outcome.evicted += report.evicted.len();
+                outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
             }
@@ -2291,7 +2291,9 @@ mod tests {
     async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
         let ws = store
             .writer
             .get_or_create_workspace("default")
