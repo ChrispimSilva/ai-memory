@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indexed documents instead of content-table rows. Both FTS tables use external
   content, so `SELECT COUNT(*)` against them was answered from `pages` /
   `observations` and the `fts: N/M` health pair could never diverge, no matter
-  how far the index had drifted.
+  how far the index had drifted (#392).
 
 ## [1.26.0] - 2026-08-12
 
