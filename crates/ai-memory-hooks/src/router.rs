@@ -2034,18 +2034,9 @@ fn sticky_within_session_tree(
     event_cwd: Option<&str>,
     home_dir: Option<&str>,
 ) -> bool {
-    let Some(session_cwd) = session_cwd.filter(|s| !s.trim().is_empty()) else {
+    let Some(session_norm) = meaningful_session_anchor(session_cwd, home_dir) else {
         return false;
     };
-    let session_norm = normalize_project_path_key(session_cwd);
-    if session_norm == "/" {
-        return false;
-    }
-    if let Some(home) = home_dir
-        && normalize_project_path_key(home) == session_norm
-    {
-        return false;
-    }
     // A cwd-less event inside a known session still belongs to it — there
     // is no directory evidence to contradict the session (and per-event
     // resolution would only shrug it into the server default anyway).
@@ -2056,6 +2047,48 @@ fn sticky_within_session_tree(
     // Component-wise containment: "/a/b" contains "/a/b/c" but not
     // "/a/bc" (Path::starts_with is component-based, not string-based).
     std::path::Path::new(&event_norm).starts_with(std::path::Path::new(&session_norm))
+}
+
+/// The session-cwd anchor guards shared by both stickiness predicates:
+/// a session with no recorded cwd, or rooted at the filesystem root or
+/// the user's home, never sticks — a broad anchor would fold every
+/// project beneath it into one bucket (the #103 catch-all failure
+/// mode). Returns the normalized session cwd when it is a meaningful
+/// anchor.
+fn meaningful_session_anchor(session_cwd: Option<&str>, home_dir: Option<&str>) -> Option<String> {
+    let session_cwd = session_cwd.filter(|s| !s.trim().is_empty())?;
+    let session_norm = normalize_project_path_key(session_cwd);
+    if session_norm == "/" {
+        return None;
+    }
+    if let Some(home) = home_dir
+        && normalize_project_path_key(home) == session_norm
+    {
+        return None;
+    }
+    Some(session_norm)
+}
+
+/// Out-of-tree stickiness for `repo-root` deployments (issue #394).
+///
+/// Under `repo-root` the host-side hook resolves the repository root
+/// itself (a containerized server cannot see the client's checkout)
+/// and sends `project=<root name>`; a marker declares its project
+/// explicitly. An event reaching stickiness with NO override therefore
+/// has a cwd outside both — an agent scratch directory, `/tmp` — and
+/// per-event derivation could only mint a basename phantom
+/// (`scratchpad`, `data`, …), so the session stays the source of truth
+/// even out of its tree. Deliberate rescopes still win (overrides never
+/// reach stickiness), broad anchors still never stick, and the default
+/// `basename` strategy is untouched: "no override" carries no
+/// fell-through signal there.
+fn sticky_out_of_tree_under_repo_root(
+    session_cwd: Option<&str>,
+    home_dir: Option<&str>,
+    strategy: ProjectStrategy,
+) -> bool {
+    matches!(strategy, ProjectStrategy::RepoRoot)
+        && meaningful_session_anchor(session_cwd, home_dir).is_some()
 }
 
 async fn process_envelope(
@@ -2164,7 +2197,9 @@ async fn process(
     //   naming a project is a deliberate rescope, not drift.
     // - The event's cwd must sit INSIDE the session's own cwd subtree;
     //   `cd`-ing out of the session's tree (into a different project)
-    //   falls back to per-event resolution as before.
+    //   falls back to per-event resolution as before — except under
+    //   `repo-root`, where a no-override cwd is already proven outside
+    //   any repo and marker, so the session sticks instead (#394).
     // - A session rooted at a broad directory — the filesystem root or
     //   the user's home — never sticks, or a stray session started in
     //   `$HOME` would fold every project beneath it into one bucket
@@ -2179,6 +2214,10 @@ async fn process(
                     session_cwd.as_deref(),
                     env.cwd.as_deref(),
                     state.home_dir.as_deref(),
+                ) || sticky_out_of_tree_under_repo_root(
+                    session_cwd.as_deref(),
+                    state.home_dir.as_deref(),
+                    env.project_strategy,
                 )
             })
     } else {
@@ -3522,6 +3561,41 @@ mod tests {
         ));
     }
 
+    // Out-of-tree stickiness is scoped to `repo-root` and keeps the
+    // broad-anchor guards (issue #394).
+    #[test]
+    fn sticky_out_of_tree_gates_on_strategy_and_anchor() {
+        // repo-root + meaningful anchor: sticks regardless of the tree.
+        assert!(sticky_out_of_tree_under_repo_root(
+            Some("/a/b"),
+            Some("/home/user"),
+            ProjectStrategy::RepoRoot,
+        ));
+        // Default basename strategy: "no override" carries no
+        // fell-through signal there, so never.
+        assert!(!sticky_out_of_tree_under_repo_root(
+            Some("/a/b"),
+            Some("/home/user"),
+            ProjectStrategy::Basename,
+        ));
+        // Broad anchors still refuse: filesystem root, $HOME, missing.
+        assert!(!sticky_out_of_tree_under_repo_root(
+            Some("/"),
+            Some("/home/user"),
+            ProjectStrategy::RepoRoot,
+        ));
+        assert!(!sticky_out_of_tree_under_repo_root(
+            Some("/home/user"),
+            Some("/home/user"),
+            ProjectStrategy::RepoRoot,
+        ));
+        assert!(!sticky_out_of_tree_under_repo_root(
+            None,
+            Some("/home/user"),
+            ProjectStrategy::RepoRoot,
+        ));
+    }
+
     // Session-sticky attribution: a mid-session `cd subdir/` inside a
     // NON-GIT project must keep observations in the session's project.
     // This is the exact production failure behind the fragment cleanup:
@@ -3625,6 +3699,143 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "marker-file overrides must still rescope"
+        );
+    }
+
+    // Out-of-tree stickiness under `repo-root` (issue #394): agent
+    // harnesses give each session a scratch directory OUTSIDE the
+    // project tree (Claude Code:
+    // `/private/tmp/claude-<uid>/<project>/<session>/scratchpad`).
+    // Under `repo-root` the host-side hook resolves the repository
+    // root and sends `project=`; when it sends none, the cwd is
+    // outside any git repo and any marker, so per-event derivation
+    // would mint a phantom `scratchpad` project. The session must
+    // stick instead.
+    #[tokio::test]
+    async fn mid_session_out_of_tree_cwd_sticks_under_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "55555555-5555-5555-5555-555555555555";
+        let parent = tmp.path().join("my_project");
+        let scratch = tmp.path().join("agent-scratch").join("scratchpad");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fire = |event: &str, cwd: std::path::PathBuf| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    project_strategy: Some("repo-root".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd.to_string_lossy(),
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+
+        process(
+            &state,
+            fire("session-start", parent.clone()),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("post-tool-use", scratch.clone()),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let parent_proj = state
+            .reader
+            .find_project(state.workspace_id, "my_project".to_string())
+            .await
+            .unwrap()
+            .expect("parent project exists");
+        assert_eq!(
+            state
+                .reader
+                .find_project(state.workspace_id, "scratchpad".to_string())
+                .await
+                .unwrap(),
+            None,
+            "the out-of-tree event must not mint a phantom project"
+        );
+        let session_id: SessionId = sid.parse().unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations.iter().all(|o| o.project_id == parent_proj),
+            "every observation must carry the session's project"
+        );
+    }
+
+    // v1-semantics guard for the same fixture: under the default
+    // `basename` strategy the client never sends a derived project, so
+    // "no override" carries no fell-through signal — an out-of-tree
+    // cwd still resolves per event exactly as before.
+    #[tokio::test]
+    async fn mid_session_out_of_tree_cwd_still_resolves_per_event_under_basename() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "66666666-6666-6666-6666-666666666666";
+        let parent = tmp.path().join("my_project");
+        let scratch = tmp.path().join("agent-scratch").join("scratchpad");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fire = |event: &str, cwd: std::path::PathBuf| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd.to_string_lossy(),
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+
+        process(
+            &state,
+            fire("session-start", parent.clone()),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("post-tool-use", scratch.clone()),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state
+                .reader
+                .find_project(state.workspace_id, "scratchpad".to_string())
+                .await
+                .unwrap()
+                .is_some(),
+            "basename strategy keeps v1 per-event resolution"
         );
     }
 
