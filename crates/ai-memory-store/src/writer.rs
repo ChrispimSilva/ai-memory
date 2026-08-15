@@ -25,8 +25,8 @@ use crate::auto_improve::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
-    self, DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome,
-    LifecycleOnlyEndOutcome, MoveSummary, PurgeSummary, ReorgSummary,
+    self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSummary, PurgeSummary, ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -127,6 +127,28 @@ pub(crate) enum WriteCmd {
         obs: NewObservation,
         ingest_key: String,
         reply: oneshot::Sender<StoreResult<IngestObservationOutcome>>,
+    },
+    AdmitHookSessionEvent {
+        session: NewSession,
+        obs: NewObservation,
+        owner_filter: OwnerFilter,
+        ingest_key: Option<String>,
+        reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
+    },
+    EndAdmittedSession {
+        admitted: AdmittedSession,
+        summary_page_id: Option<PageId>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    EndAdmittedSessionWithHandoff {
+        admitted: AdmittedSession,
+        summary_page_id: Option<PageId>,
+        handoff: NewHandoff,
+        reply: oneshot::Sender<StoreResult<HandoffId>>,
+    },
+    EndAdmittedLifecycleOnlySession {
+        admitted: AdmittedSession,
+        reply: oneshot::Sender<StoreResult<LifecycleOnlyEndOutcome>>,
     },
     CompleteObservationIngest {
         project_id: ProjectId,
@@ -659,6 +681,74 @@ impl WriterHandle {
         self.send(WriteCmd::InsertObservationIngest {
             obs,
             ingest_key,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically validate/admit a hook session and insert its observation.
+    pub async fn admit_hook_session_event(
+        &self,
+        session: NewSession,
+        obs: Sanitized<NewObservation>,
+        owner_filter: OwnerFilter,
+        ingest_key: Option<String>,
+    ) -> StoreResult<HookSessionAdmission> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::AdmitHookSessionEvent {
+            session,
+            obs: obs.into_inner(),
+            owner_filter,
+            ingest_key,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Guarded hook end.
+    pub async fn end_admitted_session(
+        &self,
+        admitted: AdmittedSession,
+        summary_page_id: Option<PageId>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndAdmittedSession {
+            admitted,
+            summary_page_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Guarded hook end plus automatic handoff.
+    pub async fn end_admitted_session_with_handoff(
+        &self,
+        admitted: AdmittedSession,
+        summary_page_id: Option<PageId>,
+        handoff: NewHandoff,
+    ) -> StoreResult<HandoffId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndAdmittedSessionWithHandoff {
+            admitted,
+            summary_page_id,
+            handoff,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Guarded hook lifecycle-only end.
+    pub async fn end_admitted_lifecycle_only_session(
+        &self,
+        admitted: AdmittedSession,
+    ) -> StoreResult<LifecycleOnlyEndOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndAdmittedLifecycleOnlySession {
+            admitted,
             reply: tx,
         })
         .await?;
@@ -1747,6 +1837,49 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::insert_observation_keyed(&mut conn, &obs, &ingest_key);
                 send_or_warn(reply, result, "insert_observation_ingest");
+            }
+            WriteCmd::AdmitHookSessionEvent {
+                session,
+                obs,
+                owner_filter,
+                ingest_key,
+                reply,
+            } => {
+                let result = ops::admit_hook_session_event(
+                    &mut conn,
+                    &session,
+                    &obs,
+                    &owner_filter,
+                    ingest_key.as_deref(),
+                );
+                send_or_warn(reply, result, "admit_hook_session_event");
+            }
+            WriteCmd::EndAdmittedSession {
+                admitted,
+                summary_page_id,
+                reply,
+            } => {
+                let result =
+                    ops::end_admitted_session(&mut conn, &admitted, summary_page_id.as_ref());
+                send_or_warn(reply, result, "end_admitted_session");
+            }
+            WriteCmd::EndAdmittedSessionWithHandoff {
+                admitted,
+                summary_page_id,
+                handoff,
+                reply,
+            } => {
+                let result = ops::end_admitted_session_with_handoff(
+                    &mut conn,
+                    &admitted,
+                    summary_page_id.as_ref(),
+                    &handoff,
+                );
+                send_or_warn(reply, result, "end_admitted_session_with_handoff");
+            }
+            WriteCmd::EndAdmittedLifecycleOnlySession { admitted, reply } => {
+                let result = ops::end_admitted_lifecycle_only_session(&mut conn, &admitted);
+                send_or_warn(reply, result, "end_admitted_lifecycle_only_session");
             }
             WriteCmd::CompleteObservationIngest {
                 project_id,

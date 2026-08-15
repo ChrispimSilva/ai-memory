@@ -399,13 +399,17 @@ where
 }
 
 /// `[auth]` section of `config.toml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthSettings {
     /// Shared bearer token. When set, all HTTP routes require
     /// `Authorization: Bearer <token>`. Generate one with
     /// `ai-memory generate-auth-token`.
     pub bearer_token: Option<String>,
+    /// Mark the browser session cookie `Secure`. Enable this only when a
+    /// trusted reverse proxy terminates HTTPS for `/web`; direct HTTP browsers
+    /// deliberately will not send a Secure cookie.
+    pub secure_cookie: bool,
     /// Username attributed to writes authenticated by the bearer
     /// token (rung 1: "identified single-user"). When set, the
     /// auth middleware injects an
@@ -448,6 +452,31 @@ pub struct AuthSettings {
     ///
     /// Only set this when the server is reachable *only* through that proxy.
     pub actor_proxy_bearer_token: Option<String>,
+}
+
+impl std::fmt::Debug for AuthSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSettings")
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("secure_cookie", &self.secure_cookie)
+            .field("root_username", &self.root_username)
+            .field("root_issuer", &self.root_issuer)
+            .field("root_subject", &self.root_subject)
+            .field("root_email", &self.root_email)
+            .field("root_name", &self.root_name)
+            .field(
+                "token_pepper",
+                &self.token_pepper.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "actor_proxy_bearer_token",
+                &self.actor_proxy_bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// `[auto_scope]` — controls how the hook-published "currently active
@@ -1212,12 +1241,40 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn auth_settings_debug_redacts_secrets_in_auth_and_config() {
+        let auth = AuthSettings {
+            bearer_token: Some("bearer-secret-sentinel".into()),
+            root_username: Some("operator".into()),
+            token_pepper: Some("pepper-secret-sentinel".into()),
+            actor_proxy_bearer_token: Some("proxy-secret-sentinel".into()),
+            ..AuthSettings::default()
+        };
+        let config = Config {
+            auth: auth.clone(),
+            ..Config::default()
+        };
+
+        for rendered in [format!("{auth:?}"), format!("{config:?}")] {
+            assert!(rendered.contains("root_username: Some(\"operator\")"));
+            assert!(rendered.contains("<redacted>"));
+            for secret in [
+                "bearer-secret-sentinel",
+                "pepper-secret-sentinel",
+                "proxy-secret-sentinel",
+            ] {
+                assert!(!rendered.contains(secret), "Debug output exposed {secret}");
+            }
+        }
+    }
+
+    #[test]
     fn defaults_have_canonical_endings() {
         let cfg = Config::default();
         assert!(cfg.data_dir.ends_with("ai-memory"));
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.log_level, "info");
+        assert!(!cfg.auth.secure_cookie);
         assert!(cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
@@ -1440,6 +1497,9 @@ mod tests {
             hook_rate_per_sec = 7.5
             hook_rate_burst = 12.0
 
+            [auth]
+            secure_cookie = true
+
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
@@ -1491,6 +1551,7 @@ mod tests {
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.hook_rate_per_sec, 7.5);
         assert_eq!(cfg.hook_rate_burst, 12.0);
+        assert!(cfg.auth.secure_cookie);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
         assert!(cfg.auto_improve.scheduler.enabled);

@@ -61,8 +61,15 @@ docker run -d --name ai-memory \
 ```
 
 See [Security](../README.md#security) in the README for why
-`AI_MEMORY_AUTH_TOKEN` and `AI_MEMORY_ALLOWED_HOSTS` are both
-required for any non-loopback bind.
+`AI_MEMORY_AUTH_TOKEN` and `AI_MEMORY_ALLOWED_HOSTS` are both required for
+normal non-loopback binds. Bearer auth does not encrypt traffic: use the ready
+[Caddy](../docker/compose.tls.caddy.yml) or
+[Cloudflare Tunnel](../docker/compose.tls.cloudflared.yml) templates from the
+[HTTPS reverse-proxy guide](https-via-proxy.md) for LAN or remote access.
+When the proxy serves `/web` over HTTPS, also set
+`AI_MEMORY_AUTH__SECURE_COOKIE=true` in the server environment and close or
+redirect direct HTTP access to that hostname. Do not set it for direct HTTP:
+browsers then correctly withhold the session cookie.
 
 ### Client side (the laptop)
 
@@ -1703,8 +1710,10 @@ docker run -d --name ai-memory \
 
 Notice the bind: `127.0.0.1:49374`, not `0.0.0.0:49374`. This is the
 critical pairing - **no bearer token AND loopback only** is the only
-safe combination. The startup log will warn loudly if you bind to a
-LAN address without setting `AI_MEMORY_AUTH_TOKEN`.
+safe combination. The server refuses an unauthenticated LAN bind before it
+accepts requests. `--allow-insecure-no-auth` can override that refusal only
+for an intentional dangerous plain-HTTP deployment; prefer
+`AI_MEMORY_AUTH_TOKEN` or loopback instead.
 
 Then wire up the agent CLI. Both commands default to no auth and
 `http://127.0.0.1:49374` - no extra flags needed for the local case:

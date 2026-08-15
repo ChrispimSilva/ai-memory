@@ -35,6 +35,70 @@ pub enum IngestObservationOutcome {
     AlreadyComplete,
 }
 
+/// Unforgeable writer-issued session capability for hook follow-up mutations.
+#[derive(Clone, Debug)]
+pub struct AdmittedSession {
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    agent_kind: AgentKind,
+    owner: Option<String>,
+}
+impl AdmittedSession {
+    /// Persisted session identifier authorized by this guard.
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+    /// Persisted workspace identifier authorized by this guard.
+    pub fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+    /// Persisted project identifier authorized by this guard.
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+    /// Persisted agent kind authorized by this guard.
+    pub fn agent_kind(&self) -> AgentKind {
+        self.agent_kind
+    }
+    /// Persisted owner storage key, or `None` for a shared session.
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
+    }
+}
+
+/// Result of atomic hook admission.
+#[derive(Clone, Debug)]
+pub enum HookSessionAdmission {
+    /// An ordinary observation was admitted for this persisted session.
+    Observation {
+        /// Writer-issued guard for the persisted session.
+        session: AdmittedSession,
+        /// Result of claiming and inserting the observation.
+        ingest: IngestObservationOutcome,
+    },
+    /// A terminal event was admitted for a session that was still open.
+    EndOpen {
+        /// Writer-issued guard for the persisted session.
+        session: AdmittedSession,
+        /// Result of claiming and inserting the observation.
+        ingest: IngestObservationOutcome,
+    },
+    /// A terminal event was admitted after new observations followed an end.
+    ReEnd {
+        /// Writer-issued guard for the persisted session.
+        session: AdmittedSession,
+        /// Result of claiming and inserting the observation.
+        ingest: IngestObservationOutcome,
+    },
+    /// A terminal event was already fully represented by this persisted session.
+    AlreadyEnded {
+        /// Writer-issued guard for the persisted session.
+        session: AdmittedSession,
+    },
+    /// A terminal event named no persisted session and created nothing.
+    InvalidMissingEnd,
+}
 /// Result of conditionally ending a session whose persisted observations are
 /// all lifecycle boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -944,6 +1008,15 @@ pub fn end_lifecycle_only_session(
     session_id: &SessionId,
 ) -> StoreResult<LifecycleOnlyEndOutcome> {
     let tx = conn.transaction()?;
+    let outcome = end_lifecycle_only_session_in_tx(&tx, session_id)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+fn end_lifecycle_only_session_in_tx(
+    tx: &Transaction<'_>,
+    session_id: &SessionId,
+) -> StoreResult<LifecycleOnlyEndOutcome> {
     let has_substantive_observation: bool = tx.query_row(
         "SELECT EXISTS( \
              SELECT 1 FROM observations \
@@ -955,7 +1028,7 @@ pub fn end_lifecycle_only_session(
     if has_substantive_observation {
         return Ok(LifecycleOnlyEndOutcome::Substantive);
     }
-    end_session_row(&tx, session_id, None)?;
+    end_session_row(tx, session_id, None)?;
     let reopened: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = tx
         .query_row(
             "UPDATE handoffs \
@@ -977,7 +1050,7 @@ pub fn end_lifecycle_only_session(
             let workspace_id = WorkspaceId::from_slice(&workspace_id)?;
             let project_id = ProjectId::from_slice(&project_id)?;
             audit(
-                &tx,
+                tx,
                 "release_lifecycle_only_handoff",
                 Some(workspace_id.as_bytes()),
                 Some(project_id.as_bytes()),
@@ -988,7 +1061,6 @@ pub fn end_lifecycle_only_session(
             Ok(handoff_id)
         })
         .transpose()?;
-    tx.commit()?;
     Ok(LifecycleOnlyEndOutcome::Ended {
         reopened_handoff: reopened,
     })
@@ -1073,6 +1145,192 @@ pub fn insert_observation_keyed(
     let id = insert_observation_row(&tx, obs)?;
     tx.commit()?;
     Ok(IngestObservationOutcome::Inserted(id))
+}
+
+/// Find or create the hook session, validate its immutable tuple and owner,
+/// optionally claim an ingest key, and append the observation in one writer
+/// transaction. Validation always precedes key mutation.
+pub fn admit_hook_session_event(
+    conn: &mut Connection,
+    session: &NewSession,
+    obs: &NewObservation,
+    owner_filter: &OwnerFilter,
+    ingest_key: Option<&str>,
+) -> StoreResult<HookSessionAdmission> {
+    if obs.session_id != session.id
+        || obs.workspace_id != session.workspace_id
+        || obs.project_id != session.project_id
+    {
+        return Err(StoreError::InvalidState(
+            "hook observation does not match its session tuple".into(),
+        ));
+    }
+    let session_end = obs.kind == ObservationKind::SessionEnd;
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    type Row = (Vec<u8>, Vec<u8>, String, Option<String>, Option<i64>, u64);
+    let existing: Option<Row> = tx.query_row(
+        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count FROM sessions WHERE id = ?1",
+        params![session.id.as_bytes()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    ).optional()?;
+    let (owner, ended_at, ended_count) = match existing {
+        Some((ws, project, agent, owner, ended_at, ended_count)) => {
+            // Corrupt owners fail closed, including for Any recovery.
+            if owner
+                .as_deref()
+                .is_some_and(|value| IdentityKey::from_storage_key(value).is_none())
+                || ws.as_slice() != session.workspace_id.as_bytes()
+                || project.as_slice() != session.project_id.as_bytes()
+                || agent != session.agent_kind.as_str()
+                || !owner_filter.admits(owner.as_deref())
+            {
+                return Err(StoreError::SessionCollision);
+            }
+            (owner, ended_at, ended_count)
+        }
+        None if session_end => {
+            tx.commit()?;
+            return Ok(HookSessionAdmission::InvalidMissingEnd);
+        }
+        None => {
+            validate_identity_storage_key(session.actor_user.as_deref(), "session owner")?;
+            if !owner_filter.admits(session.actor_user.as_deref()) {
+                return Err(StoreError::SessionCollision);
+            }
+            tx.execute(
+                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), now, session.actor_user.as_deref()],
+            )?;
+            (session.actor_user.clone(), None, 0)
+        }
+    };
+    let guard = AdmittedSession {
+        session_id: session.id,
+        workspace_id: session.workspace_id,
+        project_id: session.project_id,
+        agent_kind: session.agent_kind,
+        owner,
+    };
+    if session_end && ended_at.is_some() {
+        let count: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+            params![session.id.as_bytes()],
+            |r| r.get(0),
+        )?;
+        if count <= ended_count {
+            tx.commit()?;
+            return Ok(HookSessionAdmission::AlreadyEnded { session: guard });
+        }
+    }
+    let ingest = if let Some(key) = ingest_key {
+        tx.execute(
+            "DELETE FROM ingest_keys WHERE seen_at < ?1",
+            params![now - INGEST_KEY_TTL_MICROS],
+        )?;
+        let old: Option<Option<i64>> = tx
+            .query_row(
+                "SELECT completed_at FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
+                params![obs.project_id.as_bytes(), key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match old {
+            Some(done) => {
+                if done.is_some() {
+                    IngestObservationOutcome::AlreadyComplete
+                } else {
+                    IngestObservationOutcome::ResumePending
+                }
+            }
+            None => {
+                tx.execute("INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) VALUES (?1, ?2, ?3, NULL)", params![obs.project_id.as_bytes(), key, now])?;
+                IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
+            }
+        }
+    } else {
+        IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
+    };
+    tx.commit()?;
+    if !session_end {
+        Ok(HookSessionAdmission::Observation {
+            session: guard,
+            ingest,
+        })
+    } else if ended_at.is_some() {
+        Ok(HookSessionAdmission::ReEnd {
+            session: guard,
+            ingest,
+        })
+    } else {
+        Ok(HookSessionAdmission::EndOpen {
+            session: guard,
+            ingest,
+        })
+    }
+}
+
+fn validate_admitted_session(tx: &Transaction<'_>, admitted: &AdmittedSession) -> StoreResult<()> {
+    let owner: Option<String> = tx.query_row(
+        "SELECT actor_user FROM sessions WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 AND agent_kind = ?4",
+        params![admitted.session_id.as_bytes(), admitted.workspace_id.as_bytes(), admitted.project_id.as_bytes(), admitted.agent_kind.as_str()],
+        |r| r.get(0),
+    ).optional()?.ok_or(StoreError::SessionCollision)?;
+    if owner != admitted.owner
+        || owner
+            .as_deref()
+            .is_some_and(|v| IdentityKey::from_storage_key(v).is_none())
+    {
+        return Err(StoreError::SessionCollision);
+    }
+    Ok(())
+}
+
+/// Guarded hook equivalent of [`end_session`].
+pub fn end_admitted_session(
+    conn: &mut Connection,
+    admitted: &AdmittedSession,
+    page: Option<&PageId>,
+) -> StoreResult<()> {
+    let tx = conn.transaction()?;
+    validate_admitted_session(&tx, admitted)?;
+    end_session_row(&tx, &admitted.session_id, page)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Guarded hook lifecycle-only end.
+pub fn end_admitted_lifecycle_only_session(
+    conn: &mut Connection,
+    admitted: &AdmittedSession,
+) -> StoreResult<LifecycleOnlyEndOutcome> {
+    let tx = conn.transaction()?;
+    validate_admitted_session(&tx, admitted)?;
+    let outcome = end_lifecycle_only_session_in_tx(&tx, &admitted.session_id)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Guarded hook end plus automatic handoff in one transaction.
+pub fn end_admitted_session_with_handoff(
+    conn: &mut Connection,
+    admitted: &AdmittedSession,
+    page: Option<&PageId>,
+    handoff: &NewHandoff,
+) -> StoreResult<HandoffId> {
+    if handoff.from_session_id != Some(admitted.session_id)
+        || handoff.workspace_id != admitted.workspace_id
+        || handoff.project_id != admitted.project_id
+        || handoff.owner_user != admitted.owner
+    {
+        return Err(StoreError::SessionCollision);
+    }
+    let tx = conn.transaction()?;
+    validate_admitted_session(&tx, admitted)?;
+    end_session_row(&tx, &admitted.session_id, page)?;
+    let id = insert_handoff_row(&tx, handoff)?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Mark a keyed hook event complete after its downstream effects finish.
@@ -3153,6 +3411,65 @@ pub(crate) mod tests {
         let ws = get_or_create_workspace(&mut conn, "default").unwrap();
         let proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
         (tmp, conn, ws, proj)
+    }
+
+    fn hook_session(
+        id: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner: Option<&str>,
+    ) -> NewSession {
+        NewSession {
+            id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: owner.map(str::to_owned),
+        }
+    }
+
+    fn hook_observation(session: &NewSession) -> NewObservation {
+        NewObservation {
+            session_id: session.id,
+            workspace_id: session.workspace_id,
+            project_id: session.project_id,
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: "hook".into(),
+            body: "observation".into(),
+            importance: 5,
+        }
+    }
+
+    fn session_end_observation(session: &NewSession) -> NewObservation {
+        let mut observation = hook_observation(session);
+        observation.kind = ObservationKind::SessionEnd;
+        observation
+    }
+
+    fn seed_ingest_key(conn: &Connection, project_id: ProjectId, key: &str, completed: bool) {
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                project_id.as_bytes(),
+                key,
+                Timestamp::now().as_microsecond(),
+                completed.then_some(Timestamp::now().as_microsecond()),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn admitted_session(admission: HookSessionAdmission) -> AdmittedSession {
+        match admission {
+            HookSessionAdmission::Observation { session, .. }
+            | HookSessionAdmission::EndOpen { session, .. }
+            | HookSessionAdmission::ReEnd { session, .. }
+            | HookSessionAdmission::AlreadyEnded { session } => session,
+            HookSessionAdmission::InvalidMissingEnd => panic!("expected admitted session"),
+        }
     }
 
     fn page(
@@ -6081,5 +6398,412 @@ pub(crate) mod tests {
             Some(normalize_repo_path_key(&gone_path)),
             "path absent on this host must be preserved (multi-user/unmounted safety)"
         );
+    }
+
+    #[test]
+    fn hook_admission_rejects_cross_owner_fresh_key_without_claiming_it() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let alice = "user:alice";
+        let bob = "user:bob";
+        let session = hook_session(SessionId::new(), ws, proj, Some(alice));
+        begin_session(&mut conn, &session).unwrap();
+        let bob_event = hook_observation(&session);
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &bob_event,
+                &OwnerFilter::User(bob.into()),
+                Some("fresh-key"),
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+        let observations: u64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+            .unwrap();
+        let keys: u64 = conn
+            .query_row("SELECT COUNT(*) FROM ingest_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((observations, keys), (0, 0));
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &bob_event,
+                &OwnerFilter::User(alice.into()),
+                Some("fresh-key"),
+            )
+            .unwrap(),
+            HookSessionAdmission::Observation {
+                ingest: IngestObservationOutcome::Inserted(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn concurrent_alice_and_bob_events_only_admit_alice_observation() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        drop(conn);
+        let path = tmp.path().join("test.sqlite");
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let run = |owner: &'static str, key: &'static str, gate: Arc<std::sync::Barrier>| {
+            let path = path.clone();
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let mut conn = Connection::open(path).unwrap();
+                conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+                gate.wait();
+                admit_hook_session_event(
+                    &mut conn,
+                    &session,
+                    &hook_observation(&session),
+                    &OwnerFilter::User(owner.into()),
+                    Some(key),
+                )
+            })
+        };
+        let alice = run("user:alice", "alice-key", Arc::clone(&gate));
+        let bob = run("user:bob", "bob-key", gate);
+        assert!(matches!(
+            alice.join().unwrap(),
+            Ok(HookSessionAdmission::Observation { .. })
+        ));
+        assert!(matches!(
+            bob.join().unwrap(),
+            Err(StoreError::SessionCollision)
+        ));
+
+        let conn = Connection::open(path).unwrap();
+        let observations: u64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(observations, 1);
+    }
+
+    #[test]
+    fn hook_admission_rejects_tuple_mismatches_before_mutation() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let mut observation = hook_observation(&session);
+        observation.project_id = other;
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &observation,
+                &OwnerFilter::User("user:alice".into()),
+                Some("tuple-key"),
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+        let counts: (u64, u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM ingest_keys)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+
+        let alice_session = hook_session(session.id, ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &alice_session).unwrap();
+        let mut agent_mismatch = alice_session.clone();
+        agent_mismatch.agent_kind = AgentKind::ClaudeCode;
+        let observation = hook_observation(&alice_session);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &agent_mismatch,
+                &observation,
+                &OwnerFilter::User("user:alice".into()),
+                Some("agent-key"),
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+        let counts: (u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM ingest_keys)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[test]
+    fn hook_admission_rejects_unadmitted_new_owner_and_accepts_shared_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let owned = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &owned,
+                &hook_observation(&owned),
+                &OwnerFilter::User("user:bob".into()),
+                Some("denied-owner"),
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+        let counts: (u64, u64, u64) = conn
+            .query_row("SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM ingest_keys)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+
+        let shared = hook_session(SessionId::new(), ws, proj, None);
+        let admission = admit_hook_session_event(
+            &mut conn,
+            &shared,
+            &hook_observation(&shared),
+            &OwnerFilter::User("user:alice".into()),
+            None,
+        )
+        .unwrap();
+        assert!(admitted_session(admission).owner().is_none());
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT actor_user FROM sessions WHERE id = ?1",
+                params![shared.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(owner.is_none());
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &shared,
+                &hook_observation(&shared),
+                &OwnerFilter::User("user:bob".into()),
+                Some("shared-bob"),
+            )
+            .unwrap(),
+            HookSessionAdmission::Observation { .. }
+        ));
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT actor_user FROM sessions WHERE id = ?1",
+                params![shared.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn open_session_end_admissions_preserve_all_ingest_outcomes() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        for (key, completed, expected_complete) in [
+            ("open-inserted", None, false),
+            ("open-pending", Some(false), false),
+            ("open-complete", Some(true), true),
+        ] {
+            let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+            begin_session(&mut conn, &session).unwrap();
+            if let Some(completed) = completed {
+                seed_ingest_key(&conn, proj, key, completed);
+            }
+            let admission = admit_hook_session_event(
+                &mut conn,
+                &session,
+                &session_end_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                Some(key),
+            )
+            .unwrap();
+            match admission {
+                HookSessionAdmission::EndOpen { ingest, .. } if key == "open-inserted" => {
+                    assert!(matches!(ingest, IngestObservationOutcome::Inserted(_)));
+                }
+                HookSessionAdmission::EndOpen { ingest, .. } if key == "open-pending" => {
+                    assert_eq!(ingest, IngestObservationOutcome::ResumePending);
+                }
+                HookSessionAdmission::EndOpen { ingest, .. } if expected_complete => {
+                    assert_eq!(ingest, IngestObservationOutcome::AlreadyComplete);
+                }
+                other => panic!("unexpected open SessionEnd admission: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reend_session_end_admissions_preserve_all_ingest_outcomes() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        for (key, completed, expected_complete) in [
+            ("reend-inserted", None, false),
+            ("reend-pending", Some(false), false),
+            ("reend-complete", Some(true), true),
+        ] {
+            let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+            begin_session(&mut conn, &session).unwrap();
+            end_session(&mut conn, &session.id, None).unwrap();
+            insert_observation(&mut conn, &hook_observation(&session)).unwrap();
+            if let Some(completed) = completed {
+                seed_ingest_key(&conn, proj, key, completed);
+            }
+            let admission = admit_hook_session_event(
+                &mut conn,
+                &session,
+                &session_end_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                Some(key),
+            )
+            .unwrap();
+            match admission {
+                HookSessionAdmission::ReEnd { ingest, .. } if key == "reend-inserted" => {
+                    assert!(matches!(ingest, IngestObservationOutcome::Inserted(_)));
+                }
+                HookSessionAdmission::ReEnd { ingest, .. } if key == "reend-pending" => {
+                    assert_eq!(ingest, IngestObservationOutcome::ResumePending);
+                }
+                HookSessionAdmission::ReEnd { ingest, .. } if expected_complete => {
+                    assert_eq!(ingest, IngestObservationOutcome::AlreadyComplete);
+                }
+                other => panic!("unexpected re-end SessionEnd admission: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_session_end_creates_no_session_key_or_observation() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &session_end_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                Some("missing-end"),
+            )
+            .unwrap(),
+            HookSessionAdmission::InvalidMissingEnd
+        ));
+        let counts: (u64, u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM observations), (SELECT COUNT(*) FROM ingest_keys)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+    }
+
+    #[test]
+    fn ordinary_observation_already_complete_remains_observation_admission() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        seed_ingest_key(&conn, proj, "ordinary-complete", true);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &hook_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                Some("ordinary-complete"),
+            )
+            .unwrap(),
+            HookSessionAdmission::Observation {
+                ingest: IngestObservationOutcome::AlreadyComplete,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn admitted_guard_revalidates_and_lifecycle_preserves_handoff_release_audit() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let guard = admitted_session(
+            admit_hook_session_event(
+                &mut conn,
+                &session,
+                &hook_observation(&session),
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            )
+            .unwrap(),
+        );
+        conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![session.id.as_bytes()],
+        )
+        .unwrap();
+        assert!(matches!(
+            end_admitted_session(&mut conn, &guard, None),
+            Err(StoreError::SessionCollision)
+        ));
+        begin_session(&mut conn, &session).unwrap();
+        conn.execute(
+            "UPDATE sessions SET actor_user = 'user:bob' WHERE id = ?1",
+            params![session.id.as_bytes()],
+        )
+        .unwrap();
+        assert!(matches!(
+            end_admitted_lifecycle_only_session(&mut conn, &guard),
+            Err(StoreError::SessionCollision)
+        ));
+        let handoff = NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: Some(session.id),
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: None,
+            summary: "x".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: Some("user:alice".into()),
+        };
+        assert!(matches!(
+            end_admitted_session_with_handoff(&mut conn, &guard, None, &handoff),
+            Err(StoreError::SessionCollision)
+        ));
+
+        let receiver = hook_session(SessionId::new(), ws, proj, None);
+        let mut lifecycle_observation = hook_observation(&receiver);
+        lifecycle_observation.kind = ObservationKind::SessionStart;
+        let receiver_guard = admitted_session(
+            admit_hook_session_event(
+                &mut conn,
+                &receiver,
+                &lifecycle_observation,
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            )
+            .unwrap(),
+        );
+        let handoff = NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "x".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        };
+        let handoff_id = insert_handoff(&mut conn, &handoff).unwrap();
+        let mut acceptance = handoff_acceptance(handoff_id, ws, proj);
+        acceptance.accepting_session = Some(receiver.id);
+        assert!(accept_handoff(&mut conn, &acceptance).unwrap());
+        assert_eq!(
+            end_admitted_lifecycle_only_session(&mut conn, &receiver_guard).unwrap(),
+            LifecycleOnlyEndOutcome::Ended {
+                reopened_handoff: Some(handoff_id)
+            }
+        );
+        assert_eq!(audit_row_for(&conn, "release_lifecycle_only_handoff").0, 1);
     }
 }

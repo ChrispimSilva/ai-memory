@@ -161,3 +161,10 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1 # per project
 min_session_age_secs = 600
+
+# Browser session cookies are safe on plain loopback HTTP by default. For `/web`
+# behind a trusted HTTPS-terminating reverse proxy, set this to true so browsers
+# send the cookie only over HTTPS. Do not enable it for direct HTTP: browsers
+# will not send a Secure cookie there.
+[auth]
+secure_cookie = false

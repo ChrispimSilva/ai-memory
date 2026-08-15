@@ -639,6 +639,14 @@ Loopback-only (`127.0.0.1:49374`) with no auth is the default because
 it is safe for a single-user laptop: no process outside the machine can
 reach the server.
 
+Unauthenticated non-loopback HTTP now fails closed. Set
+`AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an
+intentional, dangerous exception for plain HTTP only. Authentication does not
+encrypt bearer tokens: for LAN or remote access, use the ready
+[Caddy](docker/compose.tls.caddy.yml) or
+[Cloudflare Tunnel](docker/compose.tls.cloudflared.yml) templates described in
+the [HTTPS reverse-proxy guide](docs/https-via-proxy.md).
+
 Enable bearer auth when the server is exposed beyond loopback, when
 untrusted local processes share the machine, or when the data dir holds
 sensitive project history:
@@ -662,7 +670,9 @@ ai-memory install-hooks --agent  claude-code --apply \
 
 Bearer auth protects `/mcp`, `/hook`, `/handoff`, `/admin/*`, and
 `/web/*`. Browser access to `/web` uses HTTP Basic auth with the token
-as the password. Non-loopback binds should also set
+as the password. When `/web` is exposed through an HTTPS reverse proxy, set
+`AI_MEMORY_AUTH__SECURE_COOKIE=true`; it makes the browser cookie HTTPS-only.
+Close or redirect direct HTTP access to that hostname. Non-loopback binds should also set
 `AI_MEMORY_ALLOWED_HOSTS` to guard against DNS rebinding.
 
 Busy shared hook servers can also set `AI_MEMORY_HOOK_RATE_PER_SEC` (tokens per

@@ -19,7 +19,7 @@ use ai_memory_core::{
     ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId, WorkstreamEvent,
     WorkstreamEventKind,
 };
-use ai_memory_store::{IngestObservationOutcome, WriterHandle};
+use ai_memory_store::{HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
 use axum::Json;
 use axum::Router;
@@ -628,7 +628,14 @@ async fn handle_hook(
     }
     tokio::spawn(async move {
         let _permit = permit;
-        process_envelope(state, env, actor, skip_webhooks).await;
+        process_envelope(
+            state,
+            env,
+            actor,
+            level_ext.map_or(ai_memory_core::AuthLevel::Anonymous, |v| v.0),
+            skip_webhooks,
+        )
+        .await;
     });
     (StatusCode::ACCEPTED, "queued")
 }
@@ -794,7 +801,23 @@ async fn handle_hook_batch(
             continue;
         }
         let _permit = permit;
-        if let Err(e) = process(&state, env, actor.clone(), skip_webhooks.clone()).await {
+        if let Err(e) = process_authorized(
+            &state,
+            env,
+            actor.clone(),
+            level_ext.map_or(ai_memory_core::AuthLevel::Anonymous, |v| v.0),
+            skip_webhooks.clone(),
+        )
+        .await
+        {
+            if matches!(
+                e.downcast_ref::<StoreError>(),
+                Some(StoreError::SessionCollision)
+            ) {
+                warn!("hook batch session collision/recovery rejection dropped");
+                accepted_indices.push(idx);
+                continue;
+            }
             warn!(error = %e, accepted = accepted_indices.len(), "hook batch item failed; stopping (fail-fast)");
             return (
                 StatusCode::OK,
@@ -2095,10 +2118,18 @@ async fn process_envelope(
     state: Arc<HookState>,
     env: HookEnvelope,
     actor: Option<IdentityKey>,
+    level: ai_memory_core::AuthLevel,
     skip_webhooks: Vec<String>,
 ) {
-    if let Err(e) = process(&state, env, actor, skip_webhooks).await {
-        warn!(error = %e, "hook processing failed");
+    if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks).await {
+        if matches!(
+            e.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ) {
+            warn!("hook session collision dropped");
+        } else {
+            warn!(error = %e, "hook processing failed");
+        }
     }
 }
 
@@ -2161,10 +2192,41 @@ fn publish_active_project_for_event(
     }
 }
 
+#[cfg(test)]
 async fn process(
     state: &HookState,
     env: HookEnvelope,
     actor: Option<IdentityKey>,
+    skip_webhooks: Vec<String>,
+) -> anyhow::Result<()> {
+    match process_authorized(
+        state,
+        env,
+        actor,
+        ai_memory_core::AuthLevel::Anonymous,
+        skip_webhooks,
+    )
+    .await
+    {
+        // Match the asynchronous hook envelope: collisions are terminal
+        // rejections, but fire-and-forget ingress acknowledges the delivery.
+        Err(error)
+            if matches!(
+                error.downcast_ref::<StoreError>(),
+                Some(StoreError::SessionCollision)
+            ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+async fn process_authorized(
+    state: &HookState,
+    env: HookEnvelope,
+    actor: Option<IdentityKey>,
+    level: ai_memory_core::AuthLevel,
     // Admission webhooks this request opted out of (see `admission_skips`).
     // Empty for every caller with no HTTP request behind it.
     skip_webhooks: Vec<String>,
@@ -2239,66 +2301,6 @@ async fn process(
         }
     };
 
-    if matches!(env.event, HookEvent::SessionEnd) {
-        match state
-            .reader
-            .session_end_disposition(session_id, ws, proj, env.agent)
-            .await?
-        {
-            ai_memory_store::SessionEndDisposition::Open => {}
-            ai_memory_store::SessionEndDisposition::DropInvalid => {
-                info!(
-                    session = %session_id,
-                    agent = %env.agent.as_str(),
-                    "ignoring SessionEnd for missing, mismatched, or cross-agent session"
-                );
-                return Ok(());
-            }
-            ai_memory_store::SessionEndDisposition::AlreadyEnded => {
-                // End stamping and the legacy handoff commit atomically. A
-                // first delivery can still be cancelled after that transaction
-                // but before the wiki commit, durable LLM enqueue, or ingest-key
-                // completion. Re-run those idempotent tail effects before
-                // acknowledging the already-ended session.
-                let commit_msg = format!("repair session {}", short_id(&session_id.to_string()),);
-                match state.wiki.commit_all(&commit_msg) {
-                    Ok(Some(oid)) => debug!(commit = %oid, "wiki recovery auto-commit"),
-                    Ok(None) => debug!("wiki clean during SessionEnd recovery"),
-                    Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
-                }
-                let observations = state.reader.observations_for_session(session_id).await?;
-                if !is_lifecycle_only_session(&observations) {
-                    enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
-                }
-                if let Some(key) = env.ingest_key {
-                    let completed = state
-                        .writer
-                        .complete_observation_ingest_if_claimed(proj, key.clone())
-                        .await?;
-                    debug!(key, completed, "SessionEnd recovery ingest-key completion");
-                }
-                info!(
-                    session = %session_id,
-                    agent = %env.agent.as_str(),
-                    "recovered tail effects for already-ended SessionEnd"
-                );
-                return Ok(());
-            }
-            // The agent resumed an ended session under the same id and kept
-            // working (issue #152). Run the full end path again — page
-            // rewrite, ended_at bump, handoff, opt-in LLM consolidation — so
-            // the resumed work reaches the compiled session page instead of
-            // living only in raw observations.
-            ai_memory_store::SessionEndDisposition::ReEndWithNewWork => {
-                info!(
-                    session = %session_id,
-                    agent = %env.agent.as_str(),
-                    "SessionEnd re-ends a resumed session with new work; re-running end path"
-                );
-            }
-        }
-    }
-
     // Hooks are fire-and-forget and may arrive out of order. Begin the
     // session idempotently before every observation so a resumed agent
     // session, or a prompt racing ahead of SessionStart, cannot trip the
@@ -2310,66 +2312,112 @@ async fn process(
     // shared, as before. The same value owns the SessionEnd handoff below, so
     // the session and its baton can never disagree about who they belong to.
     let owner_stamp = owner_stamp_for_event(state, actor.as_ref()).await;
-    let new_session = NewSession {
-        id: session_id,
-        workspace_id: ws,
-        project_id: proj,
-        agent_kind: env.agent,
-        cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
-        actor_user: owner_stamp.clone(),
-    };
-    if let Err(e) = state.writer.begin_session(new_session).await {
-        // The cached (workspace, project) may have been deleted out from
-        // under us — e.g. `purge-project` on a live server drops the row
-        // but leaves this in-memory cache pointing at the old id, so
-        // begin_session trips the project foreign key. Evict the stale
-        // slot, re-resolve (which recreates the project), and retry once.
-        warn!(error = %e, "begin_session failed; evicting stale project cache and retrying");
-        let cwd_norm = env
-            .cwd
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(normalize_project_path_key);
-        let key = cache_key_for(
-            cwd_norm.as_deref(),
-            env.workspace_override.as_deref(),
-            env.project_override.as_deref(),
-            env.project_strategy,
-        );
-        state.project_cache.lock().await.remove(&key);
-        let refreshed = resolve_project_ids_inner(
-            state,
-            env.cwd.as_deref(),
-            env.workspace_override.as_deref(),
-            env.project_override.as_deref(),
-            env.project_strategy,
-        )
-        .await?;
-        ws = refreshed.0;
-        proj = refreshed.1;
-        state
-            .writer
-            .begin_session(NewSession {
-                id: session_id,
-                workspace_id: ws,
-                project_id: proj,
-                agent_kind: env.agent,
-                cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
-                actor_user: owner_stamp.clone(),
-            })
+    // A keyed event claims its project-scoped key in the same transaction as
+    // the observation. A pending replay resumes the downstream wiki/handoff
+    // effects without duplicating the observation; only a delivery whose
+    // effects were marked complete is skipped.
+    let ingest_key = env.ingest_key.clone();
+    let owner_filter = if env.all_owners_requested {
+        if !matches!(env.event, HookEvent::SessionEnd) {
+            return Err(StoreError::SessionCollision.into());
+        }
+        let distinguishes = state
+            .reader
+            .distinguishes_operators(state.trusted_proxy_identity)
             .await?;
-    }
-
-    if publishable_scope {
-        publish_active_project_for_event(
-            state,
-            env.event,
-            &actor_key,
-            ws,
-            proj,
-            env.recall_default_global_requested,
-        );
-    }
+        if level
+            .authorize(ai_memory_core::Capability::Admin, distinguishes)
+            .is_err()
+        {
+            return Err(StoreError::SessionCollision.into());
+        }
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        actor
+            .as_ref()
+            .map_or(ai_memory_core::OwnerFilter::Unattributed, |id| {
+                ai_memory_core::OwnerFilter::User(id.storage_key())
+            })
+    };
+    let cwd_norm = env
+        .cwd
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(normalize_project_path_key);
+    let cache_key = cache_key_for(
+        cwd_norm.as_deref(),
+        env.workspace_override.as_deref(),
+        env.project_override.as_deref(),
+        env.project_strategy,
+    );
+    let mut attempts = 0;
+    // Keep the successful keyed-ingest gate until every downstream effect has
+    // completed. A replay that observes `ResumePending` must not race the first
+    // delivery's page, handoff, consolidation, or key-completion tail.
+    let (admission, log_title, _ingest_guard) = loop {
+        // Rebuild both records on retry: the store validates and persists this
+        // exact scope pair atomically with the keyed observation claim.
+        let new_session = NewSession {
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: env.agent,
+            cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
+            actor_user: owner_stamp.clone(),
+        };
+        let kind = env.event.to_observation_kind();
+        let raw_obs = NewObservation {
+            session_id,
+            workspace_id: ws,
+            project_id: proj,
+            kind,
+            extension: env.extension.clone(),
+            source_event: env.source_event.clone(),
+            title: env
+                .title_hint
+                .clone()
+                .unwrap_or_else(|| kind.as_str().to_string()),
+            body: env.body_excerpt.clone().unwrap_or_default(),
+            importance: importance_for(env.event),
+        };
+        let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
+        let log_title = sanitized.inner().title.clone();
+        let ingest_guard = if let Some(key) = ingest_key.as_deref() {
+            Some(state.ingest_gates.lock(proj, key).await)
+        } else {
+            None
+        };
+        let result = state
+            .writer
+            .admit_hook_session_event(
+                new_session,
+                sanitized,
+                owner_filter.clone(),
+                ingest_key.clone(),
+            )
+            .await;
+        match result {
+            Ok(admission) => break (admission, log_title, ingest_guard),
+            Err(error) if attempts == 0 && error.is_stale_session_scope_reference() => {
+                // Do not hold an old-project gate while resolving and acquiring
+                // the refreshed scope's gate; that would permit nested gates.
+                drop(ingest_guard);
+                attempts += 1;
+                warn!(error = %error, "hook admission used a stale project cache entry; evicting and retrying once");
+                state.project_cache.lock().await.remove(&cache_key);
+                (ws, proj) = resolve_project_ids_inner(
+                    state,
+                    env.cwd.as_deref(),
+                    env.workspace_override.as_deref(),
+                    env.project_override.as_deref(),
+                    env.project_strategy,
+                )
+                .await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    // Admission is the first mutation/effect after scope resolution.
 
     // `AI_MEMORY_RUN_ID` is invocation-scoped. A valid active run links the
     // native session and switches only this hook invocation to managed
@@ -2383,6 +2431,48 @@ async fn process(
             })
             .ok()
     });
+    let (admitted, ingest) = match admission {
+        HookSessionAdmission::InvalidMissingEnd => {
+            info!(session = %session_id, "ignoring missing SessionEnd");
+            return Ok(());
+        }
+        HookSessionAdmission::AlreadyEnded { session } => {
+            let commit_msg = format!("repair session {}", short_id(&session_id.to_string()));
+            match state.wiki.commit_all(&commit_msg) {
+                Ok(Some(oid)) => debug!(commit = %oid, "wiki recovery auto-commit"),
+                Ok(None) => debug!("wiki clean during SessionEnd recovery"),
+                Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
+            }
+            let observations = state.reader.observations_for_session(session_id).await?;
+            if !is_lifecycle_only_session(&observations) {
+                enqueue_session_end_consolidation(
+                    state,
+                    session_id,
+                    session.workspace_id(),
+                    session.project_id(),
+                )
+                .await?;
+            }
+            if let Some(key) = ingest_key {
+                let _ = state
+                    .writer
+                    .complete_observation_ingest_if_claimed(session.project_id(), key)
+                    .await?;
+            }
+            return Ok(());
+        }
+        HookSessionAdmission::Observation { session, ingest }
+        | HookSessionAdmission::EndOpen { session, ingest }
+        | HookSessionAdmission::ReEnd { session, ingest } => (session, ingest),
+    };
+    if ingest == IngestObservationOutcome::AlreadyComplete {
+        return Ok(());
+    }
+    if ingest == IngestObservationOutcome::ResumePending {
+        debug!("resuming incomplete keyed hook event");
+    }
+    ws = admitted.workspace_id();
+    proj = admitted.project_id();
     if let Some(run_id) = managed_run
         && let Some(native_session_id) = env
             .session_id
@@ -2394,57 +2484,15 @@ async fn process(
             .link_managed_run_session(run_id, env.agent, native_session_id)
             .await?;
     }
-
-    // Persist the observation row.
-    let kind = env.event.to_observation_kind();
-    let title = env
-        .title_hint
-        .clone()
-        .unwrap_or_else(|| kind.as_str().to_string());
-    let body = env.body_excerpt.clone().unwrap_or_default();
-    let raw_obs = NewObservation {
-        session_id,
-        workspace_id: ws,
-        project_id: proj,
-        kind,
-        extension: env.extension.clone(),
-        source_event: env.source_event.clone(),
-        title,
-        body,
-        importance: importance_for(env.event),
-    };
-    // The store boundary takes `Sanitized<NewObservation>` directly — no
-    // unwrap-and-clone; the type proves the scrub happened. The log line
-    // below wants the scrubbed title, so keep a copy before the move.
-    let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
-    let log_title = sanitized.inner().title.clone();
-    // A keyed event claims its project-scoped key in the same transaction as
-    // the observation. A pending replay resumes the downstream wiki/handoff
-    // effects without duplicating the observation; only a delivery whose
-    // effects were marked complete is skipped.
-    let ingest_key = env.ingest_key.clone();
-    let _ingest_guard = if let Some(key) = ingest_key.as_deref() {
-        Some(state.ingest_gates.lock(proj, key).await)
-    } else {
-        None
-    };
-    if let Some(key) = ingest_key.as_ref() {
-        match state
-            .writer
-            .insert_observation_ingest(sanitized, key.clone())
-            .await?
-        {
-            IngestObservationOutcome::Inserted(_) => {}
-            IngestObservationOutcome::ResumePending => {
-                debug!(key, "resuming incomplete keyed hook event");
-            }
-            IngestObservationOutcome::AlreadyComplete => {
-                debug!(key, "completed ingest_key replay; skipping event");
-                return Ok(());
-            }
-        }
-    } else {
-        let _ = state.writer.insert_observation(sanitized).await?;
+    if publishable_scope {
+        publish_active_project_for_event(
+            state,
+            env.event,
+            &actor_key,
+            ws,
+            proj,
+            env.recall_default_global_requested,
+        );
     }
 
     // Append the log line to the per-project log.md.
@@ -2481,7 +2529,7 @@ async fn process(
     // and current actorless sessions use the same value; attributing either to
     // whoever delivers SessionEnd would silently rebucket shared context. A
     // store failure aborts this event rather than guessing an owner.
-    let session_owner = parse_session_owner(state.reader.session_actor_user(session_id).await?)?;
+    let session_owner = parse_session_owner(admitted.owner().map(str::to_owned))?;
     let session_actor = session_owner
         .as_ref()
         .map(IdentityKey::to_actor_context)
@@ -2505,7 +2553,10 @@ async fn process(
     if matches!(env.event, HookEvent::SessionEnd) {
         let mut observations = state.reader.observations_for_session(session_id).await?;
         if is_lifecycle_only_session(&observations) {
-            let outcome = state.writer.end_lifecycle_only_session(session_id).await?;
+            let outcome = state
+                .writer
+                .end_admitted_lifecycle_only_session(admitted.clone())
+                .await?;
             match outcome {
                 ai_memory_store::LifecycleOnlyEndOutcome::Ended { reopened_handoff } => {
                     let commit_msg = format!(
@@ -2631,11 +2682,14 @@ async fn process(
             Some(handoff) => Some(
                 state
                     .writer
-                    .end_session_with_handoff(session_id, Some(page_id), handoff)
+                    .end_admitted_session_with_handoff(admitted.clone(), Some(page_id), handoff)
                     .await?,
             ),
             None => {
-                state.writer.end_session(session_id, Some(page_id)).await?;
+                state
+                    .writer
+                    .end_admitted_session(admitted.clone(), Some(page_id))
+                    .await?;
                 None
             }
         };
@@ -6127,6 +6181,625 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_collision_does_not_evict_or_retry_project_cache() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let cwd = "/home/user/collision-project";
+        let alice = Some(IdentityKey::User("alice".into()));
+        let bob = Some(IdentityKey::User("bob".into()));
+
+        let mut alice_event = session_envelope("user-prompt-submit", "collision-session", cwd);
+        alice_event.ingest_key = Some("alice-event".into());
+        process(&state, alice_event, alice, Vec::new())
+            .await
+            .unwrap();
+
+        let (cached_ws, cached_proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            Some("default"),
+            Some("scratch"),
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        let session_id = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "collision-session",
+            cwd,
+        ))
+        .unwrap();
+        let observations_before = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+
+        let mut bob_event = session_envelope("user-prompt-submit", "collision-session", cwd);
+        bob_event.ingest_key = Some("bob-event".into());
+        let error = process_authorized(
+            &state,
+            bob_event,
+            bob,
+            ai_memory_core::AuthLevel::Anonymous,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+
+        let cache_key = cache_key_for(
+            Some(&normalize_project_path_key(cwd)),
+            Some("default"),
+            Some("scratch"),
+            ProjectStrategy::Basename,
+        );
+        let mut cache = state.project_cache.lock().await;
+        assert_eq!(cache.get(&cache_key), Some((cached_ws, cached_proj)));
+        drop(cache);
+        assert_eq!(
+            state.reader.find_session_scope(session_id).await.unwrap(),
+            Some((cached_ws, cached_proj, Some(cwd.into()))),
+            "the existing session must not be replaced or moved"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            observations_before.len(),
+            "the rejected delivery must not insert an observation or ingest key"
+        );
+    }
+
+    /// A rejected foreign delivery must stop at the store admission boundary:
+    /// it cannot create any router-side artifact or claim its key.
+    #[tokio::test]
+    async fn foreign_prompt_is_a_terminal_collision_without_router_side_effects() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = Some(IdentityKey::User("alice".into()));
+        let bob = Some(IdentityKey::User("bob".into()));
+        let mut first = session_envelope("user-prompt-submit", "owned-prompt", "/tmp/scratch");
+        first.ingest_key = Some("alice-prompt".into());
+        process(&state, first, alice, Vec::new()).await.unwrap();
+        let session_id = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "owned-prompt",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        let pages = session_pages(&state).await;
+        let active = state.active_project.get();
+        let run = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "collision-repo".into(),
+                worktree_fingerprint: "collision-worktree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "test:collision".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut foreign = session_envelope("user-prompt-submit", "owned-prompt", "/tmp/scratch");
+        foreign.ingest_key = Some("bob-must-not-claim".into());
+        foreign.managed_run = Some(run.run_id.to_string());
+        let error = process_authorized(
+            &state,
+            foreign,
+            bob,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        assert!(
+            !error.to_string().contains("alice"),
+            "collision must not disclose the owner"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            observations.len()
+        );
+        assert_eq!(session_pages(&state).await, pages);
+        assert_eq!(state.active_project.get(), active);
+        assert!(!open_handoff_exists(&state).await);
+        assert!(
+            state
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .is_none(),
+            "rejected delivery linked Alice's native session to Bob's run"
+        );
+        assert!(
+            matches!(
+                state
+                    .writer
+                    .insert_observation_ingest(
+                        Sanitized::new(
+                            NewObservation {
+                                session_id,
+                                workspace_id: state.workspace_id,
+                                project_id: state.project_id,
+                                kind: ObservationKind::UserPrompt,
+                                extension: None,
+                                source_event: None,
+                                title: "probe".into(),
+                                body: String::new(),
+                                importance: 1,
+                            },
+                            &state.sanitizer
+                        ),
+                        "bob-must-not-claim".into(),
+                    )
+                    .await
+                    .unwrap(),
+                IngestObservationOutcome::Inserted(_)
+            ),
+            "foreign delivery must not claim its ingest key"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_session_end_and_reend_are_terminal_collisions() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = Some(IdentityKey::User("alice".into()));
+        let bob = Some(IdentityKey::User("bob".into()));
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "owned-end", "/tmp/scratch"),
+            alice.clone(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let sid = resolve_session_id(&session_envelope(
+            "session-end",
+            "owned-end",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let before = state
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .len();
+        let err = process_authorized(
+            &state,
+            session_envelope("session-end", "owned-end", "/tmp/scratch"),
+            bob.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            before
+        );
+        assert!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        process(
+            &state,
+            session_envelope("session-end", "owned-end", "/tmp/scratch"),
+            alice.clone(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "owned-end", "/tmp/scratch"),
+            alice,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let resumed_count = state
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .len();
+        let handoff_count = state
+            .reader
+            .briefing_for_project(
+                state.workspace_id,
+                state.project_id,
+                1,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .pending_handoff_count;
+        let page_path = ai_memory_core::PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        let page_before = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|page| page.path == page_path)
+            .expect("Alice's first end wrote a session page");
+        let body_before = state
+            .wiki
+            .read_page(state.workspace_id, state.project_id, &page_path)
+            .unwrap()
+            .body;
+        let err = process_authorized(
+            &state,
+            session_envelope("session-end", "owned-end", "/tmp/scratch"),
+            bob,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            resumed_count
+        );
+        assert_eq!(
+            state
+                .reader
+                .briefing_for_project(
+                    state.workspace_id,
+                    state.project_id,
+                    1,
+                    ai_memory_core::OwnerFilter::Any
+                )
+                .await
+                .unwrap()
+                .pending_handoff_count,
+            handoff_count
+        );
+        let page_after = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|page| page.path == page_path)
+            .expect("foreign re-end must not remove Alice's page");
+        assert_eq!(page_after.id, page_before.id);
+        assert_eq!(
+            state
+                .wiki
+                .read_page(state.workspace_id, state.project_id, &page_path)
+                .unwrap()
+                .body,
+            body_before,
+            "foreign re-end rewrote Alice's session summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_owners_recovery_is_root_session_end_only() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = Some(IdentityKey::User("alice".into()));
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "recover-owned", "/tmp/scratch"),
+            alice,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut end = session_envelope("session-end", "recover-owned", "/tmp/scratch");
+        end.all_owners_requested = true;
+        process_authorized(
+            &state,
+            end,
+            Some(IdentityKey::User("root".into())),
+            ai_memory_core::AuthLevel::Root,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let handoff = state
+            .reader
+            .latest_open_handoff(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handoff.owner_user.as_deref(), Some("user:alice"));
+
+        let no_flag = session_envelope("session-end", "recover-owned", "/tmp/scratch");
+        let error = process_authorized(
+            &state,
+            no_flag,
+            Some(IdentityKey::User("root".into())),
+            ai_memory_core::AuthLevel::Root,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        let mut forbidden = session_envelope("session-end", "recover-owned", "/tmp/scratch");
+        forbidden.all_owners_requested = true;
+        let error = process_authorized(
+            &state,
+            forbidden,
+            Some(IdentityKey::User("bob".into())),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        let mut non_end = session_envelope("user-prompt-submit", "recover-owned", "/tmp/scratch");
+        non_end.all_owners_requested = true;
+        let error = process_authorized(
+            &state,
+            non_end,
+            Some(IdentityKey::User("root".into())),
+            ai_memory_core::AuthLevel::Root,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_acknowledges_foreign_collision_then_commits_next_item() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "batch-owned", "/tmp/scratch"),
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let owned = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "batch-owned",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let owned_before = state
+            .reader
+            .observations_for_session(owned)
+            .await
+            .unwrap()
+            .len();
+        let state = Arc::new(state);
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: serde_json::json!({"session_id":"batch-owned", "prompt":"foreign"}),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: serde_json::json!({"session_id":"batch-valid", "prompt":"valid"}),
+            },
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            Some(axum::Extension(
+                IdentityKey::User("bob".into()).to_actor_context(),
+            )),
+            Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 2, "both contiguous entries are cleared");
+        assert!(ack.get("accepted_indices").is_none() || ack["accepted_indices"].is_null());
+        assert!(ack.get("failed_index").is_none() || ack["failed_index"].is_null());
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(owned)
+                .await
+                .unwrap()
+                .len(),
+            owned_before,
+            "the acknowledged collision must not mutate batch-owned"
+        );
+        let valid = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "batch-valid",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(valid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_session_end_is_a_no_op_and_single_hook_acknowledges_foreign_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let missing = resolve_session_id(&session_envelope(
+            "session-end",
+            "missing-end",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        process_authorized(
+            &state,
+            session_envelope("session-end", "missing-end", "/tmp/scratch"),
+            None,
+            ai_memory_core::AuthLevel::Anonymous,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(missing)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "async-owned", "/tmp/scratch"),
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let sid = resolve_session_id(&session_envelope(
+            "user-prompt-submit",
+            "async-owned",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let before = state
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .len();
+        let state = Arc::new(state);
+        let response = handle_hook(
+            State(state.clone()),
+            Query(HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                cwd: Some("/tmp/scratch".into()),
+                workspace: Some("default".into()),
+                project: Some("scratch".into()),
+                ..Default::default()
+            }),
+            Some(axum::Extension(
+                IdentityKey::User("bob".into()).to_actor_context(),
+            )),
+            Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            HeaderMap::new(),
+            Json(serde_json::json!({"session_id":"async-owned", "prompt":"foreign"})),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        // The background worker holds one ingress permit through processing.
+        // Acquiring the entire pool is therefore a bounded, deterministic join
+        // point without instrumenting production collision handling.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let _all_permits = loop {
+            if let Ok(permits) = state
+                .ingest_semaphore
+                .clone()
+                .try_acquire_many_owned(DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT as u32)
+            {
+                break permits;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "asynchronous hook worker did not finish"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            before,
+            "foreign asynchronous hook inserted an observation"
+        );
+    }
+
+    #[tokio::test]
     async fn process_self_heal_evicts_project_strategy_cache_slot() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
@@ -6927,6 +7600,123 @@ mod tests {
         let mut state = make_state(tmp).await;
         state.wiki = state.wiki.clone().with_admission_chain(chain);
         state
+    }
+
+    #[tokio::test]
+    async fn keyed_session_end_replay_waits_for_the_first_delivery_tail() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_hook = entered.clone();
+        let release_hook = release.clone();
+        let app = axum::Router::new().route(
+            "/admission",
+            axum::routing::post(move || {
+                let entered = entered_hook.clone();
+                let release = release_hook.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(
+            make_state_with_admission(
+                &tmp,
+                ai_memory_wiki::AdmissionChain::new(vec![ai_memory_wiki::WebhookConfig {
+                    name: "pause-tail".into(),
+                    url: format!("http://{addr}/admission"),
+                    timeout_ms: 5_000,
+                    failure_policy: ai_memory_wiki::FailurePolicy::Reject,
+                    events: vec![ai_memory_wiki::AdmissionOp::HandoffBegin],
+                    blocking: true,
+                }])
+                .unwrap(),
+            )
+            .await,
+        );
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "gated-end", "/tmp/scratch"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut end = session_envelope("session-end", "gated-end", "/tmp/scratch");
+        end.ingest_key = Some("same-end".into());
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            process_authorized(
+                &first_state,
+                end,
+                None,
+                ai_memory_core::AuthLevel::Anonymous,
+                Vec::new(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("first SessionEnd reached the paused tail");
+
+        let mut retry_end = session_envelope("session-end", "gated-end", "/tmp/scratch");
+        retry_end.ingest_key = Some("same-end".into());
+        let retry_state = state.clone();
+        let mut retry = tokio::spawn(async move {
+            process_authorized(
+                &retry_state,
+                retry_end,
+                None,
+                ai_memory_core::AuthLevel::Anonymous,
+                Vec::new(),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut retry)
+                .await
+                .is_err(),
+            "same keyed replay passed the gate before the first tail completed"
+        );
+        release.notify_one();
+        first.await.unwrap().unwrap();
+        retry.await.unwrap().unwrap();
+
+        let session_id = resolve_session_id(&session_envelope(
+            "session-end",
+            "gated-end",
+            "/tmp/scratch",
+        ))
+        .unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.kind == ObservationKind::SessionEnd)
+                .count(),
+            1,
+            "same keyed replay duplicated SessionEnd"
+        );
+        assert_eq!(
+            state.reader.reindex_target_status().await.unwrap().handoffs,
+            1,
+            "same keyed replay created a second automatic handoff, including expired rows"
+        );
+        assert_eq!(
+            state.reader.status_counts().await.unwrap().pages_all,
+            1,
+            "same keyed replay rewrote the summary page"
+        );
     }
 
     fn session_envelope(event: &str, session: &str, cwd: &str) -> HookEnvelope {
@@ -7833,6 +8623,16 @@ mod tests {
         assert_eq!(
             briefing.pending_handoff_count, 1,
             "recovery must preserve exactly one automatic handoff"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session_id)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "already-ended recovery repairs only the tail, never duplicates SessionEnd"
         );
         assert!(
             state
