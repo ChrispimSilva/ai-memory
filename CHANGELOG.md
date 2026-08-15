@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests. Intentional insecure LAN use requires `--allow-insecure-no-auth`;
   authenticated non-loopback HTTP remains available with its TLS warning
   (#396).
+- `/api/v1` internal failures now return the fixed body
+  `{"error":"internal server error"}` instead of the source error chain, which
+  could expose data-directory paths and configuration to a browser. The
+  detailed cause is logged server-side (#396).
+- The `/web` browser authentication cookie is now `SameSite=Strict` rather than
+  `SameSite=Lax`, so it no longer rides top-level cross-site navigations into
+  the UI. Existing sessions stay valid (#396).
 
 ### Fixed
 - Hook session UUIDs now reject cross-owner reuse atomically before ingest-key,
