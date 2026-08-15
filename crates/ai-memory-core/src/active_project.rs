@@ -94,6 +94,8 @@ pub enum ActiveProjectMode {
 }
 
 /// Composite identity used to key per-actor entries.
+/// This cache key namespaces active-project pointers only; it does not
+/// namespace durable hook `SessionId` records.
 ///
 /// - `PerSession` mode populates only `session_id`.
 /// - `PerActor` mode populates both (`user` holds the qualified identity key:

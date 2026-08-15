@@ -105,6 +105,11 @@ match a hook-published keyed entry; if it does not, ai-memory falls back
 to the server's baked default rather than another session's latest
 project.
 
+The composite `(identity, session_id)` key namespaces only these active-project
+pointers. The durable `SessionId` stored for hook observations remains global:
+if another owner reuses an already-owned id, ai-memory drops that hook before it
+can append observations or publish a pointer for the foreign actor.
+
 ## Client requirements
 
 Lifecycle hooks already include the agent-run session id in their

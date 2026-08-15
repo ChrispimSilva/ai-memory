@@ -1644,6 +1644,12 @@ pub struct ServeArgs {
     /// Bind address for `--transport http` (default: from config).
     #[arg(long)]
     pub bind: Option<String>,
+    /// DANGEROUS: allow unauthenticated plain HTTP on a non-loopback bind.
+    ///
+    /// HTTP-only. Unnecessary for loopback binds; prefer AI_MEMORY_AUTH_TOKEN
+    /// or a loopback bind instead.
+    #[arg(long)]
+    pub allow_insecure_no_auth: bool,
     /// Skip the filesystem watcher; useful for transient debugging.
     #[arg(long)]
     pub no_watcher: bool,
@@ -1745,6 +1751,22 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn serve_parses_insecure_no_auth_override() {
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "serve",
+            "--transport",
+            "http",
+            "--allow-insecure-no-auth",
+        ])
+        .expect("serve override parses");
+        let Command::Serve(args) = parsed.command else {
+            panic!("expected serve command");
+        };
+        assert!(args.allow_insecure_no_auth);
+    }
 
     #[test]
     fn finalize_session_parses_typed_id_and_rejects_ambiguous_selection() {

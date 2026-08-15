@@ -83,6 +83,8 @@ pub struct HookQuery {
     /// clients; older servers ignore it — both directions keep today's
     /// behavior.
     pub ingest_key: Option<String>,
+    /// Explicit root-only recovery propagation from `finalize-session --all-owners`.
+    pub all_owners: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -118,6 +120,8 @@ pub struct HookEnvelope {
     /// router publishes it on the actor's `ActiveProject` so default-scoped
     /// read tools broaden to a global search.
     pub recall_default_global_requested: bool,
+    /// Explicit cross-owner recovery request (never honored for ordinary hooks).
+    pub all_owners_requested: bool,
     /// Invocation-scoped managed-run id forwarded by the host hook.
     pub managed_run: Option<String>,
     /// Optional third-party extension namespace.
@@ -395,6 +399,7 @@ impl HookEnvelope {
         let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
+        let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
         let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
         let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
@@ -454,6 +459,7 @@ impl HookEnvelope {
             project_strategy,
             drop_subagent_requested,
             recall_default_global_requested,
+            all_owners_requested,
             managed_run,
             capture_assistant_requested,
             ingest_key,
