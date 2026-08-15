@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Under the `repo-root` project strategy, mid-session events whose cwd sits
+  outside any git repository and any `.ai-memory.toml` marker (agent scratch
+  directories, `/tmp`, data folders) now inherit the session's project instead
+  of minting phantom basename projects (`scratchpad`, `data`, `tmp`, ...). The
+  host-side hook resolves the repository root itself and sends
+  `project=<root name>`, so a missing override already proves the cwd is
+  unresolvable; session-sticky attribution now accepts these events even
+  outside the session's cwd subtree, with the broad-anchor guards unchanged.
+  Deliberate rescopes keep working: git checkouts and markers arrive as
+  explicit overrides and never reach stickiness, and the default `basename`
+  strategy is untouched (#394).
+
 ## [1.26.1] - 2026-08-14
 
 ### Fixed
