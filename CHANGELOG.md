@@ -10,23 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added `[auth].secure_cookie` for HTTPS reverse-proxy deployments to mark
   `/web` browser authentication cookies `Secure` while preserving plain-HTTP
-  loopback compatibility by default (<PR>).
+  loopback compatibility by default (#396).
 
 ### Changed
 - Unauthenticated HTTP binds beyond loopback now fail closed before accepting
   requests. Intentional insecure LAN use requires `--allow-insecure-no-auth`;
   authenticated non-loopback HTTP remains available with its TLS warning
-  (<PR>).
+  (#396).
 
 ### Fixed
 - Hook session UUIDs now reject cross-owner reuse atomically before ingest-key,
   observation, summary, handoff, or end-state mutation; explicit root
-  `finalize-session --all-owners` recovery remains available (#security-audit).
+  `finalize-session --all-owners` recovery remains available (#396).
 - Newly created data directories, configuration files, SQLite databases,
   managed-workstream segments, and downloaded backups now receive owner-only
   Unix permissions before sensitive content is written, independent of the
   ambient umask. Existing installations are left unchanged; Windows relies on
-  filesystem ACLs (#security-audit).
+  filesystem ACLs (#396).
 - Under the `repo-root` project strategy, mid-session events whose cwd sits
   outside any git repository and any `.ai-memory.toml` marker (agent scratch
   directories, `/tmp`, data folders) now inherit the session's project instead
