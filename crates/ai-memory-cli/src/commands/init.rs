@@ -246,8 +246,28 @@ mod tests {
                 .is_some_and(|p| p.len() == 64),
             "parsed token_pepper must round-trip from the rendered template"
         );
+        // `[auth]` must stay the LAST section of config.default.toml: the
+        // block appended here emits bare keys, so any section added below it
+        // silently swallows them into the wrong table. Assert the structural
+        // rule directly rather than leaving it to whichever `[auth]` key
+        // happens to be checked above.
+        let rendered = std::fs::read_to_string(&cfg_path).unwrap();
+        let last_section = rendered
+            .lines()
+            .rfind(|line| line.trim_start().starts_with('['))
+            .expect("rendered config declares sections");
+        assert_eq!(
+            last_section.trim(),
+            "[auth]",
+            "[auth] must remain the last section; init appends bare keys after it"
+        );
         assert!(loaded.auth.bearer_token.is_none());
         assert!(!loaded.slots.per_user);
+        assert_eq!(
+            loaded.routing.mid_session,
+            ai_memory_core::MidSessionRouting::FollowCwd,
+            "generated config must preserve historical per-event attribution"
+        );
         assert_eq!(
             loaded.consolidation.max_input_tokens,
             ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS

@@ -112,10 +112,11 @@ can append observations or publish a pointer for the foreign actor.
 
 Owner and agent are what identify a session; scope is not. The same operator's
 session legitimately produces events in another project when its cwd moves, so
-a differing `(workspace, project)` is recorded rather than rejected. The one
-exception is a terminal event: a `SessionEnd` naming a different scope than its
-session is not that session's end, so it is dropped rather than ending someone
-else's session.
+a differing `(workspace, project)` is recorded rather than rejected — see
+[`[routing] mid_session`](marker-file.md#mid-session-navigation-routing-mid_session)
+for how those events are attributed. The one exception is a terminal event: a
+`SessionEnd` naming a different scope than its session is not that session's
+end, so it is dropped rather than ending someone else's session.
 
 ## Client requirements
 

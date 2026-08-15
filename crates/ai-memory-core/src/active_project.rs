@@ -93,6 +93,56 @@ pub enum ActiveProjectMode {
     PerActor,
 }
 
+/// Selects how the hook router attributes MID-SESSION events whose cwd has
+/// moved since the session started. Set under `[routing] mid_session`.
+///
+/// Distinct from [`ActiveProjectMode`], which namespaces the in-process
+/// "current project" pointer: this decides the DURABLE project written on
+/// observations, and it never affects session-CREATING events — opening a
+/// session always resolves from its own cwd.
+///
+/// `FollowCwd` is the default and preserves the historical behavior exactly:
+/// every mid-session event re-resolves from its own cwd, so `cd`-ing into a
+/// sibling checkout routes those observations to that checkout's project.
+///
+/// `Sticky` treats mid-session navigation as navigation: the session's project
+/// stays the source of truth wherever the agent wanders. This matches the
+/// product's own model — `sessions.project_id` holds exactly one value, and
+/// consolidation writes one page in the session's project — so following the
+/// cwd splits a session's raw record across projects while its page lands in
+/// only one. A `.ai-memory.toml` marker still wins in both modes: naming a
+/// project is a deliberate rescope, not drift (#394).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MidSessionRouting {
+    /// Re-resolve every mid-session event from its own cwd. Historical
+    /// behavior, and the default.
+    #[default]
+    #[serde(alias = "follow_cwd")]
+    FollowCwd,
+    /// Inherit the session's project for every mid-session event, overruling
+    /// a host-derived repo-root override but never a marker-declared one.
+    Sticky,
+}
+
+impl MidSessionRouting {
+    /// Whether this mode lets an established session overrule a
+    /// non-deliberate (host-derived) project override.
+    #[must_use]
+    pub const fn overrules_derived_override(self) -> bool {
+        matches!(self, Self::Sticky)
+    }
+
+    /// Stable config/log representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FollowCwd => "follow-cwd",
+            Self::Sticky => "sticky",
+        }
+    }
+}
+
 /// Composite identity used to key per-actor entries.
 /// This cache key namespaces active-project pointers only; it does not
 /// namespace durable hook `SessionId` records.
