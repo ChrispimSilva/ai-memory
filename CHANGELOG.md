@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `[routing] mid_session` to choose how a mid-session event is attributed
+  once the agent's cwd has moved. `follow-cwd` (default) keeps the historical
+  per-event resolution; `sticky` keeps the session's project wherever the agent
+  wanders, closing the cross-repo `cd` case that split one session's raw record
+  across two projects. Lifecycle hooks now tag each `project` override with its
+  provenance (`project_src=marker` or `project_src=repo-root`), so `sticky`
+  overrules a host-derived repo name while a `.ai-memory.toml` marker still
+  wins in both modes. Clients older than this release send no provenance and
+  keep their overrides authoritative (#394).
 - Added `[auth].secure_cookie` for HTTPS reverse-proxy deployments to mark
   `/web` browser authentication cookies `Secure` while preserving plain-HTTP
   loopback compatibility by default (#396).

@@ -15,9 +15,9 @@ use std::sync::{Arc, Weak};
 use ai_memory_consolidate::{Consolidator, ConsolidatorError};
 use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
-    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, NewHandoff, NewObservation, NewSession,
-    ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId, WorkstreamEvent,
-    WorkstreamEventKind,
+    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
+    NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
+    WorkstreamEvent, WorkstreamEventKind,
 };
 use ai_memory_store::{HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
@@ -38,7 +38,8 @@ use crate::capture_policy::{
 };
 use crate::log;
 use crate::payload::{
-    HookEnvelope, HookEvent, HookQuery, ProjectStrategy, body_is_subagent, parse_agent,
+    HookEnvelope, HookEvent, HookQuery, ProjectSource, ProjectStrategy, body_is_subagent,
+    parse_agent,
 };
 use crate::synth::synthesize_session_page;
 
@@ -493,6 +494,11 @@ pub struct HookState {
     pub trusted_proxy_identity: bool,
     /// Namespace slot injection by the qualified request identity.
     pub per_user_slots: bool,
+    /// `[routing] mid_session`: whether a mid-session event that wandered out
+    /// of the session's tree re-resolves from its own cwd (`follow-cwd`, the
+    /// default and historical behavior) or inherits the session's project
+    /// (`sticky`). Held here because the hooks crate makes no config reads.
+    pub mid_session_routing: ai_memory_core::MidSessionRouting,
 }
 
 /// The owner to stamp on the session and handoff rows this event creates
@@ -2114,6 +2120,58 @@ fn sticky_out_of_tree_under_repo_root(
         && meaningful_session_anchor(session_cwd, home_dir).is_some()
 }
 
+/// Whether this event's declared overrides leave room for session-sticky
+/// attribution at all (issue #394's `sticky` knob).
+///
+/// A marker-declared scope is a deliberate rescope in BOTH modes and always
+/// wins — that is the invariant the whole knob is built around. What `sticky`
+/// changes is the other kind of override: under `repo-root` the host hook
+/// derives `project=<checkout name>` from wherever the cwd happens to be, which
+/// carries no operator intent, so an established session may overrule it. The
+/// wire-level [`ProjectSource`] is what makes the two distinguishable; a client
+/// too old to tag its override reports `Unspecified` and keeps today's
+/// behavior, so `sticky` degrades safely rather than silently capturing
+/// deliberate rescopes.
+fn overrides_permit_sticky(
+    workspace_override: Option<&str>,
+    project_override: Option<&str>,
+    project_source: ProjectSource,
+    routing: MidSessionRouting,
+) -> bool {
+    // A workspace override only ever comes from a marker file.
+    if workspace_override.is_some() {
+        return false;
+    }
+    if project_override.is_none() {
+        return true;
+    }
+    routing.overrules_derived_override() && project_source.yields_to_session()
+}
+
+/// Whether the session's cwd anchor and the event's cwd admit stickiness.
+///
+/// `follow-cwd` keeps the two #394 paths: inside the session's own subtree, or
+/// out of tree under `repo-root` where a missing override already proves the
+/// cwd resolved to nothing. `sticky` extends out-of-tree inheritance to every
+/// strategy — the point of the knob is that mid-session navigation never
+/// rescopes, whether the agent wandered into `/tmp` or into a sibling
+/// checkout. The broad-anchor guard is deliberately NOT relaxed: a session
+/// rooted at `/` or `$HOME` still never sticks in either mode, or one stray
+/// session would fold every project beneath it into a single bucket (the #103
+/// catch-all failure mode).
+fn sticky_cwd_admits(
+    session_cwd: Option<&str>,
+    event_cwd: Option<&str>,
+    home_dir: Option<&str>,
+    strategy: ProjectStrategy,
+    routing: MidSessionRouting,
+) -> bool {
+    sticky_within_session_tree(session_cwd, event_cwd, home_dir)
+        || sticky_out_of_tree_under_repo_root(session_cwd, home_dir, strategy)
+        || (routing.overrules_derived_override()
+            && meaningful_session_anchor(session_cwd, home_dir).is_some())
+}
+
 async fn process_envelope(
     state: Arc<HookState>,
     env: HookEnvelope,
@@ -2266,20 +2324,26 @@ async fn process_authorized(
     //   the user's home — never sticks, or a stray session started in
     //   `$HOME` would fold every project beneath it into one bucket
     //   (the same catch-all failure #103 healed for repo_path keys).
-    let sticky_scope = if env.project_override.is_none() && env.workspace_override.is_none() {
+    // - Under `[routing] mid_session = "sticky"` the session also overrules a
+    //   host-derived `repo-root` override, closing the cross-repo `cd` case;
+    //   marker-declared scopes still win. See `overrides_permit_sticky`.
+    let sticky_scope = if overrides_permit_sticky(
+        env.workspace_override.as_deref(),
+        env.project_override.as_deref(),
+        env.project_source,
+        state.mid_session_routing,
+    ) {
         state
             .reader
             .find_session_scope(session_id)
             .await?
             .filter(|(_, _, session_cwd)| {
-                sticky_within_session_tree(
+                sticky_cwd_admits(
                     session_cwd.as_deref(),
                     env.cwd.as_deref(),
                     state.home_dir.as_deref(),
-                ) || sticky_out_of_tree_under_repo_root(
-                    session_cwd.as_deref(),
-                    state.home_dir.as_deref(),
                     env.project_strategy,
+                    state.mid_session_routing,
                 )
             })
     } else {
@@ -3131,6 +3195,7 @@ mod tests {
             )),
             ingest_gates: IngestGates::default(),
             per_user_slots: false,
+            mid_session_routing: MidSessionRouting::default(),
         }
     }
 
@@ -3658,6 +3723,90 @@ mod tests {
         ));
     }
 
+    // The override gate for `[routing] mid_session` (#394). The invariant
+    // under test: a marker-declared project is a deliberate rescope and wins
+    // in BOTH modes; only a host-derived repo-root name may yield, and only
+    // under `sticky`.
+    #[test]
+    fn override_gate_distinguishes_marker_from_derived_project() {
+        use MidSessionRouting::{FollowCwd, Sticky};
+        use ProjectSource::{Marker, RepoRoot, Unspecified};
+
+        // (workspace, project, source, routing, expected)
+        let cases = [
+            // No override at all: both modes may stick (pre-#394 behavior).
+            (None, None, Unspecified, FollowCwd, true),
+            (None, None, Unspecified, Sticky, true),
+            // Marker-declared project: never yields, in either mode.
+            (None, Some("acme"), Marker, FollowCwd, false),
+            (None, Some("acme"), Marker, Sticky, false),
+            // Host-derived repo-root name: yields only under `sticky`. This
+            // is the cross-repo `cd` case the knob exists for.
+            (None, Some("acme"), RepoRoot, FollowCwd, false),
+            (None, Some("acme"), RepoRoot, Sticky, true),
+            // An untagged override from an older client stays authoritative,
+            // so `sticky` degrades safely instead of capturing a rescope.
+            (None, Some("acme"), Unspecified, Sticky, false),
+            // A marker workspace is itself a deliberate scope declaration.
+            (Some("oss"), None, Unspecified, Sticky, false),
+            (Some("oss"), Some("acme"), RepoRoot, Sticky, false),
+        ];
+        for (ws, project, source, routing, expected) in cases {
+            assert_eq!(
+                overrides_permit_sticky(ws, project, source, routing),
+                expected,
+                "ws={ws:?} project={project:?} source={} routing={}",
+                source.as_str(),
+                routing.as_str(),
+            );
+        }
+    }
+
+    // `sticky` extends out-of-tree inheritance to every strategy, but must
+    // NOT relax the broad-anchor guard that keeps a stray `$HOME` session
+    // from becoming a catch-all (#103).
+    #[test]
+    fn sticky_mode_extends_out_of_tree_but_keeps_broad_anchor_guard() {
+        use MidSessionRouting::{FollowCwd, Sticky};
+
+        // Basename strategy, cwd outside the session tree: only `sticky`.
+        assert!(!sticky_cwd_admits(
+            Some("/a/b"),
+            Some("/elsewhere"),
+            Some("/home/user"),
+            ProjectStrategy::Basename,
+            FollowCwd,
+        ));
+        assert!(sticky_cwd_admits(
+            Some("/a/b"),
+            Some("/elsewhere"),
+            Some("/home/user"),
+            ProjectStrategy::Basename,
+            Sticky,
+        ));
+        // Broad anchors refuse in `sticky` too — the guard is not relaxed.
+        for anchor in [Some("/"), Some("/home/user"), None] {
+            assert!(
+                !sticky_cwd_admits(
+                    anchor,
+                    Some("/elsewhere"),
+                    Some("/home/user"),
+                    ProjectStrategy::Basename,
+                    Sticky,
+                ),
+                "broad anchor {anchor:?} must never stick"
+            );
+        }
+        // In-tree stickiness is unchanged by the mode.
+        assert!(sticky_cwd_admits(
+            Some("/a/b"),
+            Some("/a/b/c"),
+            Some("/home/user"),
+            ProjectStrategy::Basename,
+            FollowCwd,
+        ));
+    }
+
     // Session-sticky attribution: a mid-session `cd subdir/` inside a
     // NON-GIT project must keep observations in the session's project.
     // This is the exact production failure behind the fragment cleanup:
@@ -3898,6 +4047,196 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "basename strategy keeps v1 per-event resolution"
+        );
+    }
+
+    /// Fire a mid-session `cd` from one checkout into a sibling one, with the
+    /// host hook tagging each `project` override by provenance, and report
+    /// where the second observation landed. The shared fixture behind the
+    /// cross-repo cases below (#394).
+    async fn cross_repo_cd(
+        state: &HookState,
+        sid: &str,
+        source: &str,
+    ) -> (ProjectId, Option<ProjectId>) {
+        let fire = |event: &str, cwd: &str, project: &str, project_src: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string()),
+                    project: Some(project.to_string()),
+                    project_src: project_src.map(str::to_owned),
+                    project_strategy: Some("repo-root".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd,
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+        process(
+            state,
+            fire("session-start", "/checkouts/repo-a", "repo-a", Some(source)),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            state,
+            fire("post-tool-use", "/checkouts/repo-b", "repo-b", Some(source)),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        let landed = observations.last().unwrap().project_id;
+        let repo_b = state
+            .reader
+            .find_project(state.workspace_id, "repo-b".to_string())
+            .await
+            .unwrap();
+        (landed, repo_b)
+    }
+
+    // The cross-repo `cd` case #394 left open. Under `sticky`, a mid-session
+    // hop into a sibling checkout keeps the session's project: the override
+    // is host-derived (`project_src=repo-root`), so it carries no operator
+    // intent and yields to the session.
+    #[tokio::test]
+    async fn sticky_routing_keeps_the_session_project_across_a_sibling_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.mid_session_routing = MidSessionRouting::Sticky;
+        let sid = "77777777-7777-4777-8777-777777777777";
+
+        let repo_a = state
+            .reader
+            .find_project(state.workspace_id, "repo-a".to_string())
+            .await
+            .unwrap();
+        assert_eq!(repo_a, None, "fixture starts clean");
+
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root").await;
+        let repo_a = state
+            .reader
+            .find_project(state.workspace_id, "repo-a".to_string())
+            .await
+            .unwrap()
+            .expect("session project exists");
+        assert_eq!(
+            landed, repo_a,
+            "a mid-session hop into a sibling checkout must stay in the session's project"
+        );
+        assert_eq!(
+            repo_b, None,
+            "sticky routing must not split the session's record into a second project"
+        );
+    }
+
+    // The same fixture under the DEFAULT mode must behave exactly as it does
+    // today: the sibling checkout's project is minted and takes the event.
+    // This is the guard that `sticky` is genuinely opt-in.
+    #[tokio::test]
+    async fn follow_cwd_routing_still_splits_across_a_sibling_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        assert_eq!(
+            state.mid_session_routing,
+            MidSessionRouting::FollowCwd,
+            "follow-cwd must remain the default"
+        );
+        let sid = "88888888-8888-4888-8888-888888888888";
+
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root").await;
+        let repo_b = repo_b.expect("follow-cwd mints the visited checkout's project");
+        assert_eq!(
+            landed, repo_b,
+            "follow-cwd must keep resolving every event from its own cwd"
+        );
+    }
+
+    // Even under `sticky`, a `.ai-memory.toml` naming the project is a
+    // deliberate rescope and must still win — the invariant the provenance
+    // parameter exists to protect.
+    #[tokio::test]
+    async fn sticky_routing_still_yields_to_a_marker_declared_project() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.mid_session_routing = MidSessionRouting::Sticky;
+        let sid = "99999999-9999-4999-8999-999999999999";
+
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "marker").await;
+        let repo_b = repo_b.expect("a marker-declared project must still be created");
+        assert_eq!(
+            landed, repo_b,
+            "a marker override is a deliberate rescope and outranks stickiness"
+        );
+    }
+
+    // A client too old to tag its override reports no provenance. `sticky`
+    // must treat that as authoritative rather than assume it was derived,
+    // so a mixed-version fleet cannot silently capture deliberate rescopes.
+    #[tokio::test]
+    async fn sticky_routing_does_not_capture_untagged_overrides_from_old_clients() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.mid_session_routing = MidSessionRouting::Sticky;
+        let sid = "abababab-abab-4bab-8bab-abababababab";
+        let fire = |event: &str, cwd: &str, project: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string()),
+                    project: Some(project.to_string()),
+                    // No `project_src`: the pre-#394 wire format.
+                    project_strategy: Some("repo-root".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd,
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+        process(
+            &state,
+            fire("session-start", "/checkouts/legacy-a", "legacy-a"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire("post-tool-use", "/checkouts/legacy-b", "legacy-b"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state
+                .reader
+                .find_project(state.workspace_id, "legacy-b".to_string())
+                .await
+                .unwrap()
+                .is_some(),
+            "an untagged override must stay authoritative under sticky"
         );
     }
 

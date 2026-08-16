@@ -207,6 +207,10 @@ pub struct Config {
     /// and `per_actor` are for shared installs. See [`AutoScopeSettings`]
     /// and [`ai_memory_core::ActiveProjectMode`].
     pub auto_scope: AutoScopeSettings,
+    /// `[routing]` — how mid-session events whose cwd moved are attributed.
+    /// Default `follow-cwd` preserves the historical per-event resolution;
+    /// `sticky` keeps the session's project. See [`RoutingSettings`].
+    pub routing: RoutingSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -512,6 +516,18 @@ impl Default for AutoScopeSettings {
     }
 }
 
+/// `[routing]` section of `config.toml`.
+///
+/// Set under `[routing]` in `config.toml` or via the
+/// `AI_MEMORY_ROUTING__MID_SESSION` env var.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingSettings {
+    /// `follow-cwd` (default) or `sticky`. See
+    /// [`ai_memory_core::MidSessionRouting`] for full semantics.
+    pub mid_session: ai_memory_core::MidSessionRouting,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -540,6 +556,7 @@ impl Default for Config {
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
+            routing: RoutingSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
