@@ -3054,6 +3054,239 @@ pub fn move_project_workspace(
     })
 }
 
+/// How [`move_session`] treats the session's consolidated wiki page
+/// (`sessions/<session_id>.md`) when the session changes scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagesMode {
+    /// Re-stamp every version of the page into the destination scope so the
+    /// curated page and its supersession history follow the session. Fails
+    /// with [`StoreError::PagePathTaken`] when the destination already holds
+    /// a latest page at that path.
+    Move,
+    /// Leave the rows in the source scope but clear `is_latest`, so the next
+    /// consolidation of the session writes a fresh page in the destination.
+    Regenerate,
+}
+
+/// Summary returned by [`move_session`] and exposed via
+/// [`crate::writer::WriterHandle::move_session`]. Populated identically for a
+/// dry run (`commit = false`), whose transaction is rolled back after counting.
+#[derive(Debug, Clone)]
+pub struct MoveSessionSummary {
+    /// Whether the `sessions` row changed scope. `false` when the target
+    /// scope equals the source scope (no-op; every count is zero).
+    pub session_moved: bool,
+    /// `observations` rows re-stamped (every row of the session, including
+    /// any that landed outside the session row's own scope).
+    pub observations: u64,
+    /// `handoffs` rows re-stamped (`from_session_id` = the session).
+    pub handoffs: u64,
+    /// `session_consolidation_jobs` rows re-stamped.
+    pub consolidation_jobs: u64,
+    /// `auto_improve_runs` rows re-stamped.
+    pub auto_improve_runs: u64,
+    /// `auto_improve_scheduler_claims` rows re-stamped.
+    pub auto_improve_claims: u64,
+    /// `pages` rows (all versions) re-stamped under [`PagesMode::Move`].
+    pub page_versions_moved: u64,
+    /// `pages` rows whose `is_latest` was cleared under
+    /// [`PagesMode::Regenerate`].
+    pub pages_regenerated: u64,
+    /// The session page path when the source scope held at least one version
+    /// of it, so the caller can move or retire the on-disk file too.
+    pub page_path: Option<String>,
+    /// Scope the session was read from.
+    pub from_workspace: WorkspaceId,
+    /// Scope the session was read from.
+    pub from_project: ProjectId,
+    /// Scope the session now belongs to.
+    pub to_workspace: WorkspaceId,
+    /// Scope the session now belongs to.
+    pub to_project: ProjectId,
+    /// The session's recorded working directory, left untouched by the move
+    /// (historical truth; the caller may warn when it no longer matches the
+    /// destination project).
+    pub cwd: Option<String>,
+}
+
+/// Re-stamp one session and every row that hangs off it (`observations`,
+/// `handoffs` it produced, its consolidation jobs, auto-improve runs and
+/// scheduler claim) into `(target_workspace, target_project)` in ONE
+/// transaction, plus its `sessions/<session_id>.md` page per `pages`.
+///
+/// `commit = false` performs the same work and rolls the transaction back
+/// before returning, so the summary is an exact dry run. A target equal to the
+/// source is a no-op that reports zero counts and `session_moved = false`.
+///
+/// The `workspace_id`/`project_id` pairing triggers only guard INSERT, so the
+/// target pair is validated against `projects` here before any UPDATE runs.
+///
+/// # Errors
+/// - [`StoreError::NotFound`] when the session or the target project (in the
+///   target workspace) does not exist.
+/// - [`StoreError::PagePathTaken`] under [`PagesMode::Move`] when the target
+///   scope already has a latest page at the session page path.
+/// - [`StoreError::Sqlite`] on any other SQL failure.
+pub fn move_session(
+    conn: &mut Connection,
+    session_id: SessionId,
+    target_workspace: WorkspaceId,
+    target_project: ProjectId,
+    pages: PagesMode,
+    commit: bool,
+) -> StoreResult<MoveSessionSummary> {
+    let tx = conn.transaction()?;
+
+    let sid = session_id.as_bytes();
+    let row = tx
+        .query_row(
+            "SELECT workspace_id, project_id, cwd FROM sessions WHERE id = ?1",
+            params![&sid[..]],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((from_ws, from_proj, cwd)) = row else {
+        return Err(StoreError::NotFound(format!(
+            "session {session_id} not found"
+        )));
+    };
+    let from_workspace = WorkspaceId::from_slice(&from_ws)?;
+    let from_project = ProjectId::from_slice(&from_proj)?;
+
+    let mut summary = MoveSessionSummary {
+        session_moved: false,
+        observations: 0,
+        handoffs: 0,
+        consolidation_jobs: 0,
+        auto_improve_runs: 0,
+        auto_improve_claims: 0,
+        page_versions_moved: 0,
+        pages_regenerated: 0,
+        page_path: None,
+        from_workspace,
+        from_project,
+        to_workspace: target_workspace,
+        to_project: target_project,
+        cwd,
+    };
+    if from_workspace == target_workspace && from_project == target_project {
+        return Ok(summary);
+    }
+
+    let to_ws = target_workspace.as_bytes();
+    let to_proj = target_project.as_bytes();
+    let target_exists: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![&to_proj[..], &to_ws[..]],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if target_exists.is_none() {
+        return Err(StoreError::NotFound(format!(
+            "project {target_project} not found in workspace {target_workspace}"
+        )));
+    }
+
+    let sessions_updated = tx.execute(
+        "UPDATE sessions SET workspace_id = ?1, project_id = ?2 WHERE id = ?3",
+        params![&to_ws[..], &to_proj[..], &sid[..]],
+    )?;
+    summary.session_moved = sessions_updated == 1;
+    // Fires `observations_fts_au` per row (delete + reinsert of the same
+    // text); the FTS index stays consistent inside this transaction.
+    summary.observations = tx.execute(
+        "UPDATE observations SET workspace_id = ?1, project_id = ?2 WHERE session_id = ?3",
+        params![&to_ws[..], &to_proj[..], &sid[..]],
+    )? as u64;
+    summary.handoffs = tx.execute(
+        "UPDATE handoffs SET workspace_id = ?1, project_id = ?2 WHERE from_session_id = ?3",
+        params![&to_ws[..], &to_proj[..], &sid[..]],
+    )? as u64;
+    summary.consolidation_jobs = tx.execute(
+        "UPDATE session_consolidation_jobs SET workspace_id = ?1, project_id = ?2 \
+         WHERE session_id = ?3",
+        params![&to_ws[..], &to_proj[..], &sid[..]],
+    )? as u64;
+    summary.auto_improve_runs = tx.execute(
+        "UPDATE auto_improve_runs SET workspace_id = ?1, project_id = ?2 WHERE session_id = ?3",
+        params![&to_ws[..], &to_proj[..], &sid[..]],
+    )? as u64;
+    summary.auto_improve_claims = tx.execute(
+        "UPDATE auto_improve_scheduler_claims SET workspace_id = ?1, project_id = ?2 \
+         WHERE session_id = ?3",
+        params![&to_ws[..], &to_proj[..], &sid[..]],
+    )? as u64;
+
+    let page_path = format!("sessions/{session_id}.md");
+    let source_versions: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+        params![&from_ws[..], &from_proj[..], page_path.as_str()],
+        |row| row.get(0),
+    )?;
+    if source_versions > 0 {
+        match pages {
+            PagesMode::Move => {
+                let taken: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM pages \
+                         WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                           AND is_latest = 1",
+                        params![&to_ws[..], &to_proj[..], page_path.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if taken.is_some() {
+                    return Err(StoreError::PagePathTaken { path: page_path });
+                }
+                summary.page_versions_moved = tx.execute(
+                    "UPDATE pages SET workspace_id = ?1, project_id = ?2 \
+                     WHERE workspace_id = ?3 AND project_id = ?4 AND path = ?5",
+                    params![
+                        &to_ws[..],
+                        &to_proj[..],
+                        &from_ws[..],
+                        &from_proj[..],
+                        page_path.as_str()
+                    ],
+                )? as u64;
+            }
+            PagesMode::Regenerate => {
+                summary.pages_regenerated = tx.execute(
+                    "UPDATE pages SET is_latest = 0 \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                       AND is_latest = 1",
+                    params![&from_ws[..], &from_proj[..], page_path.as_str()],
+                )? as u64;
+            }
+        }
+        summary.page_path = Some(page_path);
+    }
+
+    audit(
+        &tx,
+        "move_session",
+        Some(to_ws),
+        Some(to_proj),
+        None,
+        None,
+        Timestamp::now().as_microsecond(),
+    )?;
+
+    if commit {
+        tx.commit()?;
+    } else {
+        tx.rollback()?;
+    }
+    Ok(summary)
+}
+
 /// Remove embedding rows in a workspace/project scope whose `(provider, model, dim)`
 /// does not match the configured triple, plus rows tied to superseded pages.
 pub fn delete_stale_page_embeddings(
@@ -4952,6 +5185,393 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(src_pages, 1, "rollback must preserve source pages");
+    }
+
+    /// Seed one session in `(ws, proj)` with everything `move_session`
+    /// re-stamps: two observations, one handoff it produced, one completed
+    /// consolidation job, one auto-improve run, one scheduler claim, and two
+    /// versions of its `sessions/<id>.md` page. Returns the session id.
+    fn seed_movable_session(conn: &mut Connection, ws: WorkspaceId, proj: ProjectId) -> SessionId {
+        use ai_memory_core::ObservationKind;
+
+        let sid = SessionId::new();
+        begin_session(
+            conn,
+            &NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some("/repo/src".into()),
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        for n in 0..2 {
+            insert_observation(
+                conn,
+                &NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: format!("movable-obs-{n}"),
+                    body: "zebra token body".into(),
+                    importance: 5,
+                },
+            )
+            .unwrap();
+        }
+        end_session(conn, &sid, None).unwrap();
+        insert_handoff(
+            conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: Some(sid),
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "handoff from the movable session".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        assert!(crate::session_consolidation::enqueue(conn, ws, proj, sid).unwrap());
+        conn.execute(
+            "UPDATE session_consolidation_jobs SET state = 'completed', completed_at = 1 \
+             WHERE session_id = ?1",
+            params![sid.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_runs \
+             (id, workspace_id, project_id, session_id, proposal_actor_json, created_at) \
+             VALUES (?1, ?2, ?3, ?4, '{}', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                ws.as_bytes(),
+                proj.as_bytes(),
+                sid.as_bytes()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at) VALUES (?1, ?2, ?3, 1)",
+            params![ws.as_bytes(), proj.as_bytes(), sid.as_bytes()],
+        )
+        .unwrap();
+        let path = format!("sessions/{sid}.md");
+        upsert_page(conn, &page(ws, proj, &path, "first version")).unwrap();
+        upsert_page(conn, &page(ws, proj, &path, "second version")).unwrap();
+        sid
+    }
+
+    /// Rows of `table` keyed to `sid` (via `session_col`) that sit in the
+    /// given scope.
+    fn session_rows_in_scope(
+        conn: &Connection,
+        table: &str,
+        session_col: &str,
+        sid: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> i64 {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {table} \
+                 WHERE {session_col} = ?1 AND workspace_id = ?2 AND project_id = ?3"
+            ),
+            params![sid.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// `(all versions, latest versions)` of the session page in a scope.
+    fn session_page_versions(
+        conn: &Connection,
+        sid: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> (i64, i64) {
+        let path = format!("sessions/{sid}.md");
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(is_latest), 0) FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+            params![ws.as_bytes(), proj.as_bytes(), path],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Observations of `sid` reachable through FTS in a scope, i.e. what a
+    /// scoped search would return after the move.
+    fn fts_hits_in_scope(
+        conn: &Connection,
+        sid: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM observations_fts \
+             JOIN observations ON observations.rowid = observations_fts.rowid \
+             WHERE observations_fts MATCH 'zebra' \
+               AND observations.session_id = ?1 \
+               AND observations.workspace_id = ?2 AND observations.project_id = ?3",
+            params![sid.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The `(table, session column)` pairs `move_session` re-stamps besides
+    /// `sessions` and `pages`.
+    const MOVE_SESSION_CHILD_TABLES: [(&str, &str); 5] = [
+        ("observations", "session_id"),
+        ("handoffs", "from_session_id"),
+        ("session_consolidation_jobs", "session_id"),
+        ("auto_improve_runs", "session_id"),
+        ("auto_improve_scheduler_claims", "session_id"),
+    ];
+
+    fn assert_session_bundle_in_scope(
+        conn: &Connection,
+        sid: SessionId,
+        here: (WorkspaceId, ProjectId),
+        gone: (WorkspaceId, ProjectId),
+    ) {
+        assert_eq!(
+            session_rows_in_scope(conn, "sessions", "id", sid, here.0, here.1),
+            1
+        );
+        assert_eq!(
+            session_rows_in_scope(conn, "sessions", "id", sid, gone.0, gone.1),
+            0
+        );
+        for (table, col) in MOVE_SESSION_CHILD_TABLES {
+            let expected = if table == "observations" { 2 } else { 1 };
+            assert_eq!(
+                session_rows_in_scope(conn, table, col, sid, here.0, here.1),
+                expected,
+                "{table} rows must sit in the expected scope"
+            );
+            assert_eq!(
+                session_rows_in_scope(conn, table, col, sid, gone.0, gone.1),
+                0,
+                "{table} rows must not sit in the other scope"
+            );
+        }
+    }
+
+    #[test]
+    fn move_session_dry_run_reports_counts_and_changes_nothing() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+        let sid = seed_movable_session(&mut conn, src_ws, src_proj);
+
+        let summary =
+            move_session(&mut conn, sid, dst_ws, dst_proj, PagesMode::Move, false).unwrap();
+        assert!(summary.session_moved);
+        assert_eq!(summary.observations, 2);
+        assert_eq!(summary.handoffs, 1);
+        assert_eq!(summary.consolidation_jobs, 1);
+        assert_eq!(summary.auto_improve_runs, 1);
+        assert_eq!(summary.auto_improve_claims, 1);
+        assert_eq!(summary.page_versions_moved, 2);
+        assert_eq!(summary.pages_regenerated, 0);
+        assert_eq!(
+            summary.page_path.as_deref(),
+            Some(format!("sessions/{sid}.md").as_str())
+        );
+        assert_eq!(summary.from_workspace, src_ws);
+        assert_eq!(summary.from_project, src_proj);
+        assert_eq!(summary.to_workspace, dst_ws);
+        assert_eq!(summary.to_project, dst_proj);
+        assert_eq!(summary.cwd.as_deref(), Some("/repo/src"));
+
+        // Rolled back: everything still lives in the source scope.
+        assert_session_bundle_in_scope(&conn, sid, (src_ws, src_proj), (dst_ws, dst_proj));
+        assert_eq!(session_page_versions(&conn, sid, src_ws, src_proj), (2, 1));
+        assert_eq!(session_page_versions(&conn, sid, dst_ws, dst_proj), (0, 0));
+        assert_eq!(fts_hits_in_scope(&conn, sid, src_ws, src_proj), 2);
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE op = 'move_session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 0, "dry run must not leave an audit row");
+    }
+
+    #[test]
+    fn move_session_restamps_dependent_rows_and_page_versions() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+        let sid = seed_movable_session(&mut conn, src_ws, src_proj);
+
+        let summary =
+            move_session(&mut conn, sid, dst_ws, dst_proj, PagesMode::Move, true).unwrap();
+        assert!(summary.session_moved);
+        assert_eq!(summary.observations, 2);
+        assert_eq!(summary.page_versions_moved, 2);
+        assert_eq!(summary.pages_regenerated, 0);
+
+        assert_session_bundle_in_scope(&conn, sid, (dst_ws, dst_proj), (src_ws, src_proj));
+        // Both versions moved and the supersession chain kept exactly one latest.
+        assert_eq!(session_page_versions(&conn, sid, dst_ws, dst_proj), (2, 1));
+        assert_eq!(session_page_versions(&conn, sid, src_ws, src_proj), (0, 0));
+        // The FTS index followed the observations into the new scope.
+        assert_eq!(fts_hits_in_scope(&conn, sid, dst_ws, dst_proj), 2);
+        assert_eq!(fts_hits_in_scope(&conn, sid, src_ws, src_proj), 0);
+        // cwd is historical truth and stays put.
+        let cwd: Option<String> = conn
+            .query_row(
+                "SELECT cwd FROM sessions WHERE id = ?1",
+                params![sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cwd.as_deref(), Some("/repo/src"));
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE op = 'move_session' AND workspace_id = ?1 AND project_id = ?2",
+                params![dst_ws.as_bytes(), dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    #[test]
+    fn move_session_rejects_page_path_taken_in_target_and_rolls_back() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+        let sid = seed_movable_session(&mut conn, src_ws, src_proj);
+        let path = format!("sessions/{sid}.md");
+        upsert_page(&mut conn, &page(dst_ws, dst_proj, &path, "already here")).unwrap();
+
+        let err = move_session(&mut conn, sid, dst_ws, dst_proj, PagesMode::Move, true)
+            .expect_err("latest page at the same path in the target must block the move");
+        assert!(
+            matches!(&err, StoreError::PagePathTaken { path: p } if *p == path),
+            "unexpected error: {err:?}"
+        );
+        // Nothing moved: the session rows were re-stamped inside the same
+        // transaction and must have rolled back with the page check.
+        assert_session_bundle_in_scope(&conn, sid, (src_ws, src_proj), (dst_ws, dst_proj));
+        assert_eq!(session_page_versions(&conn, sid, src_ws, src_proj), (2, 1));
+        assert_eq!(session_page_versions(&conn, sid, dst_ws, dst_proj), (1, 1));
+    }
+
+    #[test]
+    fn move_session_regenerate_retires_source_page_and_moves_rows() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+        let sid = seed_movable_session(&mut conn, src_ws, src_proj);
+        // A latest page at the path in the target is fine under Regenerate.
+        let path = format!("sessions/{sid}.md");
+        upsert_page(&mut conn, &page(dst_ws, dst_proj, &path, "already here")).unwrap();
+
+        let summary = move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Regenerate,
+            true,
+        )
+        .unwrap();
+        assert!(summary.session_moved);
+        assert_eq!(summary.page_versions_moved, 0);
+        assert_eq!(summary.pages_regenerated, 1);
+        assert_eq!(summary.page_path.as_deref(), Some(path.as_str()));
+
+        assert_session_bundle_in_scope(&conn, sid, (dst_ws, dst_proj), (src_ws, src_proj));
+        // Source versions stay where they are, none of them latest anymore.
+        assert_eq!(session_page_versions(&conn, sid, src_ws, src_proj), (2, 0));
+        assert_eq!(session_page_versions(&conn, sid, dst_ws, dst_proj), (1, 1));
+    }
+
+    #[test]
+    fn move_session_without_page_reports_no_page_path() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+        let sid = seed_movable_session(&mut conn, src_ws, src_proj);
+        conn.execute(
+            "DELETE FROM pages WHERE workspace_id = ?1 AND project_id = ?2",
+            params![src_ws.as_bytes(), src_proj.as_bytes()],
+        )
+        .unwrap();
+
+        let summary =
+            move_session(&mut conn, sid, dst_ws, dst_proj, PagesMode::Move, true).unwrap();
+        assert!(summary.session_moved);
+        assert_eq!(summary.page_versions_moved, 0);
+        assert_eq!(summary.pages_regenerated, 0);
+        assert_eq!(summary.page_path, None);
+    }
+
+    #[test]
+    fn move_session_unknown_session_is_not_found() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let err = move_session(&mut conn, SessionId::new(), ws, proj, PagesMode::Move, true)
+            .expect_err("unknown session must not succeed");
+        assert!(
+            matches!(err, StoreError::NotFound(_)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn move_session_unknown_target_project_is_not_found() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let sid = seed_movable_session(&mut conn, src_ws, src_proj);
+
+        // A project id that exists, but not in the requested workspace: the
+        // pairing triggers only guard INSERT, so the op must refuse it itself.
+        let err = move_session(&mut conn, sid, dst_ws, src_proj, PagesMode::Move, true)
+            .expect_err("target project outside the target workspace must be refused");
+        assert!(
+            matches!(err, StoreError::NotFound(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_session_bundle_in_scope(&conn, sid, (src_ws, src_proj), (dst_ws, src_proj));
+    }
+
+    #[test]
+    fn move_session_same_scope_is_a_noop_summary() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = seed_movable_session(&mut conn, ws, proj);
+
+        let summary = move_session(&mut conn, sid, ws, proj, PagesMode::Move, true).unwrap();
+        assert!(!summary.session_moved);
+        assert_eq!(summary.observations, 0);
+        assert_eq!(summary.handoffs, 0);
+        assert_eq!(summary.consolidation_jobs, 0);
+        assert_eq!(summary.auto_improve_runs, 0);
+        assert_eq!(summary.auto_improve_claims, 0);
+        assert_eq!(summary.page_versions_moved, 0);
+        assert_eq!(summary.pages_regenerated, 0);
+        assert_eq!(summary.page_path, None);
+        assert_eq!(summary.from_workspace, ws);
+        assert_eq!(summary.to_project, proj);
+        assert_eq!(summary.cwd.as_deref(), Some("/repo/src"));
+        assert_eq!(session_page_versions(&conn, sid, ws, proj), (2, 1));
     }
 
     #[test]
