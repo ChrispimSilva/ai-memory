@@ -3056,12 +3056,14 @@ pub fn move_project_workspace(
 
 /// How [`move_session`] treats the session's consolidated wiki page
 /// (`sessions/<session_id>.md`) when the session changes scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PagesMode {
     /// Re-stamp every version of the page into the destination scope so the
     /// curated page and its supersession history follow the session. Fails
     /// with [`StoreError::PagePathTaken`] when the destination already holds
     /// a latest page at that path.
+    #[default]
     Move,
     /// Leave the rows in the source scope but clear `is_latest`, so the next
     /// consolidation of the session writes a fresh page in the destination.
@@ -3117,6 +3119,8 @@ pub struct MoveSessionSummary {
 /// `commit = false` performs the same work and rolls the transaction back
 /// before returning, so the summary is an exact dry run. A target equal to the
 /// source is a no-op that reports zero counts and `session_moved = false`.
+/// `author_id` is the operator recorded on the `audit_log` row, as in
+/// [`rename_project`].
 ///
 /// The `workspace_id`/`project_id` pairing triggers only guard INSERT, so the
 /// target pair is validated against `projects` here before any UPDATE runs.
@@ -3133,6 +3137,7 @@ pub fn move_session(
     target_workspace: WorkspaceId,
     target_project: ProjectId,
     pages: PagesMode,
+    author_id: Option<ai_memory_core::UserId>,
     commit: bool,
 ) -> StoreResult<MoveSessionSummary> {
     let tx = conn.transaction()?;
@@ -3275,7 +3280,7 @@ pub fn move_session(
         Some(to_ws),
         Some(to_proj),
         None,
-        None,
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
         Timestamp::now().as_microsecond(),
     )?;
 
@@ -5377,8 +5382,16 @@ pub(crate) mod tests {
         let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
         let sid = seed_movable_session(&mut conn, src_ws, src_proj);
 
-        let summary =
-            move_session(&mut conn, sid, dst_ws, dst_proj, PagesMode::Move, false).unwrap();
+        let summary = move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(summary.session_moved);
         assert_eq!(summary.observations, 2);
         assert_eq!(summary.handoffs, 1);
@@ -5419,8 +5432,16 @@ pub(crate) mod tests {
         let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
         let sid = seed_movable_session(&mut conn, src_ws, src_proj);
 
-        let summary =
-            move_session(&mut conn, sid, dst_ws, dst_proj, PagesMode::Move, true).unwrap();
+        let summary = move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
         assert!(summary.session_moved);
         assert_eq!(summary.observations, 2);
         assert_eq!(summary.page_versions_moved, 2);
@@ -5462,8 +5483,16 @@ pub(crate) mod tests {
         let path = format!("sessions/{sid}.md");
         upsert_page(&mut conn, &page(dst_ws, dst_proj, &path, "already here")).unwrap();
 
-        let err = move_session(&mut conn, sid, dst_ws, dst_proj, PagesMode::Move, true)
-            .expect_err("latest page at the same path in the target must block the move");
+        let err = move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .expect_err("latest page at the same path in the target must block the move");
         assert!(
             matches!(&err, StoreError::PagePathTaken { path: p } if *p == path),
             "unexpected error: {err:?}"
@@ -5491,6 +5520,7 @@ pub(crate) mod tests {
             dst_ws,
             dst_proj,
             PagesMode::Regenerate,
+            None,
             true,
         )
         .unwrap();
@@ -5517,8 +5547,16 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let summary =
-            move_session(&mut conn, sid, dst_ws, dst_proj, PagesMode::Move, true).unwrap();
+        let summary = move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
         assert!(summary.session_moved);
         assert_eq!(summary.page_versions_moved, 0);
         assert_eq!(summary.pages_regenerated, 0);
@@ -5528,8 +5566,16 @@ pub(crate) mod tests {
     #[test]
     fn move_session_unknown_session_is_not_found() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
-        let err = move_session(&mut conn, SessionId::new(), ws, proj, PagesMode::Move, true)
-            .expect_err("unknown session must not succeed");
+        let err = move_session(
+            &mut conn,
+            SessionId::new(),
+            ws,
+            proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .expect_err("unknown session must not succeed");
         assert!(
             matches!(err, StoreError::NotFound(_)),
             "unexpected error: {err:?}"
@@ -5544,8 +5590,16 @@ pub(crate) mod tests {
 
         // A project id that exists, but not in the requested workspace: the
         // pairing triggers only guard INSERT, so the op must refuse it itself.
-        let err = move_session(&mut conn, sid, dst_ws, src_proj, PagesMode::Move, true)
-            .expect_err("target project outside the target workspace must be refused");
+        let err = move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            src_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .expect_err("target project outside the target workspace must be refused");
         assert!(
             matches!(err, StoreError::NotFound(_)),
             "unexpected error: {err:?}"
@@ -5558,7 +5612,7 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let sid = seed_movable_session(&mut conn, ws, proj);
 
-        let summary = move_session(&mut conn, sid, ws, proj, PagesMode::Move, true).unwrap();
+        let summary = move_session(&mut conn, sid, ws, proj, PagesMode::Move, None, true).unwrap();
         assert!(!summary.session_moved);
         assert_eq!(summary.observations, 0);
         assert_eq!(summary.handoffs, 0);

@@ -317,6 +317,7 @@ pub(crate) enum WriteCmd {
         target_workspace: WorkspaceId,
         target_project: ProjectId,
         pages: PagesMode,
+        author_id: Option<UserId>,
         commit: bool,
         reply: oneshot::Sender<StoreResult<MoveSessionSummary>>,
     },
@@ -1258,7 +1259,8 @@ impl WriterHandle {
     /// `(target_workspace, target_project)` in one transaction. With
     /// `commit = false` the transaction is rolled back after counting, so the
     /// summary is an exact dry run. The target project must already exist;
-    /// the caller moves the on-disk page file afterwards.
+    /// the caller moves the on-disk page file afterwards. `author_id` is the
+    /// operator recorded on the audit row.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down,
@@ -1272,6 +1274,7 @@ impl WriterHandle {
         target_workspace: WorkspaceId,
         target_project: ProjectId,
         pages: PagesMode,
+        author_id: Option<UserId>,
         commit: bool,
     ) -> StoreResult<MoveSessionSummary> {
         let (tx, rx) = oneshot::channel();
@@ -1280,6 +1283,7 @@ impl WriterHandle {
             target_workspace,
             target_project,
             pages,
+            author_id,
             commit,
             reply: tx,
         })
@@ -2188,6 +2192,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 target_workspace,
                 target_project,
                 pages,
+                author_id,
                 commit,
                 reply,
             } => {
@@ -2197,6 +2202,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     target_workspace,
                     target_project,
                     pages,
+                    author_id,
                     commit,
                 );
                 send_or_warn(reply, result, "move_session");
@@ -2627,7 +2633,7 @@ mod tests {
 
         let dry = store
             .writer
-            .move_session(sid, ws, dst, PagesMode::Move, false)
+            .move_session(sid, ws, dst, PagesMode::Move, None, false)
             .await
             .unwrap();
         assert!(dry.session_moved);
@@ -2639,7 +2645,7 @@ mod tests {
 
         let moved = store
             .writer
-            .move_session(sid, ws, dst, PagesMode::Move, true)
+            .move_session(sid, ws, dst, PagesMode::Move, None, true)
             .await
             .unwrap();
         assert!(moved.session_moved);
