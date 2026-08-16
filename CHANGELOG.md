@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.27.0] - 2026-08-16
+
 ### Added
 - Added `[routing] mid_session` to choose how a mid-session event is attributed
   once the agent's cwd has moved. `follow-cwd` (default) keeps the historical
@@ -3198,7 +3200,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.26.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.27.0...HEAD
+[1.27.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.27.0
 [1.26.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.26.1
 [1.26.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.26.0
 [1.25.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.25.0
