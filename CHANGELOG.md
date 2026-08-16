@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `ai-memory move-session <session-id> --to <project> [--to-workspace]
+  [--pages move|regenerate] [--confirm] [--force] [--create]`, its batch form
+  `--from-project <project> [--from-workspace]`, and `POST /admin/move-session`
+  to move one session (or every session of a project) to another project, in
+  the same or another workspace. One transaction per session re-stamps the
+  `sessions` row, its `observations`, the `handoffs` it produced, its
+  consolidation jobs, auto-improve runs and scheduler claim, and its
+  `sessions/<id>.md` page: `--pages move` (default) carries every version and
+  the file along (409 when the destination already has that page), `--pages
+  regenerate` retires the source page and removes its file so the next
+  consolidation rewrites it in the destination. Without `--confirm` the server
+  runs the same transaction and rolls it back, so the summary is an exact dry
+  run and the CLI prints the command to apply. An open session, a pending or
+  running consolidation job, or (batch) the active source project refuse with
+  409 unless `--force`. `sessions.cwd` stays as recorded (the response warns
+  when its basename is not the destination), and `auto_improve_proposals`,
+  `entities` and `page_feedback` are not re-stamped. New admission op
+  `move_session`. (#402)
+
 ## [1.27.0] - 2026-08-16
 
 ### Added

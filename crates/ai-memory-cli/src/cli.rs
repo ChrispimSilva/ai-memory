@@ -157,6 +157,11 @@ pub enum Command {
     /// copy+purge (only durable pages migrate, source purged). Either way the
     /// operation is irreversible — requires `--confirm`.
     MoveProject(MoveProjectArgs),
+    /// Move one session (or every session of a project) to another project,
+    /// re-stamping its observations, handoffs, consolidation jobs and its
+    /// `sessions/<id>.md` page in one transaction. Without `--confirm` it
+    /// prints what would move (a real dry run, rolled back server-side).
+    MoveSession(MoveSessionArgs),
     /// Remove ai-memory's wiring (hooks, MCP, instructions, and default-root
     /// managed skills) from all detected agents. Dry-run unless `--apply`.
     Uninstall(UninstallArgs),
@@ -605,6 +610,50 @@ pub struct MoveProjectArgs {
     /// lands under a de-duplicated path).
     #[arg(long, value_parser = ["block", "overwrite", "duplicate"], default_value = "block")]
     pub on_conflict: String,
+}
+
+/// Arguments for `move-session`.
+#[derive(Debug, Args)]
+pub struct MoveSessionArgs {
+    /// Session id (UUID) to move. Omit it and pass `--from-project` to move
+    /// every session of one project.
+    #[arg(
+        required_unless_present = "from_project",
+        conflicts_with = "from_project"
+    )]
+    pub session_id: Option<ai_memory_core::SessionId>,
+    /// Batch form: move every session of this project. Resolved like other
+    /// commands (marker, else literal); the sessions move one at a time and
+    /// the batch stops at the first refusal, reporting how far it got.
+    #[arg(long)]
+    pub from_project: Option<String>,
+    /// Workspace of `--from-project`. Defaults to the nearest
+    /// `.ai-memory.toml` marker's `workspace`, else `default`.
+    #[arg(long, requires = "from_project")]
+    pub from_workspace: Option<String>,
+    /// Destination project name (literal, not marker-resolved).
+    #[arg(long)]
+    pub to: String,
+    /// Destination workspace. Defaults to the source workspace.
+    #[arg(long)]
+    pub to_workspace: Option<String>,
+    /// What happens to the session's `sessions/<id>.md` page: `move` carries
+    /// the page and its history along (refused when the destination already
+    /// has one at that path); `regenerate` retires it so the next
+    /// consolidation writes a fresh page in the destination.
+    #[arg(long, value_parser = ["move", "regenerate"], default_value = "move")]
+    pub pages: String,
+    /// REQUIRED to apply. Without it the command prints the dry-run summary
+    /// and the exact command to re-run.
+    #[arg(long)]
+    pub confirm: bool,
+    /// Skip the live-session guards (open session, pending consolidation job,
+    /// active project of the hook router in the batch form).
+    #[arg(long)]
+    pub force: bool,
+    /// Create the destination workspace/project when it does not exist yet.
+    #[arg(long)]
+    pub create: bool,
 }
 
 /// Arguments for `install-instructions`.
