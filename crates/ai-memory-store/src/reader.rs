@@ -221,6 +221,26 @@ fn rerank_page_hits_with_meta(
     hits
 }
 
+/// Rows keyed to one session (see [`ReaderPool::session_dependent_rows`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionDependentRows {
+    /// `observations` rows of the session, in any scope.
+    pub observations: u64,
+    /// `handoffs` rows the session produced, in any scope.
+    pub handoffs: u64,
+    /// `session_consolidation_jobs` rows, in any scope.
+    pub consolidation_jobs: u64,
+    /// `auto_improve_runs` rows, in any scope.
+    pub auto_improve_runs: u64,
+    /// `auto_improve_scheduler_claims` rows, in any scope.
+    pub auto_improve_claims: u64,
+    /// Versions of `sessions/<id>.md` in the queried page scope.
+    pub page_versions: u64,
+    /// Latest versions of `sessions/<id>.md` in the queried page scope
+    /// (0 or 1).
+    pub page_latest: u64,
+}
+
 /// One page flagged by `stale`/`wrong` feedback on its current version,
 /// aggregated per (page, kind) for the lint pass.
 #[derive(Debug, Clone, Serialize)]
@@ -2394,6 +2414,93 @@ impl ReaderPool {
                 ))),
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    /// Ids of every session that touches `(workspace_id, project_id)`: a
+    /// `sessions` row in the scope OR at least one observation stamped into
+    /// it. The second leg catches the phantom projects that mid-session
+    /// routing before the sticky mode filled with observations of sessions
+    /// rooted elsewhere (no `sessions` row of their own), so a batch
+    /// `move-session` can empty such a bucket. Ordered by first touch (the
+    /// row's `started_at` or the earliest observation in the scope), then id.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_ids_touching_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<SessionId>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM ( \
+                     SELECT id, started_at AS first_seen FROM sessions \
+                     WHERE workspace_id = ?1 AND project_id = ?2 \
+                     UNION ALL \
+                     SELECT session_id AS id, MIN(created_at) AS first_seen FROM observations \
+                     WHERE workspace_id = ?1 AND project_id = ?2 \
+                     GROUP BY session_id \
+                 ) \
+                 GROUP BY id \
+                 ORDER BY MIN(first_seen), id",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(SessionId::from_slice(&r?)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Rows keyed to a session across every scope, plus its
+    /// `sessions/<id>.md` page rows in one scope: what a `move_session` into
+    /// a scope that holds nothing of the session yet would touch. Used for
+    /// the dry run of a move whose destination does not exist yet.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_dependent_rows(
+        &self,
+        session_id: SessionId,
+        page_scope: (WorkspaceId, ProjectId),
+    ) -> StoreResult<SessionDependentRows> {
+        self.with_conn(move |conn| {
+            let sid = session_id.as_bytes();
+            let count = |sql: &str| -> StoreResult<u64> {
+                Ok(conn.query_row(sql, [sid.as_slice()], |r| r.get::<_, i64>(0))? as u64)
+            };
+            let (page_versions, page_latest): (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(is_latest), 0) FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+                params![
+                    page_scope.0.as_bytes(),
+                    page_scope.1.as_bytes(),
+                    format!("sessions/{session_id}.md"),
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(SessionDependentRows {
+                observations: count("SELECT COUNT(*) FROM observations WHERE session_id = ?1")?,
+                handoffs: count("SELECT COUNT(*) FROM handoffs WHERE from_session_id = ?1")?,
+                consolidation_jobs: count(
+                    "SELECT COUNT(*) FROM session_consolidation_jobs WHERE session_id = ?1",
+                )?,
+                auto_improve_runs: count(
+                    "SELECT COUNT(*) FROM auto_improve_runs WHERE session_id = ?1",
+                )?,
+                auto_improve_claims: count(
+                    "SELECT COUNT(*) FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+                )?,
+                page_versions: page_versions as u64,
+                page_latest: page_latest as u64,
+            })
         })
         .await
     }

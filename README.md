@@ -172,6 +172,7 @@ priors are at the [bottom](#influences-and-prior-art).
   bridge via `install-mcp --session-aware`.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
   `restore-page`, `purge-project`, `rename-project`, `move-project`,
+  `move-session`,
   `audit-contamination`, `lint`, `curator`, `auto-improve`,
   `auto-improve-report`, `pending-writes`, `embed`, `forget-sweep`, `backup`,
   `finalize-session` are
