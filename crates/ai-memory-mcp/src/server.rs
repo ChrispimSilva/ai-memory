@@ -3123,8 +3123,15 @@ impl AiMemoryServer {
                 kinds
                     .iter()
                     .map(|raw| {
-                        ai_memory_core::ObservationKind::from_str(raw.trim())
-                            .map_err(|e| McpError::invalid_params(e.to_string(), None))
+                        // Argument errors name the argument, not the store's
+                        // record parser, so the message reads like the web
+                        // route's `400`.
+                        ai_memory_core::ObservationKind::from_str(raw.trim()).map_err(|_| {
+                            McpError::invalid_params(
+                                format!("unknown observation kind: {}", raw.trim()),
+                                None,
+                            )
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -3137,8 +3144,9 @@ impl AiMemoryServer {
         // uuid cannot probe across projects.
         let session = match args.session_id.as_deref().map(str::trim) {
             Some(raw) if !raw.is_empty() => {
-                let session_id = SessionId::from_str(raw)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                let session_id = SessionId::from_str(raw).map_err(|_| {
+                    McpError::invalid_params(format!("invalid session id: {raw}"), None)
+                })?;
                 let summary = self
                     .reader
                     .session_summary_scoped(ws, proj, session_id, owner_filter)
@@ -7408,6 +7416,7 @@ mod tests {
             .await
             .expect_err("a malformed session id must be rejected");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(err.message, "invalid session id: not-a-uuid");
     }
 
     #[tokio::test]
@@ -7429,7 +7438,7 @@ mod tests {
             .await
             .expect_err("unknown kind must be rejected");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        assert!(err.to_string().contains("bogus"), "got {err}");
+        assert_eq!(err.message, "unknown observation kind: bogus");
 
         let mut args = session_observations_args(Some(session_id));
         args.order = Some("sideways".into());
