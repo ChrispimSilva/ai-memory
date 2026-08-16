@@ -613,15 +613,15 @@ pub struct MoveProjectArgs {
 }
 
 /// Arguments for `move-session`.
+///
+/// Exactly one of `<SESSION_ID>` and `--from-project` names what moves; the
+/// `what` group makes clap's error name both when neither is given.
 #[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("what").required(true).args(["session_id", "from_project"]))]
 pub struct MoveSessionArgs {
     /// Session id (UUID) to move. Omit it and pass `--from-project` to move
     /// every session touching one project. A session already rooted in the
     /// destination is re-homed: its row stays and only its stray rows move.
-    #[arg(
-        required_unless_present = "from_project",
-        conflicts_with = "from_project"
-    )]
     pub session_id: Option<ai_memory_core::SessionId>,
     /// Batch form: move every session touching this project (a session row
     /// here or observations stamped into it). Resolved like other commands

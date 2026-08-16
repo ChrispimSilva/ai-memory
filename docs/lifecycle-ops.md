@@ -402,9 +402,10 @@ scope), the `handoffs` it produced (`from_session_id`), its
   session. Refused with `409` when the destination already has a latest page
   (or a page file) at that path; retry with `--pages regenerate` or resolve
   the destination page first.
-- `--pages regenerate`: the source versions are retired (`is_latest = 0`)
-  and the file is removed, so the next consolidation of the session writes a
-  fresh page in the destination. The file has to go: a page file left on
+- `--pages regenerate`: the source versions are retired (`is_latest = 0`),
+  the session's `summary_page_id` is cleared when it pointed at them, and the
+  file is removed, so the next consolidation of the session writes a fresh
+  page in the destination. The file has to go: a page file left on
   disk with no latest row is re-indexed as a new latest page by the next
   reconciliation pass.
 
@@ -435,13 +436,18 @@ the whole run.
 **Dry run by default.** Without `--confirm` the server runs the same
 transaction and rolls it back, so the counts in the response are exact
 (`dry_run: true`), and the CLI prints the exact command to apply. Nothing
-is written and no audit row is left.
+is written and no audit row is left; with `--create` against a destination
+that does not exist yet the dry run does not create it either: it reports
+`would_create_project: true` with the counts of what would move (the CLI
+says "would create project"), and only the `--confirm` run creates it.
 
 **Guards (409 unless `--force`).** A session that is still open (no session
 end recorded) may still receive events; a `pending`/`running` consolidation
 job would write the page under the old scope; the batch form also refuses
 the project the hook router has published as active, like `move-project`.
-`--force` proceeds. Note that forcing an open session leaves the hook
+`--force` proceeds. A re-home (the session row already sits in the
+destination) skips the open-session guard: the row does not move, so an
+open session only has its stray rows gathered; the job guard still applies. Note that forcing an open session leaves the hook
 router's per-session active pointer on the old scope until it expires;
 sticky routing then keeps following the session row, which is now the
 destination.
@@ -456,9 +462,13 @@ Response (`MoveSessionReport`): `session_id`, `dry_run`, `session_moved`
 (`{workspace, project}`), `summary` (`observations`, `handoffs`,
 `consolidation_jobs`, `auto_improve_runs`, `auto_improve_claims`,
 `page_versions_moved`, `pages_regenerated`), `page` (`moved` |
-`regenerated` | `none`), `cwd`, `cwd_warning`, `pre_checkpoint`,
-`checkpoint`. The batch wraps them in `{dry_run, from, to, total, moved,
-sessions: [...]}`.
+`regenerated` | `already in destination` for a re-home whose page rows all
+sit in the destination | `none` when the session has no page anywhere),
+`cwd`, `cwd_warning`, `would_create_project` (dry run with `create` only),
+`pre_checkpoint` (only when the wiki tree had uncommitted changes before the
+move), `checkpoint` (only when the move changed the tree). The batch wraps
+them in `{dry_run, would_create_project?, from, to, total, moved, sessions:
+[...]}`.
 
 Failure modes:
 

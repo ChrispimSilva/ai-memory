@@ -737,6 +737,70 @@ async fn move_session_target_404_unless_create() {
         (1, 2, 1, 1)
     );
 
+    // Dry run with create: the full plan is reported, nothing is created.
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({
+            "session_id": sid.to_string(),
+            "workspace": "fresh-ws",
+            "project": "brand-new",
+            "create": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["dry_run"], true, "{body}");
+    assert_eq!(body["would_create_project"], true, "{body}");
+    assert_eq!(body["session_moved"], true, "{body}");
+    assert_eq!(body["summary"]["observations"], 2, "{body}");
+    assert_eq!(body["summary"]["handoffs"], 1, "{body}");
+    assert_eq!(body["summary"]["consolidation_jobs"], 1, "{body}");
+    assert_eq!(body["summary"]["page_versions_moved"], 1, "{body}");
+    assert_eq!(body["page"], "moved", "{body}");
+    assert!(
+        store
+            .reader
+            .find_workspace("fresh-ws".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "a dry run must not create the workspace"
+    );
+    let dst_projects: i64 = store
+        .reader
+        .with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM projects WHERE name = 'brand-new'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(dst_projects, 0, "a dry run must not create the project row");
+    // Batch dry run with create behaves the same.
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "from_project": "src", "project": "brand-new", "create": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["would_create_project"], true, "{body}");
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["sessions"][0]["would_create_project"], true, "{body}");
+    assert!(
+        store
+            .reader
+            .find_project(scopes.ws, "brand-new".to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
     let resp = post(
         &state,
         "/admin/move-session",
@@ -752,6 +816,7 @@ async fn move_session_target_404_unless_create() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["to"]["workspace"], "fresh-ws", "{body}");
+    assert!(body.get("would_create_project").is_none(), "{body}");
     let new_ws = store
         .reader
         .find_workspace("fresh-ws".to_string())
@@ -826,7 +891,7 @@ async fn move_session_rejects_bad_shapes() {
     let body = body_json(resp).await;
     assert_eq!(body["session_moved"], false, "{body}");
     assert_eq!(body["summary"]["observations"], 0, "{body}");
-    assert_eq!(body["page"], "none", "{body}");
+    assert_eq!(body["page"], "already in destination", "{body}");
     assert_eq!(
         rows_in_scope(&store, sid, scopes.ws, scopes.src).await,
         (1, 2, 1, 1)
@@ -905,7 +970,7 @@ async fn move_session_batch_empties_phantom_bucket_with_only_observations() {
     assert_eq!(s["session_moved"], false, "{body}");
     assert_eq!(s["summary"]["observations"], 4, "{body}");
     assert_eq!(s["summary"]["handoffs"], 0, "{body}");
-    assert_eq!(s["page"], "none", "{body}");
+    assert_eq!(s["page"], "already in destination", "{body}");
     assert_eq!(
         rows_in_scope(&store, sid, scopes.ws, scopes.src).await,
         (0, 4, 0, 0)
@@ -988,6 +1053,7 @@ async fn move_session_rehome_of_open_session_needs_no_force() {
     assert_eq!(body["moved"], 1, "{body}");
     assert_eq!(body["sessions"][0]["session_moved"], false, "{body}");
     assert_eq!(body["sessions"][0]["summary"]["observations"], 2, "{body}");
+    assert_eq!(body["sessions"][0]["page"], "none", "{body}");
     assert_eq!(
         rows_in_scope(&store, sid, scopes.ws, scopes.dst).await,
         (1, 2, 0, 0)

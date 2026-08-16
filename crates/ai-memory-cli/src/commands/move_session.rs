@@ -107,6 +107,7 @@ fn print_session_report(report: &serde_json::Value, applied: bool) {
         scope(&report["from"]),
         scope(&report["to"]),
     );
+    print_would_create(report);
     println!(
         "  session row:         {}",
         session_row_line(report, applied)
@@ -117,6 +118,26 @@ fn print_session_report(report: &serde_json::Value, applied: bool) {
     );
     if let Some(warning) = report["cwd_warning"].as_str() {
         println!("Warning: {warning}");
+    }
+    print_checkpoints(report);
+}
+
+/// Dry run with `--create` against a destination that does not exist yet.
+fn print_would_create(report: &serde_json::Value) {
+    if report["would_create_project"].as_bool().unwrap_or(false) {
+        println!(
+            "  would create project {} (absent; created on --confirm)",
+            scope(&report["to"])
+        );
+    }
+}
+
+/// The wiki checkpoints a confirmed run took: `pre_checkpoint` only when the
+/// tree had uncommitted changes before the move, `checkpoint` when the move
+/// changed the tree.
+fn print_checkpoints(report: &serde_json::Value) {
+    if let Some(oid) = report["pre_checkpoint"].as_str() {
+        println!("Pre-move checkpoint: {oid}");
     }
     if let Some(oid) = report["checkpoint"].as_str() {
         println!("Checkpoint: {oid}");
@@ -132,15 +153,16 @@ fn print_batch_report(report: &serde_json::Value, applied: bool) {
         scope(&report["from"]),
         scope(&report["to"]),
     );
+    print_would_create(report);
     if let Some(sessions) = report["sessions"].as_array() {
         println!(
-            "{:<38} {:<8} {:>6} {:>8} {:>5} {:<12} cwd",
+            "{:<38} {:<8} {:>6} {:>8} {:>5} {:<22} cwd",
             "session_id", "row", "obs", "handoffs", "jobs", "page"
         );
-        println!("{}", "-".repeat(99));
+        println!("{}", "-".repeat(109));
         for s in sessions {
             println!(
-                "{:<38} {:<8} {:>6} {:>8} {:>5} {:<12} {}",
+                "{:<38} {:<8} {:>6} {:>8} {:>5} {:<22} {}",
                 s["session_id"].as_str().unwrap_or("?"),
                 if s["session_moved"].as_bool().unwrap_or(false) {
                     "moved"
@@ -176,9 +198,7 @@ fn print_batch_report(report: &serde_json::Value, applied: bool) {
             );
         }
     }
-    if let Some(oid) = report["checkpoint"].as_str() {
-        println!("Checkpoint: {oid}");
-    }
+    print_checkpoints(report);
 }
 
 fn print_counts(summary: &serde_json::Value, page: &str) {

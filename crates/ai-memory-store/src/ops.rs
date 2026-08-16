@@ -3065,7 +3065,8 @@ pub enum PagesMode {
     /// a latest page at that path.
     #[default]
     Move,
-    /// Leave the rows in the source scope but clear `is_latest`, so the next
+    /// Leave the rows in the source scope but clear `is_latest` (and the
+    /// session's `summary_page_id` when it pointed at them), so the next
     /// consolidation of the session writes a fresh page in the destination.
     Regenerate,
 }
@@ -3100,6 +3101,10 @@ pub struct MoveSessionSummary {
     /// The session page path when the source scope held at least one version
     /// of it, so the caller can move or retire the on-disk file too.
     pub page_path: Option<String>,
+    /// `pages` versions of `sessions/<id>.md` sitting in the target scope
+    /// once the call is done (moved there now or already there before), so
+    /// a caller can tell "nothing to move" from "no page anywhere".
+    pub page_versions_in_target: u64,
     /// Scope the session was read from.
     pub from_workspace: WorkspaceId,
     /// Scope the session was read from.
@@ -3191,6 +3196,7 @@ pub fn move_session(
         page_versions_moved: 0,
         pages_regenerated: 0,
         page_path: None,
+        page_versions_in_target: 0,
         from_workspace,
         from_project,
         to_workspace: target_workspace,
@@ -3302,10 +3308,30 @@ pub fn move_session(
                     ),
                     params![page_scope_params.0, page_scope_params.1, page_path.as_str()],
                 )? as u64;
+                // The session's summary pointer targeted the page just
+                // retired; the next consolidation sets it again.
+                tx.execute(
+                    &format!(
+                        "UPDATE sessions SET summary_page_id = NULL \
+                         WHERE id = ?4 AND summary_page_id IN ( \
+                             SELECT id FROM pages WHERE {page_scope_sql} AND path = ?3)"
+                    ),
+                    params![
+                        page_scope_params.0,
+                        page_scope_params.1,
+                        page_path.as_str(),
+                        &sid[..],
+                    ],
+                )?;
             }
         }
-        summary.page_path = Some(page_path);
+        summary.page_path = Some(page_path.clone());
     }
+    summary.page_versions_in_target = tx.query_row(
+        "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+        params![&to_ws[..], &to_proj[..], page_path.as_str()],
+        |row| row.get::<_, i64>(0),
+    )? as u64;
 
     audit(
         &tx,
@@ -5464,6 +5490,8 @@ pub(crate) mod tests {
         let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
         let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
         let sid = seed_movable_session(&mut conn, src_ws, src_proj);
+        point_summary_at_latest(&mut conn, sid, src_ws, src_proj);
+        let pointer = summary_page_id(&conn, sid);
 
         let summary = move_session(
             &mut conn,
@@ -5479,6 +5507,9 @@ pub(crate) mod tests {
         assert_eq!(summary.observations, 2);
         assert_eq!(summary.page_versions_moved, 2);
         assert_eq!(summary.pages_regenerated, 0);
+        assert_eq!(summary.page_versions_in_target, 2);
+        // The page kept its id, so the pointer is still right.
+        assert_eq!(summary_page_id(&conn, sid), pointer);
 
         assert_session_bundle_in_scope(&conn, sid, (dst_ws, dst_proj), (src_ws, src_proj));
         // Both versions moved and the supersession chain kept exactly one latest.
@@ -5546,6 +5577,9 @@ pub(crate) mod tests {
         // A latest page at the path in the target is fine under Regenerate.
         let path = format!("sessions/{sid}.md");
         upsert_page(&mut conn, &page(dst_ws, dst_proj, &path, "already here")).unwrap();
+        // The session points at its (source) latest page, as consolidation
+        // leaves it.
+        point_summary_at_latest(&mut conn, sid, src_ws, src_proj);
 
         let summary = move_session(
             &mut conn,
@@ -5563,9 +5597,40 @@ pub(crate) mod tests {
         assert_eq!(summary.page_path.as_deref(), Some(path.as_str()));
 
         assert_session_bundle_in_scope(&conn, sid, (dst_ws, dst_proj), (src_ws, src_proj));
-        // Source versions stay where they are, none of them latest anymore.
+        // Source versions stay where they are, none of them latest anymore,
+        // and the session no longer points at the retired page.
         assert_eq!(session_page_versions(&conn, sid, src_ws, src_proj), (2, 0));
         assert_eq!(session_page_versions(&conn, sid, dst_ws, dst_proj), (1, 1));
+        assert_eq!(summary_page_id(&conn, sid), None);
+    }
+
+    /// Point `sessions.summary_page_id` at the session's latest page in a
+    /// scope, the way session consolidation does.
+    fn point_summary_at_latest(
+        conn: &mut Connection,
+        sid: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) {
+        let path = format!("sessions/{sid}.md");
+        conn.execute(
+            "UPDATE sessions SET summary_page_id = ( \
+                 SELECT id FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1) \
+             WHERE id = ?4",
+            params![ws.as_bytes(), proj.as_bytes(), path, sid.as_bytes()],
+        )
+        .unwrap();
+        assert!(summary_page_id(conn, sid).is_some());
+    }
+
+    fn summary_page_id(conn: &Connection, sid: SessionId) -> Option<Vec<u8>> {
+        conn.query_row(
+            "SELECT summary_page_id FROM sessions WHERE id = ?1",
+            params![sid.as_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -5594,6 +5659,7 @@ pub(crate) mod tests {
         assert_eq!(summary.page_versions_moved, 0);
         assert_eq!(summary.pages_regenerated, 0);
         assert_eq!(summary.page_path, None);
+        assert_eq!(summary.page_versions_in_target, 0);
     }
 
     #[test]
@@ -5742,6 +5808,7 @@ pub(crate) mod tests {
             summary.page_path, None,
             "the page already sits in the target"
         );
+        assert_eq!(summary.page_versions_in_target, 2);
         assert_eq!(summary.from_project, target);
         assert_eq!(summary.to_project, target);
 

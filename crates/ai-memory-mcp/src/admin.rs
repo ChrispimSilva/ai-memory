@@ -4217,6 +4217,8 @@ struct MoveSessionRequest {
     #[serde(default)]
     force: bool,
     /// Create the destination workspace/project when absent instead of 404.
+    /// A dry run never creates: it reports `would_create_project: true` and
+    /// the counts computed against an absent target.
     #[serde(default)]
     create: bool,
 }
@@ -4260,6 +4262,10 @@ pub struct MoveSessionReport {
     /// row already sat in the destination and only stray rows (the counts
     /// below) were gathered into it.
     pub session_moved: bool,
+    /// Dry run with `create` against a destination that does not exist yet:
+    /// the confirm run will create it. Never set on a confirmed move.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub would_create_project: bool,
     /// Scope the session came from.
     pub from: ScopeLabel,
     /// Scope the session now belongs to.
@@ -4267,7 +4273,9 @@ pub struct MoveSessionReport {
     /// Row counts.
     pub summary: MoveSessionCounts,
     /// What happened (or would happen) to `sessions/<id>.md`: `"moved"`,
-    /// `"regenerated"`, or `"none"` when the session has no page.
+    /// `"regenerated"`, `"already in destination"` (re-home whose page rows
+    /// all sit in the destination), or `"none"` when the session has no page
+    /// anywhere.
     pub page: &'static str,
     /// The session's recorded working directory, left untouched.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4288,6 +4296,9 @@ pub struct MoveSessionReport {
 pub struct MoveSessionBatchReport {
     /// `true` when nothing was written (no `confirm`).
     pub dry_run: bool,
+    /// Dry run with `create` against a destination that does not exist yet.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub would_create_project: bool,
     /// Source scope.
     pub from: ScopeLabel,
     /// Destination scope.
@@ -4316,7 +4327,7 @@ struct MoveSessionPlan {
     /// well sit elsewhere, even in `to`).
     from: (WorkspaceId, ProjectId),
     from_label: ScopeLabel,
-    to: (WorkspaceId, ProjectId),
+    to: MoveTarget,
     to_label: ScopeLabel,
     /// Where the `sessions` row sits right now.
     row_scope: (WorkspaceId, ProjectId),
@@ -4326,7 +4337,24 @@ struct MoveSessionPlan {
 impl MoveSessionPlan {
     /// The row already sits in the destination: only stray rows move.
     fn is_rehome(&self) -> bool {
-        self.row_scope == self.to
+        self.to.existing() == Some(self.row_scope)
+    }
+}
+
+/// The destination of a move: an existing scope, or (dry run with `create`
+/// only) a scope that does not exist yet and would be created on confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveTarget {
+    Existing((WorkspaceId, ProjectId)),
+    WouldCreate,
+}
+
+impl MoveTarget {
+    fn existing(self) -> Option<(WorkspaceId, ProjectId)> {
+        match self {
+            Self::Existing(scope) => Some(scope),
+            Self::WouldCreate => None,
+        }
     }
 }
 
@@ -4384,18 +4412,52 @@ async fn scope_label(state: &AdminState, ws: WorkspaceId, proj: ProjectId) -> Sc
     ScopeLabel { workspace, project }
 }
 
-/// Resolve the destination scope: existing only (404) unless `create`.
+/// Resolve the destination scope: existing only (404) unless `create`. A
+/// dry run never writes, so with `create` and no `confirm` an absent
+/// destination resolves to [`MoveTarget::WouldCreate`] instead of a row.
 async fn resolve_move_session_target(
     state: &AdminState,
     workspace: &str,
     project: &str,
     create: bool,
-) -> Result<(WorkspaceId, ProjectId), MoveErr> {
-    if create {
-        create_ws_proj(state, workspace, project).await
-    } else {
-        lookup_ws_proj_no_create(state, workspace, project).await
+    confirm: bool,
+) -> Result<MoveTarget, MoveErr> {
+    if create && confirm {
+        return create_ws_proj(state, workspace, project)
+            .await
+            .map(MoveTarget::Existing);
     }
+    match lookup_existing_scope(&state.reader, workspace, project).await {
+        Ok(scope) => Ok(MoveTarget::Existing(scope.as_tuple())),
+        Err(e) if create && e.is_not_found() => Ok(MoveTarget::WouldCreate),
+        Err(e) => Err(scope_err(e)),
+    }
+}
+
+/// Dry-run counts of a move into a destination that does not exist yet:
+/// nothing of the session can already be there, so every row keyed to it
+/// moves, and the page rows are those of `from` (moved or retired per
+/// `pages`). Read-only; the store never sees the absent target.
+async fn preview_move_into_absent_target(
+    reader: &ReaderPool,
+    session_id: SessionId,
+    from: (WorkspaceId, ProjectId),
+    pages: PagesMode,
+) -> Result<MoveSessionCounts, StoreError> {
+    let rows = reader.session_dependent_rows(session_id, from).await?;
+    let (page_versions_moved, pages_regenerated) = match pages {
+        PagesMode::Move => (rows.page_versions, 0),
+        PagesMode::Regenerate => (0, rows.page_latest),
+    };
+    Ok(MoveSessionCounts {
+        observations: rows.observations,
+        handoffs: rows.handoffs,
+        consolidation_jobs: rows.consolidation_jobs,
+        auto_improve_runs: rows.auto_improve_runs,
+        auto_improve_claims: rows.auto_improve_claims,
+        page_versions_moved,
+        pages_regenerated,
+    })
 }
 
 /// `(session still open, consolidation job pending or running)` for the
@@ -4506,8 +4568,10 @@ fn move_session_page_label(
     pages: PagesMode,
     touched_rows: bool,
     touched_file: bool,
+    already_in_target: bool,
 ) -> &'static str {
     match (pages, touched_rows || touched_file) {
+        (_, false) if already_in_target => "already in destination",
         (_, false) => "none",
         (PagesMode::Move, true) => "moved",
         (PagesMode::Regenerate, true) => "regenerated",
@@ -4541,7 +4605,7 @@ async fn move_planned_session(
                 Json(serde_json::json!({
                     "error": format!(
                         "session {sid} is still open (no session end recorded); \
-                         finish it or re-run with force=true"
+                         finish it or force the move (--force / force: true)"
                     )
                 })),
             ));
@@ -4552,41 +4616,72 @@ async fn move_planned_session(
                 Json(serde_json::json!({
                     "error": format!(
                         "session {sid} has a pending or running consolidation job; \
-                         wait for it or re-run with force=true"
+                         wait for it or force the move (--force / force: true)"
                     )
                 })),
             ));
         }
     }
 
-    // A page file already at the destination blocks a page move; checked here
-    // too so the dry run predicts what the wiki re-checks under its lock. When
-    // the source scope IS the destination (single-form re-home) there is no
-    // file to move and the wiki skips the file step too.
+    let cwd_warning = move_session_cwd_warning(plan.cwd.as_deref(), &plan.to_label.project);
     let file_name = format!("{sid}.md");
     let src_file = state
         .wiki
         .project_root(plan.from.0, plan.from.1)
         .join("sessions")
         .join(&file_name);
+
+    // Dry run with `create` against an absent destination: nothing exists to
+    // collide with, and the store cannot re-stamp into a scope that has no
+    // row, so the counts come from a read-only preview.
+    let to = match plan.to {
+        MoveTarget::Existing(to) => to,
+        MoveTarget::WouldCreate => {
+            debug_assert!(
+                !req.confirm,
+                "an absent target is only planned for a dry run"
+            );
+            let counts = preview_move_into_absent_target(&state.reader, sid, plan.from, req.pages)
+                .await
+                .map_err(|e| internal_err(e.to_string()))?;
+            let touched_rows = counts.page_versions_moved > 0 || counts.pages_regenerated > 0;
+            return Ok(MoveSessionReport {
+                session_id: sid.to_string(),
+                dry_run: true,
+                session_moved: true,
+                would_create_project: true,
+                from: plan.from_label,
+                to: plan.to_label,
+                page: move_session_page_label(req.pages, touched_rows, src_file.is_file(), false),
+                summary: counts,
+                cwd: plan.cwd,
+                cwd_warning,
+                pre_checkpoint: None,
+                checkpoint: None,
+            });
+        }
+    };
+
+    // A page file already at the destination blocks a page move; checked here
+    // too so the dry run predicts what the wiki re-checks under its lock. When
+    // the source scope IS the destination (single-form re-home) there is no
+    // file to move and the wiki skips the file step too.
     let dst_file = state
         .wiki
-        .project_root(plan.to.0, plan.to.1)
+        .project_root(to.0, to.1)
         .join("sessions")
         .join(&file_name);
-    let file_moves = plan.from != plan.to && src_file.is_file();
+    let file_moves = plan.from != to && src_file.is_file();
     if req.pages == PagesMode::Move && file_moves && dst_file.exists() {
         return Err(move_session_wiki_err(WikiError::DestinationPageExists(
             dst_file.display().to_string(),
         )));
     }
 
-    let cwd_warning = move_session_cwd_warning(plan.cwd.as_deref(), &plan.to_label.project);
-
     if !req.confirm {
         let summary = state
             .writer
-            .move_session(sid, plan.to.0, plan.to.1, req.pages, author_id, false)
+            .move_session(sid, to.0, to.1, req.pages, author_id, false)
             .await
             .map_err(move_session_store_err)?;
         let touched_rows = summary.page_versions_moved > 0 || summary.pages_regenerated > 0;
@@ -4594,10 +4689,16 @@ async fn move_planned_session(
             session_id: sid.to_string(),
             dry_run: true,
             session_moved: summary.session_moved,
+            would_create_project: false,
             from: plan.from_label,
             to: plan.to_label,
             summary: move_session_counts(&summary),
-            page: move_session_page_label(req.pages, touched_rows, file_moves),
+            page: move_session_page_label(
+                req.pages,
+                touched_rows,
+                file_moves,
+                summary.page_versions_in_target > 0,
+            ),
             cwd: plan.cwd,
             cwd_warning,
             pre_checkpoint: None,
@@ -4618,14 +4719,7 @@ async fn move_planned_session(
     // re-stamp, and the file rollback on SQL failure.
     let outcome = state
         .wiki
-        .move_session_page(
-            sid,
-            plan.from,
-            plan.to,
-            req.pages,
-            author_id,
-            Some(move_ctx),
-        )
+        .move_session_page(sid, plan.from, to, req.pages, author_id, Some(move_ctx))
         .await
         .map_err(move_session_wiki_err)?;
     let touched_rows =
@@ -4634,6 +4728,7 @@ async fn move_planned_session(
         session_id: sid.to_string(),
         dry_run: false,
         session_moved: outcome.summary.session_moved,
+        would_create_project: false,
         from: plan.from_label,
         to: plan.to_label,
         summary: move_session_counts(&outcome.summary),
@@ -4641,6 +4736,7 @@ async fn move_planned_session(
             req.pages,
             touched_rows,
             outcome.file != SessionPageFile::Absent,
+            outcome.summary.page_versions_in_target > 0,
         ),
         cwd: plan.cwd,
         cwd_warning,
@@ -4672,7 +4768,9 @@ async fn move_single_session(
         .workspace
         .clone()
         .unwrap_or_else(|| from_label.workspace.clone());
-    let to = resolve_move_session_target(state, &to_workspace, &req.project, req.create).await?;
+    let to =
+        resolve_move_session_target(state, &to_workspace, &req.project, req.create, req.confirm)
+            .await?;
     let plan = MoveSessionPlan {
         session_id,
         from: (from_ws, from_proj),
@@ -4725,9 +4823,16 @@ async fn move_session_batch(
         .workspace
         .clone()
         .unwrap_or_else(|| from_workspace.clone());
-    let to = match resolve_move_session_target(state, &to_workspace, &req.project, req.create).await
+    let to = match resolve_move_session_target(
+        state,
+        &to_workspace,
+        &req.project,
+        req.create,
+        req.confirm,
+    )
+    .await
     {
-        Ok(ids) => ids,
+        Ok(target) => target,
         Err(e) => return e.into_response(),
     };
     let from_label = ScopeLabel {
@@ -4738,7 +4843,7 @@ async fn move_session_batch(
         workspace: to_workspace,
         project: req.project.clone(),
     };
-    if from == to {
+    if to.existing() == Some(from) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
@@ -4754,8 +4859,8 @@ async fn move_session_batch(
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!(
-                    "{}/{} is the active session's project; re-run with force=true to move its \
-                     sessions anyway",
+                    "{}/{} is the active session's project; force the move (--force / \
+                     force: true) to move its sessions anyway",
                     from_label.workspace, from_label.project
                 )
             })),
@@ -4789,7 +4894,8 @@ async fn move_session_batch(
         // where its row sits; a session already rooted in the destination is
         // re-homed and its stray page file, if any, is looked for in the
         // source.
-        let (plan_from, plan_from_label) = if row_scope == from || row_scope == to {
+        let (plan_from, plan_from_label) = if row_scope == from || to.existing() == Some(row_scope)
+        {
             (from, from_label.clone())
         } else {
             (
@@ -4844,6 +4950,7 @@ async fn move_session_batch(
     }
     let report = MoveSessionBatchReport {
         dry_run: !req.confirm,
+        would_create_project: to == MoveTarget::WouldCreate,
         from: from_label,
         to: to_label,
         total,

@@ -18,17 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scheduler claim, and its `sessions/<id>.md` page: `--pages move` (default)
   carries every version and
   the file along (409 when the destination already has that page), `--pages
-  regenerate` retires the source page and removes its file so the next
-  consolidation rewrites it in the destination. Without `--confirm` the server
+  regenerate` retires the source page (clearing the session's
+  `summary_page_id`) and removes its file so the next consolidation rewrites
+  it in the destination. Without `--confirm` the server
   runs the same transaction and rolls it back, so the summary is an exact dry
-  run and the CLI prints the command to apply. An open session, a pending or
+  run and the CLI prints the command to apply (with `--create` the dry run
+  reports `would_create_project` and creates nothing). An open session, a pending or
   running consolidation job, or (batch) the active source project refuse with
   409 unless `--force`. `sessions.cwd` stays as recorded (the response warns
   when its basename is not the destination), and `auto_improve_proposals`,
   `entities` and `page_feedback` are not re-stamped. A session already rooted
   in the destination is re-homed instead of refused: its row stays
-  (`session_moved: false`) and only its rows still lying in other scopes are
-  gathered, and the batch form enumerates sessions with a `sessions` row in
+  (`session_moved: false`, open-session guard not applied) and only its rows
+  still lying in other scopes are gathered (`page: already in destination`
+  when its page needs nothing), and the batch form enumerates sessions with a `sessions` row in
   the source OR observations stamped into it, so a phantom project holding
   only observations of sessions rooted elsewhere can be emptied. New
   admission op `move_session`. (#402)
