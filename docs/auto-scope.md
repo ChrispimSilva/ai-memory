@@ -110,6 +110,13 @@ pointers. The durable `SessionId` stored for hook observations remains global:
 if another owner reuses an already-owned id, ai-memory drops that hook before it
 can append observations or publish a pointer for the foreign actor.
 
+Owner and agent are what identify a session; scope is not. The same operator's
+session legitimately produces events in another project when its cwd moves, so
+a differing `(workspace, project)` is recorded rather than rejected. The one
+exception is a terminal event: a `SessionEnd` naming a different scope than its
+session is not that session's end, so it is dropped rather than ending someone
+else's session.
+
 ## Client requirements
 
 Lifecycle hooks already include the agent-run session id in their

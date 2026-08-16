@@ -98,6 +98,10 @@ pub enum HookSessionAdmission {
     },
     /// A terminal event named no persisted session and created nothing.
     InvalidMissingEnd,
+    /// A terminal event named a persisted session in a different scope, so it
+    /// is not that session's end. Mirrors the pre-guard
+    /// `SessionEndDisposition::DropInvalid` arm.
+    InvalidScopedEnd,
 }
 /// Result of conditionally ending a session whose persisted observations are
 /// all lifecycle boundaries.
@@ -1176,16 +1180,34 @@ pub fn admit_hook_session_event(
     ).optional()?;
     let (owner, ended_at, ended_count) = match existing {
         Some((ws, project, agent, owner, ended_at, ended_count)) => {
-            // Corrupt owners fail closed, including for Any recovery.
+            // Corrupt owners fail closed, including for Any recovery. Owner
+            // and agent identify WHO the session belongs to, so a mismatch
+            // there is a genuine UUID collision and is terminal.
             if owner
                 .as_deref()
                 .is_some_and(|value| IdentityKey::from_storage_key(value).is_none())
-                || ws.as_slice() != session.workspace_id.as_bytes()
-                || project.as_slice() != session.project_id.as_bytes()
                 || agent != session.agent_kind.as_str()
                 || !owner_filter.admits(owner.as_deref())
             {
                 return Err(StoreError::SessionCollision);
+            }
+            // Scope is NOT identity. Under the default `follow-cwd` routing a
+            // mid-session `cd` into another project legitimately resolves this
+            // event to a different (workspace, project) than the session row,
+            // and the observation belongs in the project it names — that is
+            // exactly the record-splitting `[routing] mid_session = "sticky"`
+            // exists to opt out of. Treating the difference as a collision
+            // silently DROPPED those events instead of recording them.
+            //
+            // A terminal event is the one exception: an end naming a different
+            // scope is not this session's end, so it is dropped rather than
+            // ending someone else's session (the pre-guard
+            // `SessionEndDisposition::DropInvalid` arm).
+            let scoped_to_session = ws.as_slice() == session.workspace_id.as_bytes()
+                && project.as_slice() == session.project_id.as_bytes();
+            if session_end && !scoped_to_session {
+                tx.commit()?;
+                return Ok(HookSessionAdmission::InvalidScopedEnd);
             }
             (owner, ended_at, ended_count)
         }
@@ -3468,7 +3490,9 @@ pub(crate) mod tests {
             | HookSessionAdmission::EndOpen { session, .. }
             | HookSessionAdmission::ReEnd { session, .. }
             | HookSessionAdmission::AlreadyEnded { session } => session,
-            HookSessionAdmission::InvalidMissingEnd => panic!("expected admitted session"),
+            HookSessionAdmission::InvalidMissingEnd | HookSessionAdmission::InvalidScopedEnd => {
+                panic!("expected admitted session")
+            }
         }
     }
 
@@ -6441,6 +6465,136 @@ pub(crate) mod tests {
                 ..
             }
         ));
+    }
+
+    // A mid-session `cd` into another project resolves the event to a
+    // different (workspace, project) than the session row. Under the default
+    // `follow-cwd` routing that is legitimate — the observation belongs in the
+    // project it names — so scope difference must NOT be treated as a UUID
+    // collision. Guarding it as one silently dropped every cross-project
+    // mid-session event (#394 / #396 composition).
+    #[test]
+    fn cross_project_mid_session_observation_is_admitted_not_dropped() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+
+        // Same session and operator, event resolved into a sibling project.
+        let visited = get_or_create_project(&mut conn, &ws, "visited", None).unwrap();
+        let mut moved = session.clone();
+        moved.project_id = visited;
+        let observation = hook_observation(&moved);
+
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &moved,
+                &observation,
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            )
+            .unwrap(),
+            HookSessionAdmission::Observation {
+                ingest: IngestObservationOutcome::Inserted(_),
+                ..
+            }
+        ));
+
+        // It lands in the project it named, and the session row is untouched.
+        let landed: Vec<u8> = conn
+            .query_row("SELECT project_id FROM observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(landed.as_slice(), visited.as_bytes());
+        let session_project: Vec<u8> = conn
+            .query_row(
+                "SELECT project_id FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_project.as_slice(), proj.as_bytes());
+    }
+
+    // Identity is still identity: a different operator or a different agent
+    // reusing the UUID stays terminal, in the same scope-moved shape as above.
+    #[test]
+    fn cross_project_events_still_reject_foreign_owner_and_agent() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        let visited = get_or_create_project(&mut conn, &ws, "visited", None).unwrap();
+
+        let mut moved = session.clone();
+        moved.project_id = visited;
+        let observation = hook_observation(&moved);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &moved,
+                &observation,
+                &OwnerFilter::User("user:bob".into()),
+                None,
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+
+        let mut other_agent = moved.clone();
+        other_agent.agent_kind = AgentKind::ClaudeCode;
+        let observation = hook_observation(&other_agent);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &other_agent,
+                &observation,
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+
+        let observations: u64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(observations, 0, "neither rejection may leave a row");
+    }
+
+    // A terminal event naming a different scope is not this session's end, so
+    // it is dropped rather than ending someone else's session — preserving the
+    // pre-guard `SessionEndDisposition::DropInvalid` arm.
+    #[test]
+    fn cross_project_session_end_is_dropped_without_ending_the_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        let visited = get_or_create_project(&mut conn, &ws, "visited", None).unwrap();
+
+        let mut moved = session.clone();
+        moved.project_id = visited;
+        let end = session_end_observation(&moved);
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &moved,
+                &end,
+                &OwnerFilter::User("user:alice".into()),
+                None,
+            )
+            .unwrap(),
+            HookSessionAdmission::InvalidScopedEnd
+        ));
+
+        let ended: Option<i64> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended, None, "a foreign-scope end must not end the session");
+        let observations: u64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(observations, 0);
     }
 
     #[test]

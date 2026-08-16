@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the UI. Existing sessions stay valid (#396).
 
 ### Fixed
+- Mid-session hook events that resolve to a different project than their
+  session — the ordinary result of an agent `cd`-ing into another checkout —
+  are recorded again instead of being dropped as a session-UUID collision.
+  Owner and agent still identify a session and a mismatch there remains
+  terminal; a `SessionEnd` naming a foreign scope is still dropped without
+  ending the session (#396).
 - Hook session UUIDs now reject cross-owner reuse atomically before ingest-key,
   observation, summary, handoff, or end-state mutation; explicit root
   `finalize-session --all-owners` recovery remains available (#396).
