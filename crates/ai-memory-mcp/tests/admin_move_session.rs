@@ -814,16 +814,192 @@ async fn move_session_rejects_bad_shapes() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    // Same scope.
+    // Same scope in the single form is a re-home, not an error: nothing is
+    // stray here, so every count is zero and the row stays.
     let resp = post(
         &state,
         "/admin/move-session",
-        json!({ "session_id": sid.to_string(), "project": "src" }),
+        json!({ "session_id": sid.to_string(), "project": "src", "confirm": true }),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["session_moved"], false, "{body}");
+    assert_eq!(body["summary"]["observations"], 0, "{body}");
+    assert_eq!(body["page"], "none", "{body}");
     assert_eq!(
         rows_in_scope(&store, sid, scopes.ws, scopes.src).await,
         (1, 2, 1, 1)
     );
+    // Same scope in the batch form stays a 422.
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "from_project": "src", "project": "src" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// Scatter `n` observations of `sid` into `(ws, proj)` the way pre-sticky
+/// mid-session routing did: rows stamped into a project the session row
+/// never belonged to.
+async fn scatter_observations(
+    store: &Store,
+    sid: SessionId,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    n: usize,
+) {
+    for i in 0..n {
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: format!("stray {i}"),
+                    body: "landed in the wrong bucket".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn move_session_batch_empties_phantom_bucket_with_only_observations() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let scopes = seed_scopes(&store).await;
+    // The session is rooted in `dst` (row, 2 observations, handoff, job,
+    // page all there); 4 of its observations landed in `src`, which has no
+    // `sessions` row at all: the phantom bucket.
+    let sid = seed_session(&store, &state.wiki, scopes.ws, scopes.dst, "/repo/dst").await;
+    scatter_observations(&store, sid, scopes.ws, scopes.src, 4).await;
+    assert_eq!(
+        rows_in_scope(&store, sid, scopes.ws, scopes.src).await,
+        (0, 4, 0, 0)
+    );
+
+    // Dry run sees the session through its observations and reports them.
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "from_project": "src", "project": "dst" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["dry_run"], true, "{body}");
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["moved"], 1, "{body}");
+    let s = &body["sessions"][0];
+    assert_eq!(s["session_id"], sid.to_string(), "{body}");
+    assert_eq!(s["session_moved"], false, "{body}");
+    assert_eq!(s["summary"]["observations"], 4, "{body}");
+    assert_eq!(s["summary"]["handoffs"], 0, "{body}");
+    assert_eq!(s["page"], "none", "{body}");
+    assert_eq!(
+        rows_in_scope(&store, sid, scopes.ws, scopes.src).await,
+        (0, 4, 0, 0)
+    );
+
+    // Confirm: the strays are gathered, the bucket is empty, the row and the
+    // page never moved.
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "from_project": "src", "project": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["dry_run"], false, "{body}");
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["moved"], 1, "{body}");
+    assert_eq!(body["sessions"][0]["session_moved"], false, "{body}");
+    assert_eq!(body["sessions"][0]["summary"]["observations"], 4, "{body}");
+    assert_eq!(
+        rows_in_scope(&store, sid, scopes.ws, scopes.src).await,
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        rows_in_scope(&store, sid, scopes.ws, scopes.dst).await,
+        (1, 6, 1, 1)
+    );
+    assert!(
+        state
+            .wiki
+            .abs_path(scopes.ws, scopes.dst, &page_path(sid))
+            .exists()
+    );
+    assert_eq!(
+        read_page(&state, "default", "dst", sid).await,
+        StatusCode::OK
+    );
+    // Nothing left touching the bucket.
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "from_project": "src", "project": "dst" }),
+    )
+    .await;
+    assert_eq!(body_json(resp).await["total"], 0);
+}
+
+/// An open session whose row already sits in the destination is re-homed
+/// without `force`: the row does not move, so the open-session guard does not
+/// apply (a pending job still does).
+#[tokio::test]
+async fn move_session_rehome_of_open_session_needs_no_force() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let scopes = seed_scopes(&store).await;
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: sid,
+            workspace_id: scopes.ws,
+            project_id: scopes.dst,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/dst".into()),
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    scatter_observations(&store, sid, scopes.ws, scopes.src, 2).await;
+
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "from_project": "src", "project": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["moved"], 1, "{body}");
+    assert_eq!(body["sessions"][0]["session_moved"], false, "{body}");
+    assert_eq!(body["sessions"][0]["summary"]["observations"], 2, "{body}");
+    assert_eq!(
+        rows_in_scope(&store, sid, scopes.ws, scopes.dst).await,
+        (1, 2, 0, 0)
+    );
+
+    // The same open session, batch-moved out of its own scope, still needs
+    // force: the row would move.
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({ "from_project": "dst", "project": "src", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }

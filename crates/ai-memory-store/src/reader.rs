@@ -2020,6 +2020,47 @@ impl ReaderPool {
         .await
     }
 
+    /// Ids of every session that touches `(workspace_id, project_id)`: a
+    /// `sessions` row in the scope OR at least one observation stamped into
+    /// it. The second leg catches the phantom projects that mid-session
+    /// routing before the sticky mode filled with observations of sessions
+    /// rooted elsewhere (no `sessions` row of their own), so a batch
+    /// `move-session` can empty such a bucket. Ordered by first touch (the
+    /// row's `started_at` or the earliest observation in the scope), then id.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_ids_touching_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<SessionId>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM ( \
+                     SELECT id, started_at AS first_seen FROM sessions \
+                     WHERE workspace_id = ?1 AND project_id = ?2 \
+                     UNION ALL \
+                     SELECT session_id AS id, MIN(created_at) AS first_seen FROM observations \
+                     WHERE workspace_id = ?1 AND project_id = ?2 \
+                     GROUP BY session_id \
+                 ) \
+                 GROUP BY id \
+                 ORDER BY MIN(first_seen), id",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(SessionId::from_slice(&r?)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// How a `SessionEnd` should treat its target session (issue #152).
     ///
     /// The old boolean ("is the session open?") conflated two very different

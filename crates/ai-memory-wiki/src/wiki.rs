@@ -362,7 +362,10 @@ impl Wiki {
     /// under the watcher-ignored `.ai-memory-tmp.` prefix and deleted once the
     /// rows are retired: left in place, the next reconciliation pass would
     /// re-index it as a fresh latest page in the source scope. A store failure
-    /// puts the file back where it was in both modes.
+    /// puts the file back where it was in both modes. When `from == to` (a
+    /// re-home of a session already rooted in the destination) there is no
+    /// file to relocate: the file step is skipped and only the store sweep
+    /// runs.
     ///
     /// # Errors
     /// Returns [`WikiError::DestinationPageExists`] when the destination
@@ -394,7 +397,7 @@ impl Wiki {
             .project_root(from.0, from.1)
             .join("sessions")
             .join(&file_name);
-        let parked = if src.is_file() {
+        let parked = if from != to && src.is_file() {
             let target = match pages {
                 PagesMode::Move => {
                     let dst = self

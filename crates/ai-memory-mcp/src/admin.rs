@@ -4181,7 +4181,10 @@ async fn move_project_core(
 ///
 /// Two shapes share the route: a single move names `session_id`; a batch
 /// names `from_project` (plus optional `from_workspace`) and moves every
-/// session of that scope. Exactly one of the two must be present.
+/// session touching that scope (a `sessions` row there OR observations
+/// stamped into it). Exactly one of the two must be present. A session whose
+/// row already sits in the destination is re-homed: only its rows still
+/// lying elsewhere move (`session_moved: false`).
 #[derive(Deserialize)]
 struct MoveSessionRequest {
     /// The session to move (single form).
@@ -4190,7 +4193,7 @@ struct MoveSessionRequest {
     /// Source workspace of the batch form. Defaults to `default`.
     #[serde(default)]
     from_workspace: Option<String>,
-    /// Source project of the batch form: every session in it moves.
+    /// Source project of the batch form: every session touching it moves.
     #[serde(default)]
     from_project: Option<String>,
     /// Destination workspace. Defaults to the source workspace.
@@ -4208,8 +4211,9 @@ struct MoveSessionRequest {
     #[serde(default)]
     confirm: bool,
     /// Skip the live-session guards: an open session (no session end
-    /// recorded), a `pending`/`running` consolidation job, and, for the batch
-    /// form, the hook router's active-project pointer.
+    /// recorded; not applied to a re-home, whose row does not move), a
+    /// `pending`/`running` consolidation job, and, for the batch form, the
+    /// hook router's active-project pointer.
     #[serde(default)]
     force: bool,
     /// Create the destination workspace/project when absent instead of 404.
@@ -4252,6 +4256,10 @@ pub struct MoveSessionReport {
     pub session_id: String,
     /// `true` when nothing was written (no `confirm`).
     pub dry_run: bool,
+    /// Whether the `sessions` row changed scope. `false` for a re-home: the
+    /// row already sat in the destination and only stray rows (the counts
+    /// below) were gathered into it.
+    pub session_moved: bool,
     /// Scope the session came from.
     pub from: ScopeLabel,
     /// Scope the session now belongs to.
@@ -4284,11 +4292,13 @@ pub struct MoveSessionBatchReport {
     pub from: ScopeLabel,
     /// Destination scope.
     pub to: ScopeLabel,
-    /// Sessions found in the source scope.
+    /// Sessions touching the source scope (a `sessions` row there or at
+    /// least one observation stamped into it).
     pub total: usize,
-    /// Sessions moved (or, for a dry run, that would move).
+    /// Sessions moved or re-homed (or, for a dry run, that would be).
     pub moved: usize,
-    /// One report per session, in `started_at` order.
+    /// One report per session, oldest first (row `started_at` or first
+    /// observation in the source).
     pub sessions: Vec<MoveSessionReport>,
     /// Pre-move checkpoint, if the tree had uncommitted changes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4301,11 +4311,23 @@ pub struct MoveSessionBatchReport {
 /// One session move, resolved and validated, before any guard runs.
 struct MoveSessionPlan {
     session_id: SessionId,
+    /// Scope the rows are gathered from: the session row's own scope in the
+    /// single form, the batch source in the batch form (where the row may
+    /// well sit elsewhere, even in `to`).
     from: (WorkspaceId, ProjectId),
     from_label: ScopeLabel,
     to: (WorkspaceId, ProjectId),
     to_label: ScopeLabel,
+    /// Where the `sessions` row sits right now.
+    row_scope: (WorkspaceId, ProjectId),
     cwd: Option<String>,
+}
+
+impl MoveSessionPlan {
+    /// The row already sits in the destination: only stray rows move.
+    fn is_rehome(&self) -> bool {
+        self.row_scope == self.to
+    }
 }
 
 async fn handle_move_session(
@@ -4400,41 +4422,27 @@ async fn session_move_blockers(
         .await
 }
 
-/// `(session_id, cwd)` of every session in a scope, oldest first.
+/// `(session_id, row scope, cwd)` of every session touching a scope (a
+/// `sessions` row there or observations stamped into it), oldest first. The
+/// row scope may differ from the queried scope: that is the phantom-bucket
+/// case the batch re-homes.
 async fn list_scope_sessions(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
-) -> Result<Vec<(SessionId, Option<String>)>, StoreError> {
-    reader
-        .with_conn(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, cwd FROM sessions \
-                 WHERE workspace_id = ?1 AND project_id = ?2 \
-                 ORDER BY started_at, id",
-            )?;
-            let rows = stmt.query_map(
-                [
-                    workspace_id.as_bytes().as_slice(),
-                    project_id.as_bytes().as_slice(),
-                ],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let cwd: Option<String> = row.get(1)?;
-                    Ok((id_bytes, cwd))
-                },
-            )?;
-            let mut out = Vec::new();
-            for r in rows {
-                let (id_bytes, cwd) = r?;
-                out.push((
-                    SessionId::from_slice(&id_bytes).map_err(StoreError::Memory)?,
-                    cwd,
-                ));
-            }
-            Ok(out)
-        })
-        .await
+) -> Result<Vec<(SessionId, (WorkspaceId, ProjectId), Option<String>)>, StoreError> {
+    let ids = reader
+        .session_ids_touching_scope(workspace_id, project_id)
+        .await?;
+    let mut out = Vec::with_capacity(ids.len());
+    for sid in ids {
+        // Observations reference `sessions` (FK on), so a listed id always
+        // has a row; a concurrent purge is the only way to lose it here.
+        if let Some((ws, proj, cwd)) = reader.find_session_scope(sid).await? {
+            out.push((sid, (ws, proj), cwd));
+        }
+    }
+    Ok(out)
 }
 
 fn move_session_store_err(e: StoreError) -> MoveErr {
@@ -4517,26 +4525,17 @@ async fn move_planned_session(
     actor: &ai_memory_core::ActorContext,
 ) -> Result<MoveSessionReport, MoveErr> {
     let sid = plan.session_id;
-    if plan.from == plan.to {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": format!(
-                    "session {sid} already belongs to {}/{}",
-                    plan.to_label.workspace, plan.to_label.project
-                )
-            })),
-        ));
-    }
+    let rehome = plan.is_rehome();
 
     // Live-session guards. An open session may still receive events, and a
     // queued consolidation would write the page under the old scope; both
-    // are the operator's call with `force`.
+    // are the operator's call with `force`. A re-home leaves the row where
+    // it is, so an open session is no reason to refuse gathering its strays.
     let (open, pending_job) = session_move_blockers(&state.reader, sid)
         .await
         .map_err(|e| internal_err(e.to_string()))?;
     if !req.force {
-        if open {
+        if open && !rehome {
             return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -4561,7 +4560,9 @@ async fn move_planned_session(
     }
 
     // A page file already at the destination blocks a page move; checked here
-    // too so the dry run predicts what the wiki re-checks under its lock.
+    // too so the dry run predicts what the wiki re-checks under its lock. When
+    // the source scope IS the destination (single-form re-home) there is no
+    // file to move and the wiki skips the file step too.
     let file_name = format!("{sid}.md");
     let src_file = state
         .wiki
@@ -4573,7 +4574,8 @@ async fn move_planned_session(
         .project_root(plan.to.0, plan.to.1)
         .join("sessions")
         .join(&file_name);
-    if req.pages == PagesMode::Move && src_file.is_file() && dst_file.exists() {
+    let file_moves = plan.from != plan.to && src_file.is_file();
+    if req.pages == PagesMode::Move && file_moves && dst_file.exists() {
         return Err(move_session_wiki_err(WikiError::DestinationPageExists(
             dst_file.display().to_string(),
         )));
@@ -4591,10 +4593,11 @@ async fn move_planned_session(
         return Ok(MoveSessionReport {
             session_id: sid.to_string(),
             dry_run: true,
+            session_moved: summary.session_moved,
             from: plan.from_label,
             to: plan.to_label,
             summary: move_session_counts(&summary),
-            page: move_session_page_label(req.pages, touched_rows, src_file.is_file()),
+            page: move_session_page_label(req.pages, touched_rows, file_moves),
             cwd: plan.cwd,
             cwd_warning,
             pre_checkpoint: None,
@@ -4630,6 +4633,7 @@ async fn move_planned_session(
     Ok(MoveSessionReport {
         session_id: sid.to_string(),
         dry_run: false,
+        session_moved: outcome.summary.session_moved,
         from: plan.from_label,
         to: plan.to_label,
         summary: move_session_counts(&outcome.summary),
@@ -4678,6 +4682,7 @@ async fn move_single_session(
             workspace: to_workspace,
             project: req.project.clone(),
         },
+        row_scope: (from_ws, from_proj),
         cwd,
     };
 
@@ -4778,13 +4783,27 @@ async fn move_session_batch(
     let total = sessions.len();
     let mut reports = Vec::with_capacity(total);
     let mut failure: Option<(SessionId, MoveErr)> = None;
-    for (session_id, cwd) in sessions {
+    for (session_id, row_scope, cwd) in sessions {
+        // The page file follows the page rows: a session rooted in a third
+        // scope (only some observations in the source) is moved whole from
+        // where its row sits; a session already rooted in the destination is
+        // re-homed and its stray page file, if any, is looked for in the
+        // source.
+        let (plan_from, plan_from_label) = if row_scope == from || row_scope == to {
+            (from, from_label.clone())
+        } else {
+            (
+                row_scope,
+                scope_label(state, row_scope.0, row_scope.1).await,
+            )
+        };
         let plan = MoveSessionPlan {
             session_id,
-            from,
-            from_label: from_label.clone(),
+            from: plan_from,
+            from_label: plan_from_label,
             to,
             to_label: to_label.clone(),
+            row_scope,
             cwd,
         };
         match move_planned_session(state, req, plan, author_id, &actor).await {

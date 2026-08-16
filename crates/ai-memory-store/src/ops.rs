@@ -3075,11 +3075,14 @@ pub enum PagesMode {
 /// dry run (`commit = false`), whose transaction is rolled back after counting.
 #[derive(Debug, Clone)]
 pub struct MoveSessionSummary {
-    /// Whether the `sessions` row changed scope. `false` when the target
-    /// scope equals the source scope (no-op; every count is zero).
+    /// Whether the `sessions` row changed scope. `false` when the row already
+    /// sat in the target scope: the call is then a "re-home" that only
+    /// re-stamps the session's rows still lying in other scopes, and every
+    /// count says how many of those there were (all zero when none).
     pub session_moved: bool,
-    /// `observations` rows re-stamped (every row of the session, including
-    /// any that landed outside the session row's own scope).
+    /// `observations` rows re-stamped: every row of the session that was
+    /// outside the target scope, including any that landed outside the
+    /// session row's own scope. Rows already in the target are not counted.
     pub observations: u64,
     /// `handoffs` rows re-stamped (`from_session_id` = the session).
     pub handoffs: u64,
@@ -3116,11 +3119,25 @@ pub struct MoveSessionSummary {
 /// scheduler claim) into `(target_workspace, target_project)` in ONE
 /// transaction, plus its `sessions/<session_id>.md` page per `pages`.
 ///
+/// Dependent rows are matched by session id alone, so a hybrid session whose
+/// events were scattered over other scopes (mid-session routing before the
+/// sticky mode) is gathered whole; only rows not already in the target are
+/// touched and counted.
+///
+/// A target equal to the session row's own scope is a **re-home**: the row
+/// stays put (`session_moved = false`) and the same sweep re-stamps every
+/// dependent row still lying in any other scope; a session with nothing
+/// outside the target reports zero counts (not an error). Its page rows are
+/// then handled wherever they sit outside the target: under
+/// [`PagesMode::Move`] they are re-stamped (refused with
+/// [`StoreError::PagePathTaken`] when the target already holds a latest page
+/// or more than one outside scope does), under [`PagesMode::Regenerate`]
+/// their latest rows are retired. In a real move the page rows handled are
+/// those of the source scope, as before.
+///
 /// `commit = false` performs the same work and rolls the transaction back
-/// before returning, so the summary is an exact dry run. A target equal to the
-/// source is a no-op that reports zero counts and `session_moved = false`.
-/// `author_id` is the operator recorded on the `audit_log` row, as in
-/// [`rename_project`].
+/// before returning, so the summary is an exact dry run. `author_id` is the
+/// operator recorded on the `audit_log` row, as in [`rename_project`].
 ///
 /// The `workspace_id`/`project_id` pairing triggers only guard INSERT, so the
 /// target pair is validated against `projects` here before any UPDATE runs.
@@ -3180,9 +3197,7 @@ pub fn move_session(
         to_project: target_project,
         cwd,
     };
-    if from_workspace == target_workspace && from_project == target_project {
-        return Ok(summary);
-    }
+    let rehome = from_workspace == target_workspace && from_project == target_project;
 
     let to_ws = target_workspace.as_bytes();
     let to_proj = target_project.as_bytes();
@@ -3199,43 +3214,55 @@ pub fn move_session(
         )));
     }
 
-    let sessions_updated = tx.execute(
-        "UPDATE sessions SET workspace_id = ?1, project_id = ?2 WHERE id = ?3",
-        params![&to_ws[..], &to_proj[..], &sid[..]],
-    )?;
-    summary.session_moved = sessions_updated == 1;
-    // Fires `observations_fts_au` per row (delete + reinsert of the same
-    // text); the FTS index stays consistent inside this transaction.
-    summary.observations = tx.execute(
-        "UPDATE observations SET workspace_id = ?1, project_id = ?2 WHERE session_id = ?3",
-        params![&to_ws[..], &to_proj[..], &sid[..]],
-    )? as u64;
-    summary.handoffs = tx.execute(
-        "UPDATE handoffs SET workspace_id = ?1, project_id = ?2 WHERE from_session_id = ?3",
-        params![&to_ws[..], &to_proj[..], &sid[..]],
-    )? as u64;
-    summary.consolidation_jobs = tx.execute(
-        "UPDATE session_consolidation_jobs SET workspace_id = ?1, project_id = ?2 \
-         WHERE session_id = ?3",
-        params![&to_ws[..], &to_proj[..], &sid[..]],
-    )? as u64;
-    summary.auto_improve_runs = tx.execute(
-        "UPDATE auto_improve_runs SET workspace_id = ?1, project_id = ?2 WHERE session_id = ?3",
-        params![&to_ws[..], &to_proj[..], &sid[..]],
-    )? as u64;
-    summary.auto_improve_claims = tx.execute(
-        "UPDATE auto_improve_scheduler_claims SET workspace_id = ?1, project_id = ?2 \
-         WHERE session_id = ?3",
-        params![&to_ws[..], &to_proj[..], &sid[..]],
-    )? as u64;
+    if !rehome {
+        let sessions_updated = tx.execute(
+            "UPDATE sessions SET workspace_id = ?1, project_id = ?2 WHERE id = ?3",
+            params![&to_ws[..], &to_proj[..], &sid[..]],
+        )?;
+        summary.session_moved = sessions_updated == 1;
+    }
+    // Every dependent row of the session not already in the target, whatever
+    // scope it lies in. Fires `observations_fts_au` per observation row
+    // (delete + reinsert of the same text); the FTS index stays consistent
+    // inside this transaction.
+    let restamp = |table: &str, session_col: &str| -> StoreResult<u64> {
+        Ok(tx.execute(
+            &format!(
+                "UPDATE {table} SET workspace_id = ?1, project_id = ?2 \
+                 WHERE {session_col} = ?3 \
+                   AND NOT (workspace_id = ?1 AND project_id = ?2)"
+            ),
+            params![&to_ws[..], &to_proj[..], &sid[..]],
+        )? as u64)
+    };
+    summary.observations = restamp("observations", "session_id")?;
+    summary.handoffs = restamp("handoffs", "from_session_id")?;
+    summary.consolidation_jobs = restamp("session_consolidation_jobs", "session_id")?;
+    summary.auto_improve_runs = restamp("auto_improve_runs", "session_id")?;
+    summary.auto_improve_claims = restamp("auto_improve_scheduler_claims", "session_id")?;
 
+    // Page rows to handle: the source scope's in a real move; in a re-home,
+    // any scope other than the target (the source IS the target).
     let page_path = format!("sessions/{session_id}.md");
-    let source_versions: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
-        params![&from_ws[..], &from_proj[..], page_path.as_str()],
-        |row| row.get(0),
+    let page_scope_sql = if rehome {
+        "NOT (workspace_id = ?1 AND project_id = ?2)"
+    } else {
+        "workspace_id = ?1 AND project_id = ?2"
+    };
+    let page_scope_params = if rehome {
+        (&to_ws[..], &to_proj[..])
+    } else {
+        (&from_ws[..], &from_proj[..])
+    };
+    let (candidate_versions, candidate_latest): (i64, i64) = tx.query_row(
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(is_latest), 0) FROM pages \
+             WHERE {page_scope_sql} AND path = ?3"
+        ),
+        params![page_scope_params.0, page_scope_params.1, page_path.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if source_versions > 0 {
+    if candidate_versions > 0 {
         match pages {
             PagesMode::Move => {
                 let taken: Option<i64> = tx
@@ -3247,27 +3274,33 @@ pub fn move_session(
                         |row| row.get(0),
                     )
                     .optional()?;
-                if taken.is_some() {
+                // Two latest rows cannot share the path in the target
+                // (`idx_pages_latest_path`): a re-home that finds latest
+                // rows in more than one outside scope is a collision too.
+                if taken.is_some() || candidate_latest > 1 {
                     return Err(StoreError::PagePathTaken { path: page_path });
                 }
                 summary.page_versions_moved = tx.execute(
-                    "UPDATE pages SET workspace_id = ?1, project_id = ?2 \
-                     WHERE workspace_id = ?3 AND project_id = ?4 AND path = ?5",
+                    &format!(
+                        "UPDATE pages SET workspace_id = ?4, project_id = ?5 \
+                         WHERE {page_scope_sql} AND path = ?3"
+                    ),
                     params![
+                        page_scope_params.0,
+                        page_scope_params.1,
+                        page_path.as_str(),
                         &to_ws[..],
                         &to_proj[..],
-                        &from_ws[..],
-                        &from_proj[..],
-                        page_path.as_str()
                     ],
                 )? as u64;
             }
             PagesMode::Regenerate => {
                 summary.pages_regenerated = tx.execute(
-                    "UPDATE pages SET is_latest = 0 \
-                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
-                       AND is_latest = 1",
-                    params![&from_ws[..], &from_proj[..], page_path.as_str()],
+                    &format!(
+                        "UPDATE pages SET is_latest = 0 \
+                         WHERE {page_scope_sql} AND path = ?3 AND is_latest = 1"
+                    ),
+                    params![page_scope_params.0, page_scope_params.1, page_path.as_str()],
                 )? as u64;
             }
         }
@@ -5607,8 +5640,10 @@ pub(crate) mod tests {
         assert_session_bundle_in_scope(&conn, sid, (src_ws, src_proj), (dst_ws, src_proj));
     }
 
+    /// Same scope, nothing stray: a re-home with every count at zero, not
+    /// an error (the audit row is still written).
     #[test]
-    fn move_session_same_scope_is_a_noop_summary() {
+    fn move_session_same_scope_with_nothing_stray_reports_zero_counts() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let sid = seed_movable_session(&mut conn, ws, proj);
 
@@ -5625,7 +5660,159 @@ pub(crate) mod tests {
         assert_eq!(summary.from_workspace, ws);
         assert_eq!(summary.to_project, proj);
         assert_eq!(summary.cwd.as_deref(), Some("/repo/src"));
+        assert_session_bundle_in_scope(&conn, sid, (ws, proj), (WorkspaceId::new(), proj));
         assert_eq!(session_page_versions(&conn, sid, ws, proj), (2, 1));
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE op = 'move_session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    /// Insert `n` observations of `sid` stamped into `(ws, proj)` directly,
+    /// the way mid-session routing before the sticky mode scattered events
+    /// into phantom projects.
+    fn scatter_observations(
+        conn: &mut Connection,
+        sid: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        n: usize,
+    ) {
+        use ai_memory_core::ObservationKind;
+        for i in 0..n {
+            insert_observation(
+                conn,
+                &NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: format!("stray-obs-{i}"),
+                    body: "zebra token body".into(),
+                    importance: 5,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// The phantom-bucket case: the session row already sits in the target,
+    /// some of its observations landed in another scope. Moving the session
+    /// to its own scope re-homes those rows and reports the real counts.
+    #[test]
+    fn move_session_rehomes_stray_rows_when_session_row_already_in_target() {
+        let (_tmp, mut conn, ws, target) = fresh_db();
+        let stray = get_or_create_project(&mut conn, &ws, "tmp", None).unwrap();
+        // Session (row, 2 observations, handoff, job, run, claim, page) in T.
+        let sid = seed_movable_session(&mut conn, ws, target);
+        // 3 observations of the same session stamped into S.
+        scatter_observations(&mut conn, sid, ws, stray, 3);
+        assert_eq!(
+            session_rows_in_scope(&conn, "observations", "session_id", sid, ws, stray),
+            3
+        );
+
+        // Dry run: same counts, nothing changes.
+        let summary =
+            move_session(&mut conn, sid, ws, target, PagesMode::Move, None, false).unwrap();
+        assert!(!summary.session_moved);
+        assert_eq!(summary.observations, 3);
+        assert_eq!(
+            session_rows_in_scope(&conn, "observations", "session_id", sid, ws, stray),
+            3
+        );
+
+        let summary =
+            move_session(&mut conn, sid, ws, target, PagesMode::Move, None, true).unwrap();
+        assert!(!summary.session_moved, "the row was already in the target");
+        assert_eq!(summary.observations, 3, "only the stray rows are counted");
+        assert_eq!(summary.handoffs, 0);
+        assert_eq!(summary.consolidation_jobs, 0);
+        assert_eq!(summary.auto_improve_runs, 0);
+        assert_eq!(summary.auto_improve_claims, 0);
+        assert_eq!(summary.page_versions_moved, 0);
+        assert_eq!(summary.pages_regenerated, 0);
+        assert_eq!(
+            summary.page_path, None,
+            "the page already sits in the target"
+        );
+        assert_eq!(summary.from_project, target);
+        assert_eq!(summary.to_project, target);
+
+        assert_eq!(
+            session_rows_in_scope(&conn, "observations", "session_id", sid, ws, target),
+            5
+        );
+        assert_eq!(
+            session_rows_in_scope(&conn, "observations", "session_id", sid, ws, stray),
+            0
+        );
+        assert_eq!(fts_hits_in_scope(&conn, sid, ws, target), 5);
+        assert_eq!(fts_hits_in_scope(&conn, sid, ws, stray), 0);
+        assert_eq!(
+            session_rows_in_scope(&conn, "sessions", "id", sid, ws, target),
+            1
+        );
+        assert_eq!(session_page_versions(&conn, sid, ws, target), (2, 1));
+    }
+
+    /// A re-home also gathers the session page when its rows lie outside the
+    /// target: moved under `Move` (collision rule against the target),
+    /// retired under `Regenerate`.
+    #[test]
+    fn move_session_rehome_handles_page_rows_outside_target() {
+        let (_tmp, mut conn, ws, target) = fresh_db();
+        let stray = get_or_create_project(&mut conn, &ws, "tmp", None).unwrap();
+        let sid = seed_movable_session(&mut conn, ws, target);
+        let path = format!("sessions/{sid}.md");
+        // Park the page in the stray scope: nothing at the path in T.
+        conn.execute(
+            "UPDATE pages SET workspace_id = ?1, project_id = ?2 WHERE path = ?3",
+            params![ws.as_bytes(), stray.as_bytes(), path],
+        )
+        .unwrap();
+        assert_eq!(session_page_versions(&conn, sid, ws, target), (0, 0));
+        assert_eq!(session_page_versions(&conn, sid, ws, stray), (2, 1));
+
+        let summary =
+            move_session(&mut conn, sid, ws, target, PagesMode::Move, None, true).unwrap();
+        assert!(!summary.session_moved);
+        assert_eq!(summary.observations, 0);
+        assert_eq!(summary.page_versions_moved, 2);
+        assert_eq!(summary.page_path.as_deref(), Some(path.as_str()));
+        assert_eq!(session_page_versions(&conn, sid, ws, target), (2, 1));
+        assert_eq!(session_page_versions(&conn, sid, ws, stray), (0, 0));
+
+        // Stray latest AND a latest in the target: Move collides, Regenerate
+        // retires the stray one and leaves the target's page alone.
+        upsert_page(&mut conn, &page(ws, stray, &path, "stray again")).unwrap();
+        let err = move_session(&mut conn, sid, ws, target, PagesMode::Move, None, true)
+            .expect_err("a latest page at the path in the target must block the page move");
+        assert!(
+            matches!(&err, StoreError::PagePathTaken { path: p } if *p == path),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(session_page_versions(&conn, sid, ws, stray), (1, 1));
+        let summary = move_session(
+            &mut conn,
+            sid,
+            ws,
+            target,
+            PagesMode::Regenerate,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(summary.pages_regenerated, 1);
+        assert_eq!(summary.page_versions_moved, 0);
+        assert_eq!(session_page_versions(&conn, sid, ws, stray), (1, 0));
+        assert_eq!(session_page_versions(&conn, sid, ws, target), (2, 1));
     }
 
     #[test]

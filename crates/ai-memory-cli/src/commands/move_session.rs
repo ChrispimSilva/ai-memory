@@ -33,9 +33,14 @@ struct MoveSessionRequest {
 /// transaction and this prints what would change plus the exact command to
 /// apply it. With `--confirm` it prints the report.
 ///
+/// A session already rooted in the destination is re-homed: the report says
+/// `session row: already in destination` and the counts are the stray rows
+/// gathered into it (zero when there were none).
+///
 /// # Errors
 /// Returns an error when the server is unreachable or answers non-2xx (404
-/// unknown session/target, 409 guard or page collision, 422 same scope).
+/// unknown session/target, 409 guard or page collision, 422 batch source
+/// equal to the destination).
 pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
 
@@ -84,6 +89,16 @@ fn scope(label: &serde_json::Value) -> String {
     )
 }
 
+/// One line saying whether the `sessions` row itself changes scope; a
+/// re-home leaves it and only gathers stray rows.
+fn session_row_line(report: &serde_json::Value, applied: bool) -> &'static str {
+    match (report["session_moved"].as_bool().unwrap_or(false), applied) {
+        (true, true) => "moved",
+        (true, false) => "would move",
+        (false, _) => "already in destination (re-home: only stray rows gathered)",
+    }
+}
+
 fn print_session_report(report: &serde_json::Value, applied: bool) {
     let verb = if applied { "Moved" } else { "Would move" };
     println!(
@@ -91,6 +106,10 @@ fn print_session_report(report: &serde_json::Value, applied: bool) {
         report["session_id"].as_str().unwrap_or("?"),
         scope(&report["from"]),
         scope(&report["to"]),
+    );
+    println!(
+        "  session row:         {}",
+        session_row_line(report, applied)
     );
     print_counts(
         &report["summary"],
@@ -115,19 +134,34 @@ fn print_batch_report(report: &serde_json::Value, applied: bool) {
     );
     if let Some(sessions) = report["sessions"].as_array() {
         println!(
-            "{:<38} {:>6} {:>8} {:>5} {:<12} cwd",
-            "session_id", "obs", "handoffs", "jobs", "page"
+            "{:<38} {:<8} {:>6} {:>8} {:>5} {:<12} cwd",
+            "session_id", "row", "obs", "handoffs", "jobs", "page"
         );
-        println!("{}", "-".repeat(90));
+        println!("{}", "-".repeat(99));
         for s in sessions {
             println!(
-                "{:<38} {:>6} {:>8} {:>5} {:<12} {}",
+                "{:<38} {:<8} {:>6} {:>8} {:>5} {:<12} {}",
                 s["session_id"].as_str().unwrap_or("?"),
+                if s["session_moved"].as_bool().unwrap_or(false) {
+                    "moved"
+                } else {
+                    "re-home"
+                },
                 s["summary"]["observations"].as_u64().unwrap_or(0),
                 s["summary"]["handoffs"].as_u64().unwrap_or(0),
                 s["summary"]["consolidation_jobs"].as_u64().unwrap_or(0),
                 s["page"].as_str().unwrap_or("none"),
                 s["cwd"].as_str().unwrap_or(""),
+            );
+        }
+        let rehomed = sessions
+            .iter()
+            .filter(|s| !s["session_moved"].as_bool().unwrap_or(false))
+            .count();
+        if rehomed > 0 {
+            println!(
+                "Note: {rehomed} session(s) marked re-home already had their session row in the \
+                 destination; only their stray rows (the counts above) were gathered."
             );
         }
         let warned = sessions

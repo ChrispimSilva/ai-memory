@@ -13,7 +13,7 @@ on a homelab box where mistakes are harder to undo.
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
 | `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
-| `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session of `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
+| `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
 | `backup --output-path` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
@@ -366,14 +366,20 @@ ai-memory move-session --from-project tmp --to NAS_general --to-workspace home \
   --pages regenerate --confirm
 ```
 
-Moves one session, or every session of `--from-project`, into another
+Moves one session, or every session touching `--from-project`, into another
 project, in the same or another workspace. Use it when a session was
 captured under the wrong project (a `cd` into `/tmp` before sticky routing,
 a subagent started in a scratch directory, a repo cloned under a temporary
 name) and its observations should live with the project they are about.
 Unlike `reorg`, which re-derives every session's project from its `cwd`,
 this names the destination explicitly and leaves the rest of the store
-alone.
+alone. Sessions already rooted in the destination only get their stray rows
+re-homed: the `sessions` row stays, every row of theirs still lying in
+another scope is gathered into the destination, and the report says
+`session_moved: false` with the counts. The batch form therefore sees a
+session through a `sessions` row in the source OR observations stamped into
+it, which is what empties a phantom bucket that holds only observations of
+sessions rooted elsewhere (mid-session routing before sticky).
 
 **Request.** `POST /admin/move-session` takes either
 `{"session_id": "<uuid>", "workspace"?, "project", "pages"?, "confirm"?,
@@ -413,7 +419,10 @@ they target pages in the scope they were staged in). `entities` and
 `page_feedback` are not re-stamped either, the same gap `move-project` has.
 
 **Order of operations (per session):** validate the destination (404 unless
-`create`), reject a same-scope target (422), run the guards, then, under the
+`create`), reject a batch whose source is the destination (422; the single
+form with the session's own project is a re-home), run the guards (the
+open-session guard does not apply to a re-home, whose row does not move),
+then, under the
 wiki's exclusive mutation gate, fire `op=move_session` admission webhooks
 (source names in `ctx.workspace`/`ctx.project`, destination names in
 `ctx.destination_*`), move the file, and re-stamp SQLite. Disk goes first
@@ -442,7 +451,8 @@ in its own transaction. The batch stops at the first refusal and the error
 body reports `moved`/`total` and the sessions already moved (they stay
 moved). A dry run of the batch shows the whole plan first.
 
-Response (`MoveSessionReport`): `session_id`, `dry_run`, `from`/`to`
+Response (`MoveSessionReport`): `session_id`, `dry_run`, `session_moved`
+(`false` for a re-home), `from`/`to`
 (`{workspace, project}`), `summary` (`observations`, `handoffs`,
 `consolidation_jobs`, `auto_improve_runs`, `auto_improve_claims`,
 `page_versions_moved`, `pages_regenerated`), `page` (`moved` |
@@ -455,9 +465,11 @@ Failure modes:
 - **Neither `session_id` nor `from_project`, or both** → 400.
 - **Session or destination not found** → 404 (pass `create` / `--create`
   to create the destination).
-- **Destination equals the source scope** → 422.
-- **Open session, pending consolidation job, or active source project
-  (batch)** → 409 without `force`.
+- **Batch source equals the destination** → 422 (the single form with the
+  session's own project is a re-home, 200 with `session_moved: false`).
+- **Open session (unless the row already sits in the destination), pending
+  consolidation job, or active source project (batch)** → 409 without
+  `force`.
 - **Latest page or page file already at `sessions/<id>.md` in the
   destination** (`--pages move`) → 409; nothing moved.
 - **Store failure after the file moved** → 500, file renamed back; the

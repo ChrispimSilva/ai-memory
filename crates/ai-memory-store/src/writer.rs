@@ -1260,7 +1260,9 @@ impl WriterHandle {
     /// `commit = false` the transaction is rolled back after counting, so the
     /// summary is an exact dry run. The target project must already exist;
     /// the caller moves the on-disk page file afterwards. `author_id` is the
-    /// operator recorded on the audit row.
+    /// operator recorded on the audit row. A target equal to the session
+    /// row's own scope re-homes only the rows still lying elsewhere
+    /// (`session_moved = false`); see [`ops::move_session`].
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down,
