@@ -2436,6 +2436,14 @@ async fn process_authorized(
             info!(session = %session_id, "ignoring missing SessionEnd");
             return Ok(());
         }
+        HookSessionAdmission::InvalidScopedEnd => {
+            info!(
+                session = %session_id,
+                agent = %env.agent.as_str(),
+                "ignoring SessionEnd naming a different scope than its session"
+            );
+            return Ok(());
+        }
         HookSessionAdmission::AlreadyEnded { session } => {
             let commit_msg = format!("repair session {}", short_id(&session_id.to_string()));
             match state.wiki.commit_all(&commit_msg) {
