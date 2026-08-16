@@ -485,6 +485,28 @@ Failure modes:
 - **Store failure after the file moved** → 500, file renamed back; the
   error names the manual repair if that rollback also fails.
 
+**It drains every scope, not just the one you named.** Dependent rows are
+matched by session id alone, so a session whose observations were scattered
+across projects (pre-`sticky` mid-session routing, for instance) is gathered
+whole. That is the point of the command — but it means a move can empty a
+project you did not mention, and it is **not cleanly reversible**: moving the
+session back later returns every row to a single project, and the original
+per-row split is gone.
+
+The dry run therefore names each scope it would drain, with counts:
+
+```text
+  gathering observations out of 2 scopes into default/acme-api:
+    default/scratchpad: 3 observation(s)
+    default/tmp: 1 observation(s)
+  Note: this empties every scope listed above, not only the one named as the
+  source. Moving the session back later returns all rows to a single project —
+  the split shown here is not restored.
+```
+
+`POST /admin/move-session` reports the same list as `source_scopes`. Read it
+before confirming.
+
 ### `checkpoints`
 
 ```bash

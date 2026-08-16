@@ -116,6 +116,7 @@ fn print_session_report(report: &serde_json::Value, applied: bool) {
         &report["summary"],
         report["page"].as_str().unwrap_or("none"),
     );
+    print_source_scopes(report, &scope(&report["to"]));
     if let Some(warning) = report["cwd_warning"].as_str() {
         println!("Warning: {warning}");
     }
@@ -199,6 +200,43 @@ fn print_batch_report(report: &serde_json::Value, applied: bool) {
         }
     }
     print_checkpoints(report);
+}
+
+/// Name every scope the move will drain, when it is more than the one the
+/// caller asked about.
+///
+/// A move gathers dependent rows by session id alone, so it can empty a
+/// project nobody named — and moving back afterwards cannot restore the
+/// original split. The operator sees that here, in the dry run, rather than
+/// inferring it from a count that came out larger than expected.
+fn print_source_scopes(report: &serde_json::Value, destination: &str) {
+    let Some(scopes) = report["source_scopes"].as_array() else {
+        return;
+    };
+    let others: Vec<_> = scopes
+        .iter()
+        .filter(|s| s["observations"].as_u64().unwrap_or(0) > 0)
+        .collect();
+    if others.len() < 2 {
+        return;
+    }
+    println!(
+        "  gathering observations out of {} scopes into {destination}:",
+        others.len()
+    );
+    for s in &others {
+        println!(
+            "    {}/{}: {} observation(s)",
+            s["workspace"].as_str().unwrap_or("?"),
+            s["project"].as_str().unwrap_or("?"),
+            s["observations"].as_u64().unwrap_or(0),
+        );
+    }
+    println!(
+        "  Note: this empties every scope listed above, not only the one named as the source. \
+         Moving the session back later returns all rows to a single project — the split shown \
+         here is not restored."
+    );
 }
 
 fn print_counts(summary: &serde_json::Value, page: &str) {

@@ -34,7 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when its page needs nothing), and the batch form enumerates sessions with a `sessions` row in
   the source OR observations stamped into it, so a phantom project holding
   only observations of sessions rooted elsewhere can be emptied. New
-  admission op `move_session`. (#402)
+  admission op `move_session`. The dry run and the `/admin/move-session`
+  response name every scope the move would drain (`source_scopes`), because
+  gathering by session id can empty a project the caller never named and
+  moving back does not restore the original split. (#402)
 - Added a read path for one session's raw hook observations, before any
   consolidation: the MCP tool `memory_read_session_observations` and the
   `/api/v1` routes `GET .../projects/{project}/sessions` and

@@ -3071,6 +3071,29 @@ pub enum PagesMode {
     Regenerate,
 }
 
+/// One scope a move drained observations out of, and how many.
+///
+/// A move matches dependent rows by session id alone, so it gathers rows from
+/// EVERY scope they landed in — not just the one the caller named as the
+/// source. That is deliberate (it is what repairs a session scattered by
+/// pre-sticky mid-session routing), but it is not cleanly reversible: moving
+/// back sends every row to one scope, and the original per-row attribution is
+/// gone. So the caller is told which scopes it is about to drain, by name,
+/// before it commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveSessionSourceScope {
+    /// Workspace the rows are currently stamped with.
+    pub workspace_id: WorkspaceId,
+    /// Project the rows are currently stamped with.
+    pub project_id: ProjectId,
+    /// Workspace name, resolved for the operator-facing report.
+    pub workspace_name: String,
+    /// Project name, resolved for the operator-facing report.
+    pub project_name: String,
+    /// Observations of this session currently in that scope.
+    pub observations: u64,
+}
+
 /// Summary returned by [`move_session`] and exposed via
 /// [`crate::writer::WriterHandle::move_session`]. Populated identically for a
 /// dry run (`commit = false`), whose transaction is rolled back after counting.
@@ -3117,6 +3140,11 @@ pub struct MoveSessionSummary {
     /// (historical truth; the caller may warn when it no longer matches the
     /// destination project).
     pub cwd: Option<String>,
+    /// Scopes holding observations of this session that are NOT the target,
+    /// with their counts, newest-largest first. More than one entry means the
+    /// move will drain a project the caller did not name; an empty list means
+    /// everything already sits in the target.
+    pub source_scopes: Vec<MoveSessionSourceScope>,
 }
 
 /// Re-stamp one session and every row that hangs off it (`observations`,
@@ -3202,6 +3230,7 @@ pub fn move_session(
         to_workspace: target_workspace,
         to_project: target_project,
         cwd,
+        source_scopes: Vec::new(),
     };
     let rehome = from_workspace == target_workspace && from_project == target_project;
 
@@ -3227,6 +3256,42 @@ pub fn move_session(
         )?;
         summary.session_moved = sessions_updated == 1;
     }
+    // Which scopes this move is about to drain, resolved to names BEFORE the
+    // re-stamp moves the rows. A move gathers by session id alone, so it can
+    // empty a project the caller never named; the operator sees that in the
+    // dry run rather than discovering it afterwards, when the original
+    // attribution is no longer recoverable.
+    {
+        let mut stmt = tx.prepare(
+            "SELECT o.workspace_id, o.project_id, w.name, p.name, COUNT(*) \
+             FROM observations o \
+             JOIN workspaces w ON w.id = o.workspace_id \
+             JOIN projects p ON p.id = o.project_id \
+             WHERE o.session_id = ?1 AND NOT (o.workspace_id = ?2 AND o.project_id = ?3) \
+             GROUP BY o.workspace_id, o.project_id \
+             ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt.query_map(params![&sid[..], &to_ws[..], &to_proj[..]], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (ws_bytes, proj_bytes, workspace_name, project_name, count) = row?;
+            summary.source_scopes.push(MoveSessionSourceScope {
+                workspace_id: WorkspaceId::from_slice(&ws_bytes)?,
+                project_id: ProjectId::from_slice(&proj_bytes)?,
+                workspace_name,
+                project_name,
+                observations: u64::try_from(count).unwrap_or(0),
+            });
+        }
+    }
+
     // Every dependent row of the session not already in the target, whatever
     // scope it lies in. Fires `observations_fts_au` per observation row
     // (delete + reinsert of the same text); the FTS index stays consistent
@@ -5766,6 +5831,55 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// A move gathers dependent rows by session id alone, so it drains every
+    /// scope they landed in — including projects the caller never named. That
+    /// is deliberate, but it is not cleanly reversible, so the dry run has to
+    /// say which scopes it is about to empty before anything is committed.
+    #[test]
+    fn move_session_dry_run_names_every_scope_it_will_drain() {
+        let (_tmp, mut conn, ws, target) = fresh_db();
+        let unnamed_a = get_or_create_project(&mut conn, &ws, "scratchpad", None).unwrap();
+        let unnamed_b = get_or_create_project(&mut conn, &ws, "tmp", None).unwrap();
+        let sid = seed_movable_session(&mut conn, ws, target);
+        scatter_observations(&mut conn, sid, ws, unnamed_a, 3);
+        scatter_observations(&mut conn, sid, ws, unnamed_b, 1);
+
+        // Dry run: nothing is written, but the report must already name both
+        // scopes it would empty.
+        let summary =
+            move_session(&mut conn, sid, ws, target, PagesMode::Move, None, false).unwrap();
+
+        let named: Vec<(String, u64)> = summary
+            .source_scopes
+            .iter()
+            .map(|s| (s.project_name.clone(), s.observations))
+            .collect();
+        assert_eq!(
+            named,
+            vec![("scratchpad".to_string(), 3), ("tmp".to_string(), 1)],
+            "both drained scopes must be named, largest first"
+        );
+        assert!(
+            summary.source_scopes.iter().all(|s| s.workspace_id == ws),
+            "each entry carries its resolved scope ids"
+        );
+        // The dry run really was a dry run.
+        assert_eq!(
+            session_rows_in_scope(&conn, "observations", "session_id", sid, ws, unnamed_a),
+            3
+        );
+
+        // The destination itself is never listed as a scope to drain.
+        let confirmed =
+            move_session(&mut conn, sid, ws, target, PagesMode::Move, None, true).unwrap();
+        assert_eq!(confirmed.observations, 4);
+        let after = move_session(&mut conn, sid, ws, target, PagesMode::Move, None, false).unwrap();
+        assert!(
+            after.source_scopes.is_empty(),
+            "with everything in the destination there is nothing left to drain"
+        );
     }
 
     /// The phantom-bucket case: the session row already sits in the target,

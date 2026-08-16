@@ -58,8 +58,7 @@ pub use reader::{
     PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
     ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
     SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts, StoredEmbedding,
-    StoredPageBody,
-    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,

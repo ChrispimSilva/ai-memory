@@ -4251,6 +4251,17 @@ pub struct MoveSessionCounts {
     pub pages_regenerated: u64,
 }
 
+/// One scope a move gathers observations out of, for the operator's report.
+#[derive(Debug, Serialize)]
+pub struct MoveSessionScopeCount {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Observations of the session currently stamped into that scope.
+    pub observations: u64,
+}
+
 /// Wire-format report for one session in `POST /admin/move-session`.
 #[derive(Debug, Serialize)]
 pub struct MoveSessionReport {
@@ -4266,6 +4277,12 @@ pub struct MoveSessionReport {
     /// the confirm run will create it. Never set on a confirmed move.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub would_create_project: bool,
+    /// Every scope holding observations of this session other than the
+    /// destination, with counts. More than one entry — or one that is not
+    /// `from` — means the move drains a project the caller did not name.
+    /// Empty when everything already sits in the destination.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_scopes: Vec<MoveSessionScopeCount>,
     /// Scope the session came from.
     pub from: ScopeLabel,
     /// Scope the session now belongs to.
@@ -4552,6 +4569,20 @@ fn move_session_cwd_warning(cwd: Option<&str>, to_project: &str) -> Option<Strin
     ))
 }
 
+fn move_session_source_scopes(
+    summary: &ai_memory_store::MoveSessionSummary,
+) -> Vec<MoveSessionScopeCount> {
+    summary
+        .source_scopes
+        .iter()
+        .map(|scope| MoveSessionScopeCount {
+            workspace: scope.workspace_name.clone(),
+            project: scope.project_name.clone(),
+            observations: scope.observations,
+        })
+        .collect()
+}
+
 fn move_session_counts(summary: &ai_memory_store::MoveSessionSummary) -> MoveSessionCounts {
     MoveSessionCounts {
         observations: summary.observations,
@@ -4650,6 +4681,7 @@ async fn move_planned_session(
                 dry_run: true,
                 session_moved: true,
                 would_create_project: true,
+                source_scopes: Vec::new(),
                 from: plan.from_label,
                 to: plan.to_label,
                 page: move_session_page_label(req.pages, touched_rows, src_file.is_file(), false),
@@ -4690,6 +4722,7 @@ async fn move_planned_session(
             dry_run: true,
             session_moved: summary.session_moved,
             would_create_project: false,
+            source_scopes: move_session_source_scopes(&summary),
             from: plan.from_label,
             to: plan.to_label,
             summary: move_session_counts(&summary),
@@ -4729,6 +4762,7 @@ async fn move_planned_session(
         dry_run: false,
         session_moved: outcome.summary.session_moved,
         would_create_project: false,
+        source_scopes: move_session_source_scopes(&outcome.summary),
         from: plan.from_label,
         to: plan.to_label,
         summary: move_session_counts(&outcome.summary),
