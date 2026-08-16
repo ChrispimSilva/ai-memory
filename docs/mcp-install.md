@@ -1084,7 +1084,8 @@ Model (any client): I can call: memory_query, memory_recent,
      memory_status, memory_briefing, memory_explore,
      memory_handoff_accept, memory_handoff_begin, memory_handoff_cancel,
      memory_consolidate, memory_auto_improve, memory_write_page,
-     memory_read_page, memory_delete_page, memory_feedback,
+     memory_read_page, memory_read_session_observations,
+     memory_delete_page, memory_feedback,
      memory_lint, memory_forget_sweep, memory_install_self_routing.
      memory_status reports: 0 pages, 0 observations, 0 sessions.
 ```
