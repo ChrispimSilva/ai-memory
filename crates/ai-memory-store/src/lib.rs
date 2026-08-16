@@ -53,10 +53,12 @@ pub use reader::{
     ActivityWindow, AgentSessionCount, AutoImproveCandidateSession, BriefPageBody, BriefingPage,
     BriefingSnapshot, ClientActivity, ContaminationFinding, ContaminationReport,
     ContaminationSummary, DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount,
-    FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit, OpenSession, PageAuthor,
-    PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
+    FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit, ObservationOrder,
+    ObservationPage, ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit,
+    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
     ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
-    SessionDependentRows, SessionEndDisposition, StatusCounts, StoredEmbedding, StoredPageBody,
+    SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts, StoredEmbedding,
+    StoredPageBody,
     WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use scope::{

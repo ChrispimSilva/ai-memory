@@ -35,6 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the source OR observations stamped into it, so a phantom project holding
   only observations of sessions rooted elsewhere can be emptied. New
   admission op `move_session`. (#402)
+- Added a read path for one session's raw hook observations, before any
+  consolidation: the MCP tool `memory_read_session_observations` and the
+  `/api/v1` routes `GET .../projects/{project}/sessions` and
+  `GET .../sessions/{session_id}/observations`. Both return only the rows that
+  landed in the resolved `(workspace, project)`, report `elided_other_scope`
+  for a session that crossed repositories, and apply the same owner filter as
+  handoffs; a session id from another project or operator reads as not found.
+  Pagination is `limit`/`offset` with `total` (default 50, max 200; the
+  session list defaults to 20, max 100), `order` is `asc` or `desc`, `kinds`
+  and a full-text query narrow the rows, and `body_max_chars` (default 4000,
+  `200..=16384`) caps each body with a visible truncation marker. The MCP tool
+  reads the latest completed visible session when `session_id` is omitted
+  (#401).
 
 ## [1.27.0] - 2026-08-16
 
