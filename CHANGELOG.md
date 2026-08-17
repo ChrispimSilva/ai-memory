@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.28.0] - 2026-08-17
+
 ### Fixed
 - `install-hooks --agent codex` and `uninstall` now honor `CODEX_HOME`, instead
   of always writing to `~/.codex/hooks.json`. Codex loads hooks from its
@@ -3254,7 +3256,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.27.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.28.0...HEAD
+[1.28.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.28.0
 [1.27.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.27.0
 [1.26.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.26.1
 [1.26.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.26.0
