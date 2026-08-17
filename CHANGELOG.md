@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `install-hooks --agent codex` and `uninstall` now honor `CODEX_HOME`, instead
+  of always writing to `~/.codex/hooks.json`. Codex loads hooks from its
+  configured home, so on an install with `CODEX_HOME` set the hooks landed
+  where Codex never reads them: the install reported success and capture
+  silently did nothing. ai-memory already honored the variable when resolving
+  Codex transcripts, so the two halves of one install disagreed about where
+  that home was. Installs without `CODEX_HOME` set are unaffected.
+
 ### Added
 - Added `ai-memory move-session <session-id> --to <project> [--to-workspace]
   [--pages move|regenerate] [--confirm] [--force] [--create]`, its batch form

@@ -57,8 +57,27 @@ fn claude_settings_path_in(
         .join("settings.json"))
 }
 
+/// Codex's hooks file — `$CODEX_HOME/hooks.json` when the var is set, else
 /// `~/.codex/hooks.json`.
+///
+/// `CODEX_HOME` relocates Codex's whole config home, so hooks written to the
+/// default path are simply never loaded by a Codex configured that way: capture
+/// silently does nothing, with a successful-looking install. ai-memory already
+/// honors the variable when it resolves that Codex's transcripts
+/// (`ManagedHarness::Codex` in `ai-memory-workstream`), so ignoring it here left
+/// one half of the same install pointing somewhere the other half did not.
 pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    codex_hooks_path_in(std::env::var_os("CODEX_HOME"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both branches
+/// without mutating process env (mirrors [`claude_settings_path_in`]).
+fn codex_hooks_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("hooks.json"));
+    }
     Ok(home_dir()
         .context("could not locate $HOME for ~/.codex/hooks.json")?
         .join(".codex")
@@ -6709,6 +6728,34 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             assert!(
                 path.ends_with(Path::new(".claude").join("settings.json")),
                 "default must be ~/.claude/settings.json, got {}",
+                path.display()
+            );
+        }
+    }
+
+    /// `CODEX_HOME` relocates Codex's entire config home, so hooks written to
+    /// `~/.codex` are never loaded by a Codex configured that way — the install
+    /// reports success and capture silently does nothing. ai-memory already
+    /// honors the variable when resolving Codex transcripts, so the two halves
+    /// of one install have to agree on where that home is.
+    #[test]
+    fn codex_hooks_path_honours_codex_home() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\codex"
+        } else {
+            "/custom/codex"
+        };
+        let path = codex_hooks_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(path, Path::new(custom).join("hooks.json"));
+
+        // Unset and blank both fall back to ~/.codex/hooks.json. Blank counts as
+        // unset because an exported-but-empty variable is nearly always a failed
+        // shell expansion, not a request to install into the filesystem root.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = codex_hooks_path_in(env).unwrap();
+            assert!(
+                path.ends_with(Path::new(".codex").join("hooks.json")),
+                "default must be ~/.codex/hooks.json, got {}",
                 path.display()
             );
         }
